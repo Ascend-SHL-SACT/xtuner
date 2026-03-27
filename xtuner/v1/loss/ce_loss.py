@@ -169,7 +169,7 @@ class LMHeadLossContext(BaseLossContext):
                 raise AssertionError(
                     "loss_weight contains NaN or Inf values. Please filter out samples with no valid tokens."
                 )
-            loss_ctx.loss_kwargs.loss_weight = loss_weight
+            loss_ctx.loss_kwargs.loss_weight = loss_weight.to(DEVICE)
             loss_weight_list.append(loss_weight)
 
         # Compute the denominator used in the global calibration of the loss

@@ -1,0 +1,77 @@
+KUBERNETES_SERVICE_PORT_HTTPS=443
+KUBERNETES_PORT_9201_TCP=tcp://10.109.81.55:9201
+KUBERNETES_SERVICE_PORT=443
+KUBERNETES_PORT_9200_TCP_PORT=9200
+MOE_AIV=1
+HOSTNAME=houyufeng-qwen35-worker-0
+KUBERNETES_SERVICE_PORT_LOCAL_MANAGER=9200
+KUBERNETES_SERVICE_PORT_VIRTUAL_MANAGER=9201
+PWD=/mnt/huawei/hyf/xtuner
+MULTI_STREAM_MEMORY_REUSE=2
+ASCEND_VISIBLE_DEVICES=14,2,15,7,11,9,3,0,1,12,13,8,4,10,6,5
+TORCH_HCCL_ZERO_COPY=1
+MODEL_PATH=/mnt/huawei/weight/Qwen3.5-35B-A3B
+VC_WORKER_HOSTS=houyufeng-qwen35-worker-0.houyufeng-qwen35
+ASCEND_RUNTIME_OPTIONS=
+HCCL_CONNECT_TIMEOUT=600
+TORCH_LOGS=recompiles
+LINES=38
+WORK_DIR=/mnt/huawei/hyf/
+HOME=/root
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True,segment_size_mb:128
+KUBERNETES_PORT_9201_TCP_PORT=9201
+KUBERNETES_PORT_443_TCP=tcp://10.109.81.55:443
+LS_COLORS=rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=30;41:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.arc=01;31:*.arj=01;31:*.taz=01;31:*.lha=01;31:*.lz4=01;31:*.lzh=01;31:*.lzma=01;31:*.tlz=01;31:*.txz=01;31:*.tzo=01;31:*.t7z=01;31:*.zip=01;31:*.z=01;31:*.dz=01;31:*.gz=01;31:*.lrz=01;31:*.lz=01;31:*.lzo=01;31:*.xz=01;31:*.zst=01;31:*.tzst=01;31:*.bz2=01;31:*.bz=01;31:*.tbz=01;31:*.tbz2=01;31:*.tz=01;31:*.deb=01;31:*.rpm=01;31:*.jar=01;31:*.war=01;31:*.ear=01;31:*.sar=01;31:*.rar=01;31:*.alz=01;31:*.ace=01;31:*.zoo=01;31:*.cpio=01;31:*.7z=01;31:*.rz=01;31:*.cab=01;31:*.wim=01;31:*.swm=01;31:*.dwm=01;31:*.esd=01;31:*.jpg=01;35:*.jpeg=01;35:*.mjpg=01;35:*.mjpeg=01;35:*.gif=01;35:*.bmp=01;35:*.pbm=01;35:*.pgm=01;35:*.ppm=01;35:*.tga=01;35:*.xbm=01;35:*.xpm=01;35:*.tif=01;35:*.tiff=01;35:*.png=01;35:*.svg=01;35:*.svgz=01;35:*.mng=01;35:*.pcx=01;35:*.mov=01;35:*.mpg=01;35:*.mpeg=01;35:*.m2v=01;35:*.mkv=01;35:*.webm=01;35:*.webp=01;35:*.ogm=01;35:*.mp4=01;35:*.m4v=01;35:*.mp4v=01;35:*.vob=01;35:*.qt=01;35:*.nuv=01;35:*.wmv=01;35:*.asf=01;35:*.rm=01;35:*.rmvb=01;35:*.flc=01;35:*.avi=01;35:*.fli=01;35:*.flv=01;35:*.gl=01;35:*.dl=01;35:*.xcf=01;35:*.xwd=01;35:*.yuv=01;35:*.cgm=01;35:*.emf=01;35:*.ogv=01;35:*.ogx=01;35:*.aac=00;36:*.au=00;36:*.flac=00;36:*.m4a=00;36:*.mid=00;36:*.midi=00;36:*.mka=00;36:*.mp3=00;36:*.mpc=00;36:*.ogg=00;36:*.ra=00;36:*.wav=00;36:*.oga=00;36:*.opus=00;36:*.spx=00;36:*.xspf=00;36:
+KUBERNETES_PORT_9200_TCP_ADDR=10.109.81.55
+HCCL_BUFFSIZE=100
+COLUMNS=186
+HCCL_EXEC_TIMEOUT=600
+DATA_PATH=/mnt/hwfile/vc-intern-delivery/vl_delivery/code/huawei_debug/task_entries/meta_data/export_meta_internvl3_5_internvlm3_tiny_final_debug.json
+TOOLCHAIN_HOME=/usr/local/Ascend/ascend-toolkit/latest/toolkit
+ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
+VC_WORKER_NUM=1
+CPU_AFFINITY_FORCE=True
+PYTHONPATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:
+TERM=xterm-256color
+KUBERNETES_PORT_9200_TCP_PROTO=tcp
+KUBERNETES_PORT_9201_TCP_PROTO=tcp
+TASK_QUEUE_ENABLE=2
+XTUNER_ACTIVATION_OFFLOAD=1
+SHLVL=2
+KUBERNETES_PORT_443_TCP_PROTO=tcp
+CPU_AFFINITY_CONF=1,npu0:12-23,npu1:26-37,npu2:52-63,npu3:66-77,npu4:92-103,npu5:106-117,npu6:132-143,npu7:146-157,npu8:172-183,npu9:186-197,npu10:212-223,npu11:226-237,npu12:252-263,npu13:266-277,npu14:292-303,npu15:306-317
+KUBERNETES_PORT_443_TCP_ADDR=10.109.81.55
+KUBERNETES_PORT_9201_TCP_ADDR=10.109.81.55
+XTUNER_USE_FA3=1
+ASCEND_OPP_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp
+LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/driver://usr/local/Ascend/driver/lib64/common:
+ASCEND_AICPU_PATH=/usr/local/Ascend/ascend-toolkit/latest
+KUBERNETES_SERVICE_HOST=10.109.81.55
+KUBERNETES_PORT=tcp://10.109.81.55:443
+KUBERNETES_PORT_443_TCP_PORT=443
+PATH=/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+KUBERNETES_PORT_9200_TCP=tcp://10.109.81.55:9200
+MEDIA_ROOT=
+OLDPWD=/mnt/huawei/hyf
+_=/usr/bin/env
+---------------------------START--------------------------------
+run_cmd: torchrun --nproc_per_node 1 --nnodes 1 --node_rank 0 --master_addr 127.0.0.1 --master_port 6000 -m xtuner.v1.train.cli.sft --config autotest/config/qwen3_5_30B_sft_vl.py
+The installed version of bitsandbytes was compiled without GPU support. 8-bit optimizers and GPU quantization are unavailable.
+/usr/local/lib/python3.11/site-packages/torch_npu/contrib/transfer_to_npu.py:345: ImportWarning: 
+    *************************************************************************************************************
+    The torch.Tensor.cuda and torch.nn.Module.cuda are replaced with torch.Tensor.npu and torch.nn.Module.npu now..
+    The torch.cuda.DoubleTensor is replaced with torch.npu.FloatTensor cause the double type is not supported now..
+    The backend in torch.distributed.init_process_group set to hccl now..
+    The torch.cuda.* and torch.cuda.amp.* are replaced with torch.npu.* and torch.npu.amp.* now..
+    The device parameters have been replaced with npu in the function below:
+    torch.logspace, torch.randint, torch.hann_window, torch.rand, torch.full_like, torch.ones_like, torch.rand_like, torch.randperm, torch.arange, torch.frombuffer, torch.normal, torch._empty_per_channel_affine_quantized, torch.empty_strided, torch.empty_like, torch.scalar_tensor, torch.tril_indices, torch.bartlett_window, torch.ones, torch.sparse_coo_tensor, torch.randn, torch.kaiser_window, torch.tensor, torch.triu_indices, torch.as_tensor, torch.zeros, torch.randint_like, torch.full, torch.eye, torch._sparse_csr_tensor_unsafe, torch.empty, torch._sparse_coo_tensor_unsafe, torch.blackman_window, torch.zeros_like, torch.range, torch.sparse_csr_tensor, torch.randn_like, torch.from_file, torch._cudnn_init_dropout_state, torch._empty_affine_quantized, torch.linspace, torch.hamming_window, torch.empty_quantized, torch._pin_memory, torch.load, torch.set_default_device, torch.get_device_module, torch.sparse_compressed_tensor, torch.Tensor.new_empty, torch.Tensor.new_empty_strided, torch.Tensor.new_full, torch.Tensor.new_ones, torch.Tensor.new_tensor, torch.Tensor.new_zeros, torch.Tensor.to, torch.Tensor.pin_memory, torch.nn.Module.to, torch.nn.Module.to_empty
+    *************************************************************************************************************
+    
+  warnings.warn(msg, ImportWarning)
+/usr/local/lib/python3.11/site-packages/torch_npu/contrib/transfer_to_npu.py:276: RuntimeWarning: torch.jit.script and torch.jit.script_method will be disabled by transfer_to_npu, which currently does not support them, if you need to enable them, please do not use transfer_to_npu.
+  warnings.warn(msg, RuntimeWarning)
+[XTuner][2026-03-19 13:43:54][INFO] set HF_MODULES_CACHE to /root/.cache/huggingface/modules_pid_3742 for current process 3742
+> /mnt/huawei/hyf/xtuner/xtuner/v1/train/cli/sft.py(38)main()
+-> trainer = Trainer.from_config(trainer_cfg)
+(Pdb) 

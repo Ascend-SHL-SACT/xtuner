@@ -96,5 +96,5 @@ class DeterministicDDPTestCase(DistributedTestBase):
 
     def create_pg(self, device):
         ret = super().create_pg(device)
-        os.environ["LOCAL_RANK"] = str(dist.get_rank() % torch.cuda.device_count())
+        os.environ["LOCAL_RANK"] = str(dist.get_rank() % torch.npu.device_count())
         return ret

@@ -1,2 +1,4 @@
 -r requirements/runtime.txt
 -r requirements/docs.txt
+more_itertools
+transformers==5.3.0
