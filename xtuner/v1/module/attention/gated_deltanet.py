@@ -114,6 +114,47 @@ def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
     return x * inv_norm
 
 
+def varlen_to_nonvarlen(cu_seqlens, *vars):
+    B = len(cu_seqlens) - 1
+    max_len = max(cu_seqlens[i+1] - cu_seqlens[i] for i in range(B))
+    nonvarlen_vars = [torch.zeros((B, max_len.item(), *var.shape[2:]), dtype=var.dtype, device=var.device) for var in vars]
+    for i in range(B):
+        start = cu_seqlens[i]
+        end = cu_seqlens[i+1]
+        seq_len = end - start
+        if seq_len > 0:
+            for j in range(len(nonvarlen_vars)):
+                nonvarlen_vars[j][i, :seq_len] = vars[j][0, start:end]
+    return nonvarlen_vars
+
+def nonvarlen_to_varlen(cu_seqlens, nonvarlen_var):
+    B = len(cu_seqlens) - 1
+    total_len = cu_seqlens[-1]
+
+    # 创建结果张量列表
+    # varlen_vars = []
+
+    feature_dims = nonvarlen_var.shape[2:]
+    # 创建变长张量
+    varlen_var = torch.zeros(
+        (1, total_len.item(), *feature_dims),
+        dtype=nonvarlen_var.dtype,
+        device=nonvarlen_var.device
+    )
+    # varlen_vars.append(varlen_var)
+
+    # 填充数据
+    for i in range(B):
+        start = cu_seqlens[i]
+        end = cu_seqlens[i + 1]
+        seq_len = end - start
+        if seq_len > 0:
+            varlen_var[0, start:end] = nonvarlen_var[i, :seq_len]
+
+    return varlen_var
+
+
+
 def torch_chunk_gated_delta_rule(
     query,
     key,
@@ -210,6 +251,8 @@ class Qwen3_5RMSNormGated(nn.Module):
         # Norm before gate
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         hidden_states = weight * hidden_states.to(input_dtype)
+        # import torch_npu
+        # hidden_states = torch_npu.npu_rms_norm(hidden_states.float(), weight.float(), self.variance_epsilon)[0]
         hidden_states = hidden_states * F.silu(gate.to(torch.float32))
 
         return hidden_states.to(input_dtype)
@@ -443,12 +486,18 @@ class GatedDeltaNet(nn.Module):
             # if torch.distributed.get_rank() == 0:
             #     breakpoint()
             # torch.distributed.barrier()
-            query_conv1d = replace_conv1d(query_weight.unsqueeze(1), bias, self.conv1d)
-            query = F.silu(query_conv1d(query)[:,:,:seq_len*sp_size]) # causal_conv_1d融合算子实际调用
-            key_conv1d = replace_conv1d(key_weight.unsqueeze(1), bias, self.conv1d)
-            key = F.silu(key_conv1d(key)[:,:,:seq_len*sp_size]) 
-            value_conv1d = replace_conv1d(value_weight.unsqueeze(1), bias, self.conv1d)
-            value = F.silu(value_conv1d(value)[:,:,:seq_len*sp_size])
+            # query_conv1d = replace_conv1d(query_weight.unsqueeze(1), bias, self.conv1d)
+            # query = F.silu(query_conv1d(query)[:,:,:seq_len*sp_size]) # causal_conv_1d融合算子实际调用
+            # key_conv1d = replace_conv1d(key_weight.unsqueeze(1), bias, self.conv1d)
+            # key = F.silu(key_conv1d(key)[:,:,:seq_len*sp_size]) 
+            # value_conv1d = replace_conv1d(value_weight.unsqueeze(1), bias, self.conv1d)
+            # value = F.silu(value_conv1d(value)[:,:,:seq_len*sp_size])
+            query = F.silu(F.conv1d(query,query_weight.unsqueeze(1),bias,padding=query_weight.shape[1]-1,
+                groups=query_weight.shape[0])[:,:,:seq_len*sp_size])
+            key = F.silu(F.conv1d(key,key_weight.unsqueeze(1),bias,padding=key_weight.shape[1]-1,
+                groups=key_weight.shape[0])[:,:,:seq_len*sp_size])
+            value = F.silu(F.conv1d(value,value_weight.unsqueeze(1),bias,padding=value_weight.shape[1]-1,
+                groups=value_weight.shape[0])[:,:,:seq_len*sp_size])
 
 
         beta = b.sigmoid()
@@ -499,8 +548,9 @@ class GatedDeltaNet(nn.Module):
         # if torch.distributed.get_rank()==0:
         #     breakpoint()
         # torch.distributed.barrier()
-        if seq_ctx.cu_seq_lens_q is not None:
-            origin_device = seq_ctx.cu_seq_lens_q.device
+        # query, key, value, g, beta = varlen_to_nonvarlen(seq_ctx.cu_seq_lens_q, query, key, value, g, beta)
+        if seq_ctx.cu_seq_lens_q is not None and seq_ctx.cu_seq_lens_q.device != query.device:
+            # origin_device = seq_ctx.cu_seq_lens_q.device
             seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(query.device)
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
@@ -513,8 +563,9 @@ class GatedDeltaNet(nn.Module):
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=seq_ctx.cu_seq_lens_q,
         )
-        if seq_ctx.cu_seq_lens_q is not None:
-            seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)
+        # if seq_ctx.cu_seq_lens_q is not None:
+        #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)
+        # core_attn_out = nonvarlen_to_varlen(seq_ctx.cu_seq_lens_q, core_attn_out)
 
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
             core_attn_out = _all_to_all_out(
@@ -588,8 +639,9 @@ class GatedDeltaNet(nn.Module):
                 seq_idx=seq_idx,
             )
         else:    
-            new_conv = replace_conv1d(weight.unsqueeze(1), bias, self.conv1d)
-            mixed_qkv = F.silu(new_conv(mixed_qkv)[:,:,:seq_len])
+            # new_conv = replace_conv1d(weight.unsqueeze(1), bias, self.conv1d)
+            # mixed_qkv = F.silu(new_conv(mixed_qkv)[:,:,:seq_len])
+            mixed_qkv = F.silu(F.conv1d(mixed_qkv,weight.unsqueeze(1),bias,padding=weight.shape[1]-1,groups=weight.shape[0])[:,:,:seq_len])
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
