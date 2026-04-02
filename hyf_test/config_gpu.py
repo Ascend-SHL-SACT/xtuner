@@ -32,11 +32,11 @@ float8_cfg = Float8Config(
 
 
 moe_cfg = Qwen3_5_VLMoE35BA3Config()
-moe_cfg.text_config.num_hidden_layers = 4
+# moe_cfg.text_config.num_hidden_layers = 20
 moe_cfg.text_config.ep_size = 1
 if MTPConfig is not None:
     moe_cfg.text_config.mtp_config = MTPConfig(num_layers=1, loss_scaling_factor=1.0)
-optim_cfg = AdamWConfig(lr=6e-05, foreach=False)
+optim_cfg = AdamWConfig(lr=6e-05, foreach=False, swap_optimizer=True)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 fsdp_cfg = FSDPConfig(
     torch_compile=True,
@@ -70,12 +70,34 @@ trainer = TrainerConfig(
     lr_cfg=lr_cfg,
     loss_cfg=loss_cfg,
     tokenizer_path=QWEN3_MOE_PATH,
-    global_batch_size=8,
+    global_batch_size=16,
     # hf_interval=2,
-    work_dir="/mnt/huawei/hyf",
+    work_dir="/mnt/huawei/hyf/xtuner_logs_0331",
     seed=0,
-    profile_step=5,
-    profile_time=True,
-    profile_memory=False,
+    # profile_step=5,
+    # profile_time=True,
+    # profile_memory=True,
     sp_size=2
 )
+
+def seed_all(seed=42):
+    import random 
+    import os
+    import numpy as np
+    import torch
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu
+
+    random.seed(seed) 
+    os.environ['PYTHONHASHSEED'] = str(seed) 
+    os.environ['HCCL_DETERMINISTIC'] = str(True) 
+    os.environ['LCCL_DETERMINISTIC'] = str(1) 
+    os.environ['CLOSE_MATMUL_K_SHIFT'] = str(1) 
+    os.environ['ATB_MATMUL_SHUFFLE_K_ENABLE'] = str(0) 
+    os.environ['ATB_LLM_LCOC_ENABLE'] = str(0) 
+    np.random.seed(seed) 
+    torch.manual_seed(seed) 
+    torch.use_deterministic_algorithms(True) 
+    torch_npu.npu.manual_seed(seed) 
+    torch_npu.npu.manual_seed_all(seed)
+# seed_all()

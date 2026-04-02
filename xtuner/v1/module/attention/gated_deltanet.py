@@ -17,6 +17,7 @@ from xtuner.v1.utils import get_logger, get_device
 
 from ..linear import build_linear
 from .attn_outputs import AttnOutputs
+from .causal_conv1d import causal_conv1d_triton
 
 
 # Temporary solution: use separate function objects for each call site, Dynamo will cache them separately
@@ -492,12 +493,39 @@ class GatedDeltaNet(nn.Module):
             # key = F.silu(key_conv1d(key)[:,:,:seq_len*sp_size]) 
             # value_conv1d = replace_conv1d(value_weight.unsqueeze(1), bias, self.conv1d)
             # value = F.silu(value_conv1d(value)[:,:,:seq_len*sp_size])
-            query = F.silu(F.conv1d(query,query_weight.unsqueeze(1),bias,padding=query_weight.shape[1]-1,
-                groups=query_weight.shape[0])[:,:,:seq_len*sp_size])
-            key = F.silu(F.conv1d(key,key_weight.unsqueeze(1),bias,padding=key_weight.shape[1]-1,
-                groups=key_weight.shape[0])[:,:,:seq_len*sp_size])
-            value = F.silu(F.conv1d(value,value_weight.unsqueeze(1),bias,padding=value_weight.shape[1]-1,
-                groups=value_weight.shape[0])[:,:,:seq_len*sp_size])
+            # query = F.silu(F.conv1d(query,query_weight.unsqueeze(1),bias,padding=query_weight.shape[1]-1,
+            #     groups=query_weight.shape[0])[:,:,:seq_len*sp_size])
+            # key = F.silu(F.conv1d(key,key_weight.unsqueeze(1),bias,padding=key_weight.shape[1]-1,
+            #     groups=key_weight.shape[0])[:,:,:seq_len*sp_size])
+            # value = F.silu(F.conv1d(value,value_weight.unsqueeze(1),bias,padding=value_weight.shape[1]-1,
+            #     groups=value_weight.shape[0])[:,:,:seq_len*sp_size])
+            # if torch.distributed.get_rank() == 0:
+            #     breakpoint()
+            # torch.distributed.barrier()
+            if seq_ctx.cu_seq_lens_q is not None and seq_ctx.cu_seq_lens_q.device != query.device:
+                # origin_device = seq_ctx.cu_seq_lens_q.device
+                seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(query.device)
+            query, _ = causal_conv1d_triton(
+                x=query,
+                weight=query_weight,
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
+            key, _ = causal_conv1d_triton(
+                x=key,
+                weight=key_weight,
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
+            value, _ = causal_conv1d_triton(
+                x=value,
+                weight=value_weight,
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
 
 
         beta = b.sigmoid()
@@ -509,6 +537,7 @@ class GatedDeltaNet(nn.Module):
         if isinstance(dt_bias, DTensor):
             dt_bias = dt_bias.to_local()
 
+        A_log = A_log.to(query.device)
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
         # (1,key_dim/sp_size, L)
@@ -549,9 +578,7 @@ class GatedDeltaNet(nn.Module):
         #     breakpoint()
         # torch.distributed.barrier()
         # query, key, value, g, beta = varlen_to_nonvarlen(seq_ctx.cu_seq_lens_q, query, key, value, g, beta)
-        if seq_ctx.cu_seq_lens_q is not None and seq_ctx.cu_seq_lens_q.device != query.device:
-            # origin_device = seq_ctx.cu_seq_lens_q.device
-            seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(query.device)
+        
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
             key,

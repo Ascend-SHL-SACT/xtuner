@@ -26,7 +26,7 @@ export CPU_AFFINITY_FORCE=True
 export CPU_AFFINITY_CONF=1,npu0:12-23,npu1:26-37,npu2:52-63,npu3:66-77,npu4:92-103,npu5:106-117,npu6:132-143,npu7:146-157,npu8:172-183,npu9:186-197,npu10:212-223,npu11:226-237,npu12:252-263,npu13:266-277,npu14:292-303,npu15:306-317
 # unset XTUNER_ACTIVATION_OFFLOAD
 
-export TASK_QUEUE_ENABLE=1
+export TASK_QUEUE_ENABLE=2
 export PYTHONPATH=/mnt/huawei/wtg/xtuner_hyf_qwen35:$PYTHONPATH
 export PYTHONPATH=/mnt/hwfile/vc-intern-delivery/yehaochen/codebase/interntrain:$PYTHONPATH 
 export PYTHONPATH=/mnt/hwfile/vc-intern-delivery/vl_delivery/code/mmengine:$PYTHONPATH
@@ -52,6 +52,8 @@ NPROC_PER_NODE=${PROC_PER_NODE-"8"}  # yidian
 fi
 
 # hyf
+# export TRITON_ALWAYS_COMPILE=1
+export XTUNER_DETERMINISTIC=true
 export MULTI_STREAM_MEMORY_REUSE=2
 export MODEL_PATH=/mnt/huawei/weight/Qwen3.5-35B-A3B
 export MEDIA_ROOT=''
@@ -59,9 +61,9 @@ export DATA_PATH='/mnt/hwfile/vc-intern-delivery/vl_delivery/code/huawei_debug/t
 export WORK_DIR="/mnt/huawei/hyf/"
 NRANK=0
 NNODES=1
-NPROC_PER_NODE=8
+NPROC_PER_NODE=16
 MASTER_ADDR=${MASTER_ADDR-"127.0.0.1"}
-MASTER_PORT=${MASTER_PORT-"6002"}
+MASTER_PORT=${MASTER_PORT-"6003"}
 DISTRIBUTED_ARGS="--nproc_per_node $NPROC_PER_NODE --nnodes $NNODES --node_rank $NRANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
 run_cmd="torchrun $DISTRIBUTED_ARGS -m xtuner.v1.train.cli.sft --config ${config_file}"
