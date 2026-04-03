@@ -71,7 +71,11 @@ except ImportError:
     FusedRMSNormGated = None  # type: ignore
     DEVICE = get_device()
     if DEVICE == "npu":
-        from .chunk_gated_delta_rule_npu.chunk_gated_delta_rule import chunk_gated_delta_rule
+        # from .chunk_gated_delta_rule_npu.chunk_gated_delta_rule import chunk_gated_delta_rule
+        print("Loading Ascend C GDN")
+        from .chunk_gated_delta_rule_npu.flash_gated_delta_rule import flash_gated_delta_rule
+        chunk_gated_delta_rule = flash_gated_delta_rule
+        print("Using Ascend C GDN")
     else:
         chunk_gated_delta_rule = None
 
@@ -590,6 +594,7 @@ class GatedDeltaNet(nn.Module):
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=seq_ctx.cu_seq_lens_q,
         )
+        # core_attn_out = torch.randn_like(query)
         # if seq_ctx.cu_seq_lens_q is not None:
         #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)
         # core_attn_out = nonvarlen_to_varlen(seq_ctx.cu_seq_lens_q, core_attn_out)
