@@ -70,7 +70,7 @@ def get_zero_centered_rms_norm_fn() -> RMSNormProtocol:
         if os.getenv("XTUNER_USE_NATIVE_RMSNORM", "1") == "0":
             raise NotImplementedError("Zero-centered RMSNorm is not implemented in triton")
         else:
-            return native_zero_centered_rms_norm
+            return zero_centered_rms_norm_npu
         # def _not_implemented(*args, **kwargs):
         #     raise NotImplementedError("Zero-centered RMSNorm is not implemented on NPU")
 

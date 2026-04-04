@@ -8,17 +8,22 @@
 
 # pip install transformers==5.3.0
 # pip install triton_ascend==3.2.0
+source /mnt/huawei/hyf/CANN/8.5.0/ascend-toolkit/set_env.sh
+source /mnt/huawei/hyf/CANN/8.5.0/cann-8.5.0/set_env.sh
+source /mnt/huawei/hyf/CANN/8.5.0/nnal/atb/set_env.sh
+pip install /mnt/huawei/tanshaojie/ascendcGDN/newPTA/torch_npu-2.7.1.post4-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
 
 config_file=${1}
 datetime=$(date +%Y%m%d_%H%M%S)
 log_dir="logs/${datetime}"
 
-export HCCL_BUFFSIZE=16
+export HCCL_BUFFSIZE=256
 export XTUNER_TOKENIZE_WORKERS=1
+# export TORCH_HCCL_ZERO_COPY=1
 
 export HCCL_CONNECT_TIMEOUT=600
 export HCCL_EXEC_TIMEOUT=600
-
+# export ASCEND_LAUNCH_BLOCKING=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True,segment_size_mb:128
 export MOE_AIV=1
 export XTUNER_ACTIVATION_OFFLOAD=1
@@ -52,18 +57,23 @@ NPROC_PER_NODE=${PROC_PER_NODE-"8"}  # yidian
 fi
 
 # hyf
-# export TRITON_ALWAYS_COMPILE=1
-export XTUNER_DETERMINISTIC=true
+export WORLD_SIZE=${WORLD_SIZE:-$NODE_COUNT}
+export RANK=${RANK:-$NODE_RANK} 
+
+# source /usr/local/Ascend/ascend-toolkit/set_env.sh 
+export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:$LD_LIBRARY_PATH && 
 export MULTI_STREAM_MEMORY_REUSE=2
 export MODEL_PATH=/mnt/huawei/weight/Qwen3.5-35B-A3B
 export MEDIA_ROOT=''
 export DATA_PATH='/mnt/hwfile/vc-intern-delivery/vl_delivery/code/huawei_debug/task_entries/meta_data/export_meta_internvl3_5_internvlm3_tiny_final_debug.json'
 export WORK_DIR="/mnt/huawei/hyf/"
-NRANK=0
-NNODES=1
+NRANK=${NRANK-"0"}
+NNODES=2
 NPROC_PER_NODE=16
 MASTER_ADDR=${MASTER_ADDR-"127.0.0.1"}
-MASTER_PORT=${MASTER_PORT-"6003"}
+MASTER_PORT=23452
+# MASTER_ADDR="127.0.0.1"
+# MASTER_PORT="6003"
 DISTRIBUTED_ARGS="--nproc_per_node $NPROC_PER_NODE --nnodes $NNODES --node_rank $NRANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
 bash hyf_test/bind_irq.sh

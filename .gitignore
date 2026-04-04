@@ -128,5 +128,6 @@ docs/en/api/generated/
 docs/zh_cn/_build/
 docs/zh_cn/api/generated/
 logs
-xtuner/v1/module/attention/chunk_gated_delta_rule_npu
+# xtuner/v1/module/attention/chunk_gated_delta_rule_npu
 extra-info
+mojo_opset

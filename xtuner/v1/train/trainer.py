@@ -1528,6 +1528,12 @@ class Trainer:
         else:
             img_tokens_str = ""
 
+        if self.cur_step == 1:
+            # 从本地文件获取cpu_binder文件类
+            import cpu_binder
+            # 执行cpu_binder 细粒度绑核操作
+            cpu_binder.run(self.rank)
+        
         self.logger.info(
             f"Epoch {self._cur_epoch} Step {self.cur_step}/{self.total_step} "
             f"data_time: {data_time:.4f} lr: {lr:.6e} time: {step_time:.4f} "

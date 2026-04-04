@@ -72,10 +72,11 @@ except ImportError:
     DEVICE = get_device()
     if DEVICE == "npu":
         # from .chunk_gated_delta_rule_npu.chunk_gated_delta_rule import chunk_gated_delta_rule
-        print("Loading Ascend C GDN")
-        from .chunk_gated_delta_rule_npu.flash_gated_delta_rule import flash_gated_delta_rule
-        chunk_gated_delta_rule = flash_gated_delta_rule
-        print("Using Ascend C GDN")
+        # print("Loading Ascend C GDN")
+        from .chunk_gated_delta_rule_npu.flash_gated_delta_rule import flash_gated_delta_rule as chunk_gated_delta_rule
+        # chunk_gated_delta_rule = flash_gated_delta_rule
+        # print("Using Ascend C GDN")
+        
     else:
         chunk_gated_delta_rule = None
 
@@ -251,13 +252,13 @@ class Qwen3_5RMSNormGated(nn.Module):
         if isinstance(weight, DTensor):
             weight = weight.to_local()
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        # Norm before gate
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = weight * hidden_states.to(input_dtype)
-        # import torch_npu
-        # hidden_states = torch_npu.npu_rms_norm(hidden_states.float(), weight.float(), self.variance_epsilon)[0]
+        # hidden_states = hidden_states.to(torch.float32)
+        # variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # # Norm before gate
+        # hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        # hidden_states = weight * hidden_states.to(input_dtype)
+        import torch_npu
+        hidden_states = torch_npu.npu_rms_norm(hidden_states.float(), weight.float(), self.variance_epsilon)[0]
         hidden_states = hidden_states * F.silu(gate.to(torch.float32))
 
         return hidden_states.to(input_dtype)
@@ -465,29 +466,30 @@ class GatedDeltaNet(nn.Module):
         query = query.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
         key = key.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
         value = value.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
-        if self.causal_conv1d_fn is not None:
-            query = self.causal_conv1d_fn(  # query (batch, dim, seqlen)
-                x=query,  # need non contiguous
-                weight=query_weight,
-                bias=bias,
-                activation=self.activation,
-                seq_idx=seq_idx,
-            )
-            key = self.causal_conv1d_fn(
-                x=key,  # need non contiguous
-                weight=key_weight,
-                bias=bias,
-                activation=self.activation,
-                seq_idx=seq_idx,
-            )
-            value = self.causal_conv1d_fn(
-                x=value,  # need non contiguous
-                weight=value_weight,
-                bias=bias,
-                activation=self.activation,
-                seq_idx=seq_idx,
-            )
-        else:
+        # if self.causal_conv1d_fn is not None:
+        #     query = self.causal_conv1d_fn(  # query (batch, dim, seqlen)
+        #         x=query,  # need non contiguous
+        #         weight=query_weight,
+        #         bias=bias,
+        #         activation=self.activation,
+        #         seq_idx=seq_idx,
+        #     )
+        #     key = self.causal_conv1d_fn(
+        #         x=key,  # need non contiguous
+        #         weight=key_weight,
+        #         bias=bias,
+        #         activation=self.activation,
+        #         seq_idx=seq_idx,
+        #     )
+        #     value = self.causal_conv1d_fn(
+        #         x=value,  # need non contiguous
+        #         weight=value_weight,
+        #         bias=bias,
+        #         activation=self.activation,
+        #         seq_idx=seq_idx,
+        #     )
+        # else:
+        if True:
             # if torch.distributed.get_rank() == 0:
             #     breakpoint()
             # torch.distributed.barrier()
@@ -673,7 +675,16 @@ class GatedDeltaNet(nn.Module):
         else:    
             # new_conv = replace_conv1d(weight.unsqueeze(1), bias, self.conv1d)
             # mixed_qkv = F.silu(new_conv(mixed_qkv)[:,:,:seq_len])
-            mixed_qkv = F.silu(F.conv1d(mixed_qkv,weight.unsqueeze(1),bias,padding=weight.shape[1]-1,groups=weight.shape[0])[:,:,:seq_len])
+            # mixed_qkv = F.silu(F.conv1d(mixed_qkv,weight.unsqueeze(1),bias,padding=weight.shape[1]-1,groups=weight.shape[0])[:,:,:seq_len])
+            if seq_ctx.cu_seq_lens_q is not None and seq_ctx.cu_seq_lens_q.device != mixed_qkv.device:
+                seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(mixed_qkv.device)
+            mixed_qkv, _ = causal_conv1d_triton(
+                x=mixed_qkv,
+                weight=weight,
+                bias=bias,
+                activation=self.activation,
+                cu_seqlens=seq_ctx.cu_seq_lens_q,
+            )
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
@@ -703,9 +714,9 @@ class GatedDeltaNet(nn.Module):
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-        if seq_ctx.cu_seq_lens_q is not None:
-            origin_device = seq_ctx.cu_seq_lens_q.device
-            seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(query.device)
+        # if seq_ctx.cu_seq_lens_q is not None:
+        #     origin_device = seq_ctx.cu_seq_lens_q.device
+        #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(query.device)
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
             key,
@@ -717,8 +728,8 @@ class GatedDeltaNet(nn.Module):
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=seq_ctx.cu_seq_lens_q
         )
-        if seq_ctx.cu_seq_lens_q is not None:
-            seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)
+        # if seq_ctx.cu_seq_lens_q is not None:
+        #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)

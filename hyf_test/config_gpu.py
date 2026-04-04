@@ -34,9 +34,9 @@ float8_cfg = Float8Config(
 moe_cfg = Qwen3_5_VLMoE35BA3Config()
 # moe_cfg.text_config.num_hidden_layers = 20
 moe_cfg.text_config.ep_size = 1
-if MTPConfig is not None:
-    moe_cfg.text_config.mtp_config = MTPConfig(num_layers=1, loss_scaling_factor=1.0)
-optim_cfg = AdamWConfig(lr=6e-05, foreach=False, swap_optimizer=True)
+# if MTPConfig is not None:
+#     moe_cfg.text_config.mtp_config = MTPConfig(num_layers=1, loss_scaling_factor=1.0)
+optim_cfg = AdamWConfig(lr=6e-05, foreach=False, swap_optimizer=False)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 fsdp_cfg = FSDPConfig(
     torch_compile=True,
@@ -56,7 +56,7 @@ dataloader_config = DataloaderConfig(
     pack_level="hard"
 )
 
-loss_cfg = CELossConfig(mode="chunk")
+loss_cfg = CELossConfig(mode="chunk",chunk_size=2048)
 
 
 trainer = TrainerConfig(
@@ -70,14 +70,14 @@ trainer = TrainerConfig(
     lr_cfg=lr_cfg,
     loss_cfg=loss_cfg,
     tokenizer_path=QWEN3_MOE_PATH,
-    global_batch_size=16,
+    global_batch_size=32,
     # hf_interval=2,
-    work_dir="/mnt/huawei/hyf/xtuner_logs_0331",
+    work_dir="/mnt/huawei/hyf/xtuner_logs_0403",
     seed=0,
-    # profile_step=5,
-    # profile_time=True,
-    # profile_memory=True,
-    sp_size=2
+    profile_step=10,
+    profile_time=True,
+    # profile_memory=False,
+    # sp_size=2
 )
 
 def seed_all(seed=42):
