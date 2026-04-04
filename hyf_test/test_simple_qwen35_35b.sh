@@ -66,6 +66,7 @@ MASTER_ADDR=${MASTER_ADDR-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT-"6003"}
 DISTRIBUTED_ARGS="--nproc_per_node $NPROC_PER_NODE --nnodes $NNODES --node_rank $NRANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
+bash hyf_test/bind_irq.sh
 run_cmd="torchrun $DISTRIBUTED_ARGS -m xtuner.v1.train.cli.sft --config ${config_file}"
 
 env
