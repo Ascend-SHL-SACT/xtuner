@@ -61,7 +61,7 @@ export WORLD_SIZE=${WORLD_SIZE:-$NODE_COUNT}
 export RANK=${RANK:-$NODE_RANK} 
 
 # source /usr/local/Ascend/ascend-toolkit/set_env.sh 
-export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:$LD_LIBRARY_PATH && 
+export LD_LIBRARY_PATH=/mnt/huawei/hyf/CANN/8.5.0/cann-8.5.0/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
 export MULTI_STREAM_MEMORY_REUSE=2
 export MODEL_PATH=/mnt/huawei/weight/Qwen3.5-35B-A3B
 export MEDIA_ROOT=''

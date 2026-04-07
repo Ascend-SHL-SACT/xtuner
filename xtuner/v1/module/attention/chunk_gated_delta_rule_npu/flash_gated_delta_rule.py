@@ -18,7 +18,7 @@ import torch_npu
 
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from .triton_core.wy_fast import recompute_w_u_fwd
+from .triton_core.wy_fast import recompute_w_u_fwd, prepare_wy_repr_bwd
 from .triton_core.solve_tril import solve_tril
 from .triton_core.cumsum import chunk_local_cumsum
 from .triton_core.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
@@ -283,6 +283,27 @@ def flash_chunk_gated_delta_rule_bwd(
     dk2 = dk2.transpose(1, 2).contiguous()
     db = db.transpose(1, 2).contiguous()
     dg2 = dg2.transpose(1, 2).contiguous()
+
+    # k = k.transpose(1, 2).contiguous()
+    # v = v.transpose(1, 2).contiguous()
+    # beta = beta.transpose(1, 2).contiguous().float()
+    # g = g.transpose(1, 2).contiguous()
+    # A = A.transpose(1, 2).contiguous()
+    # dw = dw.transpose(1, 2).contiguous()
+    # dv = dv.transpose(1, 2).contiguous()
+
+    # dk2, dv, db, dg2 = prepare_wy_repr_bwd(
+    #     k=k,
+    #     v=v,
+    #     beta=beta,
+    #     g=g,
+    #     A=A,
+    #     dw=dw,
+    #     du=dv,
+    #     cu_seqlens=cu_seqlens,
+    #     chunk_size=chunk_size
+    # )
+
     dq = dq.transpose(1, 2).contiguous()
     dk = dk.transpose(1, 2).contiguous()
     dg = dg.transpose(1, 2).contiguous()

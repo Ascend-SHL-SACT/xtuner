@@ -20,6 +20,7 @@ except:
     MTPConfig = None
 
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
+# from xtuner.v1.loss.layer_moe_loss import LayerBalancingLossConfig
 
 QWEN3_MOE_PATH = "/mnt/huawei/weight/Qwen3.5-35B-A3B"
 # QWEN3_MOE_PATH = "/mnt/shared-storage-user/llmrazor-share/yehaochen/tmp/asdfasfasdf/20260320160600/hf-2"
@@ -36,6 +37,7 @@ moe_cfg = Qwen3_5_VLMoE35BA3Config()
 moe_cfg.text_config.ep_size = 1
 # if MTPConfig is not None:
 #     moe_cfg.text_config.mtp_config = MTPConfig(num_layers=1, loss_scaling_factor=1.0)
+# moe_cfg.text_config.layer_balancing_loss_cfg = LayerBalancingLossConfig()
 optim_cfg = AdamWConfig(lr=6e-05, foreach=False, swap_optimizer=False)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 fsdp_cfg = FSDPConfig(
@@ -73,9 +75,9 @@ trainer = TrainerConfig(
     global_batch_size=32,
     # hf_interval=2,
     work_dir="/mnt/huawei/hyf/xtuner_logs_0403",
-    seed=0,
-    profile_step=10,
-    profile_time=True,
+    # seed=0,
+    # profile_step=20,
+    # profile_time=True,
     # profile_memory=False,
     # sp_size=2
 )
