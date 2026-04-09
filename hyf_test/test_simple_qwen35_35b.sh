@@ -8,10 +8,11 @@
 
 # pip install transformers==5.3.0
 # pip install triton_ascend==3.2.0
-source /mnt/huawei/hyf/CANN/8.5.0/ascend-toolkit/set_env.sh
-source /mnt/huawei/hyf/CANN/8.5.0/cann-8.5.0/set_env.sh
-source /mnt/huawei/hyf/CANN/8.5.0/nnal/atb/set_env.sh
+source /mnt/huawei/hyf/CANN/8.5.0-2/ascend-toolkit/set_env.sh
+source /mnt/huawei/hyf/CANN/8.5.0-2/cann-8.5.0/set_env.sh
+source /mnt/huawei/hyf/CANN/8.5.0-2/nnal/atb/set_env.sh
 pip install /mnt/huawei/tanshaojie/ascendcGDN/newPTA/torch_npu-2.7.1.post4-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+pip install /mnt/huawei/hyf/sgl-kernel-npu/output/sgl_kernel_npu-2026.3.1-cp311-cp311-linux_aarch64.whl
 
 config_file=${1}
 datetime=$(date +%Y%m%d_%H%M%S)
@@ -57,11 +58,12 @@ NPROC_PER_NODE=${PROC_PER_NODE-"8"}  # yidian
 fi
 
 # hyf
+export TRITON_ALL_BLOCKS_PARALLEL=1
 export WORLD_SIZE=${WORLD_SIZE:-$NODE_COUNT}
 export RANK=${RANK:-$NODE_RANK} 
 
 # source /usr/local/Ascend/ascend-toolkit/set_env.sh 
-export LD_LIBRARY_PATH=/mnt/huawei/hyf/CANN/8.5.0/cann-8.5.0/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=/mnt/huawei/hyf/CANN/8.5.0-2/cann-8.5.0/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
 export MULTI_STREAM_MEMORY_REUSE=2
 export MODEL_PATH=/mnt/huawei/weight/Qwen3.5-35B-A3B
 export MEDIA_ROOT=''

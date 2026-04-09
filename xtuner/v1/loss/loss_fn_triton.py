@@ -12,6 +12,7 @@ import torch_npu
 import triton
 import triton.language as tl
 from typing import Optional
+from torch.autograd import Function
 
 import triton.runtime.driver as driver
 device = torch_npu.npu.current_device()
@@ -120,7 +121,7 @@ def fused_ce_loss_kernel_chunked(
     label_chunk_logits = tl.load(
         logits_ptr + i * C + label_chunk_start + label_chunk_offsets,
         mask=label_chunk_mask,
-        other=float('-inf')
+        other=float('0.0')
     )
 
     # 提取目标 logit
@@ -137,10 +138,102 @@ def fused_ce_loss_kernel_chunked(
     tl.store(out_ptr + i, loss)
 
 
-# ============================================================================
-# PyTorch 包装接口
-# ============================================================================
+# ============================================================================# PyTorch 包装接口 (支持自动微分)# ============================================================================
+class FusedCrossEntropyLoss(Function):
+    """
+    融合交叉熵损失的自定义自动微分函数
+    使用 Triton 内核实现前向和反向传播
+    """
+    
+    @staticmethod
+    def forward(ctx, logits, weight, labels, ignore_index=-100, vocab_chunk_size=4096):
+        """
+        前向传播
+        
+        Args:
+            logits: [N, C] - logits 张量
+            labels: [N] - 标签张量
+            weight: [N] - 权重张量
+            ignore_index: int - 忽略的标签索引
+            vocab_chunk_size: int - 分块大小 (仅大词汇表使用)
+            
+        Returns:
+            loss: scalar - 总损失
+        """
+        N, C = logits.shape
+        assert labels.shape == (N,)
+        assert weight.shape == (N,)
+        
+        # 保存需要反向传播的张量和参数
+        ctx.save_for_backward(logits, weight, labels)
+        ctx.ignore_index = ignore_index
+        ctx.vocab_chunk_size = vocab_chunk_size
+        
+        # 分配输出张量
+        out = torch.empty(N, dtype=torch.float32, device=logits.device)
+        
+        # 大词汇表: 使用分块版本
+        # 确保 vocab_chunk_size 是 2 的幂
+        VOCAB_CHUNK_SIZE = triton.next_power_of_2(vocab_chunk_size)
+        grid = (N,)
+        
+        # 调用 Triton 内核
+        fused_ce_loss_kernel_chunked[grid](
+            logits,
+            weight,
+            labels,
+            out,
+            N=N,
+            C=C,
+            VOCAB_CHUNK_SIZE=VOCAB_CHUNK_SIZE,
+            ignore_index=ignore_index,
+        )
+        
+        # 返回总损失
+        return out.sum()
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        反向传播
+        
+        Args:
+            grad_output: scalar - 上游梯度
+            
+        Returns:
+            grad_logits: [N, C] - logits 的梯度
+            grad_weight: [N] - weight 的梯度
+            None: labels 没有梯度
+            None: ignore_index 没有梯度
+            None: vocab_chunk_size 没有梯度
+        """
+        # 取出保存的张量
+        logits, weight, labels = ctx.saved_tensors
+        ignore_index = ctx.ignore_index
+        
+        # 初始化输出梯度
+        grad_logits = torch.empty_like(logits, dtype=torch.bfloat16)
+        grad_weight = torch.empty_like(weight, dtype=torch.bfloat16)
+        
+        # 形状
+        N, V = logits.shape
+        
+        # 启动 Triton 内核
+        BLOCK_V = min(4096, V)
+        grid = (N,)
+        
+        chunk_loss_bw_kernel[grid](
+            logits, labels, weight, grad_output,
+            grad_logits, grad_weight,
+            N, V, ignore_index,
+            BLOCK_V=BLOCK_V
+        )
+        
+        # 返回梯度
+        return grad_logits, grad_weight, None, None, None
 
+
+# 包装函数，方便使用
 def fused_cross_entropy_loss(
     logits,
     weight,
@@ -149,42 +242,19 @@ def fused_cross_entropy_loss(
     vocab_chunk_size=4096
 ):
     """
-    融合交叉熵损失 (自动选择最优实现)
-
+    融合交叉熵损失 (自动选择最优实现，支持自动微分)
+    
     Args:
         logits: [N, C] - logits 张量
         labels: [N] - 标签张量
         weight: [N] - 权重张量
         ignore_index: int - 忽略的标签索引
         vocab_chunk_size: int - 分块大小 (仅大词汇表使用)
-
+        
     Returns:
         loss: scalar - 总损失
     """
-    N, C = logits.shape
-    assert labels.shape == (N,)
-    assert weight.shape == (N,)
-
-    out = torch.empty(N, dtype=torch.float32, device=logits.device)
-
-
-    # 大词汇表: 使用分块版本
-    # 确保 vocab_chunk_size 是 2 的幂
-    VOCAB_CHUNK_SIZE = triton.next_power_of_2(vocab_chunk_size)
-    grid = (N,)
-
-    fused_ce_loss_kernel_chunked[grid](
-        logits,
-        weight,
-        labels,
-        out,
-        N=N,
-        C=C,
-        VOCAB_CHUNK_SIZE=VOCAB_CHUNK_SIZE,
-        ignore_index=ignore_index,
-    )
-
-    return out.sum()
+    return FusedCrossEntropyLoss.apply(logits, weight, labels, ignore_index, vocab_chunk_size)
 
 
 
@@ -338,19 +408,69 @@ class ChunkLoss(Function):
         return grad_logits, grad_loss_weight, None
 
 # ---------------------------
-# 测试：和 PyTorch 结果完全对齐
+# 测试：验证loss是否具有grad_fn
 # ---------------------------
 if __name__ == "__main__":
+    import torch
     import torch.nn.functional as F
+    
+    # 构造小批量测试数据
+    bs, seq_len, vocab_size = 1, 10, 1000
+    logits = torch.randn(bs * seq_len, vocab_size, device="cpu", dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, vocab_size, (bs * seq_len,), dtype=torch.int32, device="cpu")
+    loss_weight = torch.randn(bs * seq_len, device="cpu", dtype=torch.float32)
+    
+    print("=== 测试 fused_cross_entropy_loss 是否支持自动微分 ===")
+    print(f"logits shape: {logits.shape}")
+    print(f"labels shape: {labels.shape}")
+    print(f"loss_weight shape: {loss_weight.shape}")
+    print(f"logits requires_grad: {logits.requires_grad}")
+    
+    try:
+        # 使用我们的融合交叉熵损失函数
+        loss = fused_cross_entropy_loss(logits, loss_weight, labels)
+        
+        print(f"\n损失计算结果：")
+        print(f"loss: {loss}")
+        print(f"loss.dtype: {loss.dtype}")
+        print(f"loss.device: {loss.device}")
+        print(f"loss.grad_fn: {loss.grad_fn}")
+        
+        if loss.grad_fn is not None:
+            print("✅ 成功：loss具有grad_fn，可以进行反向传播")
+            
+            # 测试反向传播
+            loss.backward()
+            
+            print(f"\n反向传播结果：")
+            print(f"logits.grad: {logits.grad}")
+            print(f"logits.grad.shape: {logits.grad.shape if logits.grad is not None else 'None'}")
+            
+            if logits.grad is not None:
+                print("✅ 成功：反向传播完成，logits.grad已更新")
+                print(f"logits.grad.mean(): {logits.grad.mean()}")
+                print(f"logits.grad.std(): {logits.grad.std()}")
+            else:
+                print("❌ 失败：反向传播后logits.grad为None")
+        else:
+            print("❌ 失败：loss没有grad_fn，无法进行反向传播")
+            
+    except Exception as e:
+        print(f"❌ 测试失败：{e}")
+        import traceback
+        traceback.print_exc()
+    # logits.requires_grad = True
+    # loss_weight.requires_grad = True
+    # ignore_index = -100
 
-    # 构造数据
-    bs, seq_len, vocab_size = 1, 1024, 248320
-    logits = torch.randn(bs * seq_len, vocab_size, device="npu", dtype=torch.bfloat16)
-    labels = torch.randint(0, seq_len, (bs * seq_len,), dtype=torch.int32, device="npu")
-    loss_weight = torch.randn(bs * seq_len, device="npu", dtype=torch.float32)
-    logits.requires_grad = True
-    loss_weight.requires_grad = True
-    ignore_index = -100
+    chunkloss_input = torch.load("../../../chunkloss.pt")
+    logits = chunkloss_input["logits"].npu()
+    labels = chunkloss_input["labels"].npu()
+    loss_weight = chunkloss_input["weight"].npu()
+    # logits.requires_grad = True
+    # loss_weight.requires_grad = True
+    breakpoint()
+    fused_cross_entropy_loss(logits, loss_weight, labels)
 
     # # Triton 融合算子
     # triton_loss = fused_cross_entropy_loss(logits, loss_weight, labels)

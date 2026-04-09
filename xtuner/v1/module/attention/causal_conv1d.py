@@ -23,7 +23,7 @@ class CausalConv1dFunction(torch.autograd.Function):
         output_final_state: bool = False,
     ):
         # Save necessary tensors for backward pass
-        x = x.transpose(-1, -2).contiguous()
+        # x = x.transpose(-1, -2).contiguous()
         weight = weight.transpose(-1, -2).contiguous()
         ctx.save_for_backward(x, weight, bias, residual, initial_state)
         ctx.activation = activation
@@ -40,7 +40,7 @@ class CausalConv1dFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             output_final_state=output_final_state,
         )
-        y = y.transpose(-1, -2).contiguous()
+        # y = y.transpose(-1, -2).contiguous()
         # weight = weight.transpose(-1, -2).contiguous()
         # Save final_state if needed for backward
         ctx.final_state = final_state
@@ -69,7 +69,7 @@ class CausalConv1dFunction(torch.autograd.Function):
 
         # Return gradients in the order of forward inputs
         # Note: We don't return gradients for non-tensor inputs (activation, cu_seqlens, output_final_state)
-        return dx.transpose(-1, -2).contiguous(), dw.transpose(0, 1).contiguous(), db, dr, dh0, None, None, None
+        return dx, dw.transpose(0, 1).contiguous(), db, dr, dh0, None, None, None
 
 
 def causal_conv1d_triton(

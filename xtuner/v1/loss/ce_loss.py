@@ -209,7 +209,9 @@ class LMHeadLossContext(BaseLossContext):
             loss = logits.sum() * 0
         else:
             from .loss_fn_triton import fused_cross_entropy_loss
-            loss = fused_cross_entropy_loss(logits, loss_weight, shifted_labels, ignore_index=self.loss_cfg.ignore_idx)
+            # torch.save({"logits":logits.detach().cpu(), "loss_weight":loss_weight.detach().cpu(), "shifted_labels":shifted_labels.detach().cpu()}, "triton_loss_input.pt")
+            # exit()
+            loss = fused_cross_entropy_loss(logits, loss_weight, shifted_labels.to(torch.int32), ignore_index=self.loss_cfg.ignore_idx)
 
             # loss = F.cross_entropy(logits, shifted_labels, reduction="none", ignore_index=self.loss_cfg.ignore_idx)
             # # Step 2.b in the loss calculation: sum the loss over all tokens
@@ -429,5 +431,5 @@ class LMHeadLossContext(BaseLossContext):
 
 # Deprecated: Use LMHeadLossContext instead. Will be removed in version 1.1.0
 CELossContext = LMHeadLossContext
-# if DEVICE == "npu":
-#     LMHeadLossContext.loss_fn = LMHeadLossContext.loss_fu_triton_npu
+if DEVICE == "npu":
+    LMHeadLossContext.loss_fn = LMHeadLossContext.loss_fu_triton_npu

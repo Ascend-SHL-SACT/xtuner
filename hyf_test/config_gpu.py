@@ -19,12 +19,14 @@ try:
 except:
     MTPConfig = None
 
+from xtuner.v1.datasets import PretrainTokenizeFunctionConfig
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 # from xtuner.v1.loss.layer_moe_loss import LayerBalancingLossConfig
 
 QWEN3_MOE_PATH = "/mnt/huawei/weight/Qwen3.5-35B-A3B"
 # QWEN3_MOE_PATH = "/mnt/shared-storage-user/llmrazor-share/yehaochen/tmp/asdfasfasdf/20260320160600/hf-2"
 ALPACA_PATH = "/mnt/huawei/wsl/datasets"
+# ALPACA_PATH = "/mnt/huawei/wtg/qwen35_dataset_0408/sample_1k"
 
 float8_cfg = Float8Config(
     scaling_granularity_gemm=ScalingGranularity.TILEWISE,
@@ -50,6 +52,7 @@ dataset_config = [
     {
         "dataset": DatasetConfig(name="alpaca", anno_path=ALPACA_PATH, sample_ratio=1.0),
         "tokenize_fn": FTDPTokenizeFnConfig(max_length=16*1024),
+        # "tokenize_fn": PretrainTokenizeFunctionConfig(),
     },
 ]
 
@@ -76,8 +79,8 @@ trainer = TrainerConfig(
     # hf_interval=2,
     work_dir="/mnt/huawei/hyf/xtuner_logs_0403",
     # seed=0,
-    # profile_step=20,
-    # profile_time=True,
+    profile_step=20,
+    profile_time=True,
     # profile_memory=False,
     # sp_size=2
 )

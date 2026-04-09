@@ -258,10 +258,10 @@ class Qwen3_5RMSNormGated(nn.Module):
         # hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         # hidden_states = weight * hidden_states.to(input_dtype)
         import torch_npu
-        hidden_states = torch_npu.npu_rms_norm(hidden_states.float(), weight.float(), self.variance_epsilon)[0]
-        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+        hidden_states = torch_npu.npu_rms_norm(hidden_states, weight, self.variance_epsilon)[0]
+        hidden_states = hidden_states * F.silu(gate)
 
-        return hidden_states.to(input_dtype)
+        return hidden_states
 
 
 class GatedDeltaNetConfig(BaseModel):
@@ -663,8 +663,8 @@ class GatedDeltaNet(nn.Module):
 
         # TODO: due to the limitation of scatter_dim=1 in ulysses_all_to_all,
         # the implementation is very inelegant and inefficient, and needs to be refactored in the future.
-        mixed_qkv = mixed_qkv.transpose(1, 2)
         if self.causal_conv1d_fn is not None:
+            mixed_qkv = mixed_qkv.transpose(1, 2)
             mixed_qkv = self.causal_conv1d_fn(
                 x=mixed_qkv,  # need non contiguous
                 weight=weight,
@@ -672,6 +672,7 @@ class GatedDeltaNet(nn.Module):
                 activation=self.activation,
                 seq_idx=seq_idx,
             )
+            mixed_qkv = mixed_qkv.transpose(1, 2)
         else:    
             # new_conv = replace_conv1d(weight.unsqueeze(1), bias, self.conv1d)
             # mixed_qkv = F.silu(new_conv(mixed_qkv)[:,:,:seq_len])
@@ -686,7 +687,6 @@ class GatedDeltaNet(nn.Module):
                 cu_seqlens=seq_ctx.cu_seq_lens_q,
             )
 
-        mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
             mixed_qkv,
             [

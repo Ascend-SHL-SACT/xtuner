@@ -19,7 +19,8 @@ import torch_npu
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .triton_core.wy_fast import recompute_w_u_fwd, prepare_wy_repr_bwd
-from .triton_core.solve_tril import solve_tril
+# from .triton_core.solve_tril import solve_tril
+from .triton_core.solve_tril_fast import solve_tril_npu as solve_tril
 from .triton_core.cumsum import chunk_local_cumsum
 from .triton_core.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
