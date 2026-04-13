@@ -511,6 +511,9 @@ class GatedDeltaNet(nn.Module):
             if seq_ctx.cu_seq_lens_q is not None and seq_ctx.cu_seq_lens_q.device != query.device:
                 # origin_device = seq_ctx.cu_seq_lens_q.device
                 seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(query.device)
+            query = query.transpose(1, 2)  # (1, dim, L/sp_size)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
             query, _ = causal_conv1d_triton(
                 x=query,
                 weight=query_weight,
