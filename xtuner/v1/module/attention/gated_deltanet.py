@@ -685,6 +685,7 @@ class GatedDeltaNet(nn.Module):
             mixed_qkv, _ = causal_conv1d_triton(
                 x=mixed_qkv,
                 weight=weight,
+                H=2*self.num_k_heads+self.num_v_heads,
                 bias=bias,
                 activation=self.activation,
                 cu_seqlens=seq_ctx.cu_seq_lens_q,
@@ -693,15 +694,15 @@ class GatedDeltaNet(nn.Module):
         query, key, value = torch.split(
             mixed_qkv,
             [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
+                self.num_k_heads,
+                self.num_k_heads,
+                self.num_v_heads,
             ],
-            dim=-1,
+            dim=1,
         )
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        # query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        # key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        # value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
@@ -715,11 +716,11 @@ class GatedDeltaNet(nn.Module):
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
         if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-        # if seq_ctx.cu_seq_lens_q is not None:
-        #     origin_device = seq_ctx.cu_seq_lens_q.device
-        #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(query.device)
+            # query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            # key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
+        
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
             key,
@@ -731,8 +732,7 @@ class GatedDeltaNet(nn.Module):
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=seq_ctx.cu_seq_lens_q
         )
-        # if seq_ctx.cu_seq_lens_q is not None:
-        #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)
+        
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)

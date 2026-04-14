@@ -70,6 +70,9 @@ def apply_rotary_pos_emb_cuda_for_partial_rotary(
     # Apply rotary embeddings on the first half or full tensor
     q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
     k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    # import torch_npu
+    # q_embed = torch_npu.npu_rotary_mul(q_rot.contiguous(), cos, sin)
+    # k_embed = torch_npu.npu_rotary_mul(k_rot.contiguous(), cos, sin)
 
     # Concatenate back to full shape
     q_embed = torch.cat([q_embed, q_pass], dim=-1)

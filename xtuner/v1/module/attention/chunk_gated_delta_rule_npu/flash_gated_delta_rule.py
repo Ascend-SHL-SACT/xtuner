@@ -18,7 +18,7 @@ import torch_npu
 
 from .triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from .triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from .triton_core.wy_fast import recompute_w_u_fwd, prepare_wy_repr_bwd
+from .triton_core.wy_fast import recompute_w_u_fwd, prepare_wy_repr_bwd, recompute_w_u_fwd_new
 # from .triton_core.solve_tril import solve_tril
 from .triton_core.solve_tril_fast import solve_tril_npu as solve_tril
 from .triton_core.cumsum import chunk_local_cumsum
@@ -74,7 +74,6 @@ def flash_chunk_gated_delta_rule_fwd(
 ):
 
     g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=False)
-
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
@@ -84,12 +83,16 @@ def flash_chunk_gated_delta_rule_fwd(
         chunk_size=chunk_size,
         output_dtype=torch.float32
     )
+
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,
         output_dtype=k.dtype
     )
-    w, u = recompute_w_u_fwd(
+    g = g.transpose(1, 2).contiguous()
+    beta = beta.transpose(1, 2).contiguous().float()
+    A = A.transpose(1, 2).contiguous()
+    w, u = recompute_w_u_fwd_new(
         k=k,
         v=v,
         beta=beta,
@@ -103,18 +106,6 @@ def flash_chunk_gated_delta_rule_fwd(
     else:
         chunk_indices = None
 
-    q = q.transpose(1, 2).contiguous()
-    k = k.transpose(1, 2).contiguous()
-    w = w.transpose(1, 2).contiguous()
-    u = u.transpose(1, 2).contiguous()
-    g = g.transpose(1, 2).contiguous()
-
-    import torch.distributed as dist
-
-    # if not dist.is_initialized() or dist.get_rank() == 0:
-    #     breakpoint()  # 或使用 pdb.set_trace()
-    # print(cu_seqlens.dtype)
-    # print(chunk_indices.dtype)
     h, v_new, final_state = torch_npu.npu_chunk_gated_delta_rule_fwd_h(
         k,
         w,
@@ -160,7 +151,9 @@ def flash_chunk_gated_delta_rule_bwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
 ):
-    w, u = recompute_w_u_fwd(
+    g = g.transpose(1, 2).contiguous()
+    beta = beta.transpose(1, 2).contiguous().float()
+    w, u = recompute_w_u_fwd_new(
         k=k,
         v=v,
         beta=beta,
@@ -174,15 +167,7 @@ def flash_chunk_gated_delta_rule_bwd(
     else:
         chunk_indices = None
 
-    w = w.transpose(1, 2).contiguous()
-    v = v.transpose(1, 2).contiguous()
-    q = q.transpose(1, 2).contiguous()
-    k = k.transpose(1, 2).contiguous()
     do = do.transpose(1, 2).contiguous()
-    g = g.transpose(1, 2).contiguous()
-    beta = beta.transpose(1, 2).contiguous().float()
-    u = u.transpose(1, 2).contiguous()
-    A = A.transpose(1, 2).contiguous()
     
     h, v_new, _ = torch_npu.npu_chunk_gated_delta_rule_fwd_h(
         k,
@@ -215,9 +200,6 @@ def flash_chunk_gated_delta_rule_bwd(
       chunk_size=chunk_size
     )
     
-    # 对齐？
-    # if not dist.is_initialized() or dist.get_rank() == 0:
-    # breakpoint()  # 或使用 pdb.set_trace()
     dh, dh0, dv = torch_npu.npu_chunk_gated_delta_rule_bwd_dhu(
         q,
         k,
@@ -234,9 +216,6 @@ def flash_chunk_gated_delta_rule_bwd(
         chunk_size=chunk_size
     )
     dh0 = None
-    # if torch.distributed.get_rank()==0:
-    #     breakpoint()
-    # torch.distributed.barrier()
 
     dq, dk, dw, dg = torch_npu.npu_chunk_bwd_dqkwg(
         q, 
@@ -256,11 +235,11 @@ def flash_chunk_gated_delta_rule_bwd(
     dA = torch_npu.npu_prepare_wy_repr_bwd_da(
         k, 
         v, 
-        beta, 
+        beta.float(), 
         A, 
         dw, 
         dv, 
-        g, 
+        g.float(), 
         cu_seqlens=cu_seqlens1,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size
@@ -280,33 +259,9 @@ def flash_chunk_gated_delta_rule_bwd(
         chunk_size=chunk_size
     )
     
-    dv = dv.transpose(1, 2).contiguous()
-    dk2 = dk2.transpose(1, 2).contiguous()
     db = db.transpose(1, 2).contiguous()
     dg2 = dg2.transpose(1, 2).contiguous()
 
-    # k = k.transpose(1, 2).contiguous()
-    # v = v.transpose(1, 2).contiguous()
-    # beta = beta.transpose(1, 2).contiguous().float()
-    # g = g.transpose(1, 2).contiguous()
-    # A = A.transpose(1, 2).contiguous()
-    # dw = dw.transpose(1, 2).contiguous()
-    # dv = dv.transpose(1, 2).contiguous()
-
-    # dk2, dv, db, dg2 = prepare_wy_repr_bwd(
-    #     k=k,
-    #     v=v,
-    #     beta=beta,
-    #     g=g,
-    #     A=A,
-    #     dw=dw,
-    #     du=dv,
-    #     cu_seqlens=cu_seqlens,
-    #     chunk_size=chunk_size
-    # )
-
-    dq = dq.transpose(1, 2).contiguous()
-    dk = dk.transpose(1, 2).contiguous()
     dg = dg.transpose(1, 2).contiguous()
 
     dk.add_(dk2)
