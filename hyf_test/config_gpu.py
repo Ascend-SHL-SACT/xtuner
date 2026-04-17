@@ -106,3 +106,5 @@ def seed_all(seed=42):
     torch_npu.npu.manual_seed(seed) 
     torch_npu.npu.manual_seed_all(seed)
 # seed_all()
+from xtuner.v1.patch.fully_shard_patch import apply_fully_shard_patch
+apply_fully_shard_patch()

@@ -3,18 +3,19 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, By Triton_Ascend & sglang_ascend
 
-from typing import List, Optional, Tuple, Union, Callable
+from typing import List, Optional, Tuple, Union, Callable, Dict
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from sgl_kernel_npu.fla.utils import (
-    exp,
-    prepare_chunk_indices,
-    prepare_chunk_offsets,
-    safe_exp,
-)
+from .utils import prepare_chunk_indices
+# from sgl_kernel_npu.fla.utils import (
+#     exp,
+#     prepare_chunk_indices,
+#     prepare_chunk_offsets,
+#     safe_exp,
+# )
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -457,6 +458,7 @@ def merge_16x16_to_64x64_inverse_kernel_reorder_all_masked(
 def solve_tril_npu(
     A: torch.Tensor,
     cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_indices_out: Dict[str, Optional[torch.Tensor]] = None,
     output_dtype: torch.dtype = torch.float,
 ) -> torch.Tensor:
     """
@@ -484,12 +486,13 @@ def solve_tril_npu(
 
     LARGE_BLOCK_T = 608 * 2
     # assert A.shape[1]%LARGE_BLOCK_T == 0 # or last N_BLOCKS have not enough block which leads to tl.arange failed
-
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, LARGE_BLOCK_T)
-        if cu_seqlens is not None
-        else None
-    )
+    
+    chunk_indices = (chunk_indices_out[str(LARGE_BLOCK_T)] if cu_seqlens is not None else None)
+    # chunk_indices = (
+    #     prepare_chunk_indices_608x2(cu_seqlens, LARGE_BLOCK_T)
+    #     if cu_seqlens is not None
+    #     else None
+    # )
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, LARGE_BLOCK_T)
     solve_tril_16x16_kernel_paral_v3[NT, B * H](
         A=A,
@@ -513,9 +516,10 @@ def solve_tril_npu(
         if BT == 32
         else merge_16x16_to_64x64_inverse_kernel_reorder_all_masked
     )
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    chunk_indices = (chunk_indices_out[str(BT)] if cu_seqlens is not None else None)
+    # chunk_indices = (
+    #     prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    # )
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
     merge_fn[NT, B * H](
         A=A,

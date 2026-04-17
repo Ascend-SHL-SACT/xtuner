@@ -72,7 +72,7 @@ from xtuner.v1.utils import (
 )
 from xtuner.v1.utils.activation_offload import async_save_on_cpu
 from xtuner.v1.utils.router_offload import AsyncOffloadedTensor
-
+from xtuner.v1.module.attention.chunk_gated_delta_rule_npu.triton_core.utils import prepare_chunk_indices_list, prepare_lens, prepare_chunk_indices
 
 if TYPE_CHECKING:
     from xtuner.v1.datasets.collator import ColateItem
@@ -713,6 +713,24 @@ class MoE(BaseModel):
         output["mtp_loss"][name] = scaled_mtp_loss
 
         return scaled_mtp_loss
+        
+    def prepare_chunk_indices_all(self, seq_ctx: SequenceContext):
+        from concurrent.futures import ThreadPoolExecutor
+        cu_seq_lens_int64 = seq_ctx.cu_seq_lens_q.to(torch.int64).to(seq_ctx.inputs_embeds.device)
+        seq_ctx.cu_seq_lens_q = cu_seq_lens_int64
+        seq_ctx.cu_seq_lens_list = cu_seq_lens_int64.tolist()  # for compatibility with prepare_chunk_indices1
+        CHUNK_SIZES = [16, 32, 64, 128, 608 * 2]
+
+        def compute_chunk_indices(chunk_size):
+            return str(chunk_size), prepare_chunk_indices(cu_seq_lens_int64, chunk_size=chunk_size)
+    
+        with ThreadPoolExecutor() as executor:
+            chunk_indices = dict(executor.map(compute_chunk_indices, CHUNK_SIZES))
+                
+        cur_chunk_size = 128
+        chunk_indices_list = {str(cur_chunk_size): prepare_chunk_indices_list(cu_seq_lens_int64, chunk_size=cur_chunk_size)}
+        seq_ctx.chunk_indices = chunk_indices
+        seq_ctx.chunk_indices_list = chunk_indices_list
 
     def _forward(
         self,
@@ -723,6 +741,7 @@ class MoE(BaseModel):
         input_ids = seq_ctx.input_ids
         position_ids = seq_ctx.position_ids
 
+        self.prepare_chunk_indices_all(seq_ctx)
         if input_ids is not None:
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -1110,6 +1129,15 @@ class MoE(BaseModel):
             else:
                 reshard_after_forward = self.fsdp_config.reshard_after_forward
 
+            if os.environ.get("SHARD_512", "false").lower() == "true":
+                self._fully_shard(
+                    mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=reshard_after_forward,
+                    offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+                    hook_module=layer,
+                    module=layer.experts,
+                )
             self._fully_shard(
                 mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
                 mp_policy=mp_policy,
@@ -1122,7 +1150,11 @@ class MoE(BaseModel):
             list(self.layers.values())[:-1],
             list(self.layers.values())[1:],
         ):
-            layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
+            if os.environ.get("SHARD_512", "false").lower() == "true":
+                layer_cur._checkpoint_wrapped_module.experts.set_modules_to_forward_prefetch([layer_next, layer_next.experts])  # type: ignore
+                layer_next.set_modules_to_backward_prefetch([layer_cur, layer_cur.experts])  # type: ignore
+            else:
+                layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
 
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
@@ -1131,7 +1163,8 @@ class MoE(BaseModel):
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
             module=self.embed_tokens,
         )
-
+        if os.environ.get("SHARD_512", "false").lower() == "true":
+            self.embed_tokens.set_modules_to_forward_prefetch([self.layers["0"], self.layers["0"].experts])
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
             mp_policy=mp_policy,

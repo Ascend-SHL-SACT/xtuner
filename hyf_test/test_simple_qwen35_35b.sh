@@ -8,11 +8,14 @@
 
 # pip install transformers==5.3.0
 # pip install triton_ascend==3.2.0
-source /mnt/huawei/hyf/CANN/8.5.0-2/ascend-toolkit/set_env.sh
-source /mnt/huawei/hyf/CANN/8.5.0-2/cann-8.5.0/set_env.sh
-source /mnt/huawei/hyf/CANN/8.5.0-2/nnal/atb/set_env.sh
-pip install /mnt/huawei/tanshaojie/ascendcGDN/newPTA/torch_npu-2.7.1.post4-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+source /mnt/huawei/hyf/CANN/8.5.2/ascend-toolkit/set_env.sh
+source /mnt/huawei/hyf/CANN/8.5.2/cann-8.5.2/set_env.sh
+source /mnt/huawei/hyf/CANN/8.5.2/nnal/atb/set_env.sh
+pip install /mnt/huawei/hyf/torch_npu-2.7.1.post4-cp311-cp311-linux_aarch64.whl
 pip install /mnt/huawei/hyf/sgl-kernel-npu/output/sgl_kernel_npu-2026.3.1-cp311-cp311-linux_aarch64.whl
+# cp -f /mnt/huawei/hyf/_add_fsdp_patch.py /usr/local/lib/python3.11/site-packages/torch_npu/distributed/fsdp/_add_fsdp_patch.py
+cp /mnt/huawei/hyf/libstdc++.so.6.0.34 /usr/lib64
+ln -sf /usr/lib64/libstdc++.so.6.0.34 /usr/lib64/libstdc++.so.6
 
 config_file=${1}
 datetime=$(date +%Y%m%d_%H%M%S)
@@ -41,8 +44,6 @@ export PYTHONPATH=/mnt/hwfile/vc-intern-delivery/vl_delivery/code/mmengine:$PYTH
 export XTUNER_USE_FA3=${XTUNER_USE_FA3-"1"}
 export TORCH_LOGS=${TORCH_LOGS-"recompiles"}
 
-# /mnt/huawei/hyf/CANN/8.5.0.B030/Ascend-cann-toolkit_8.5.0_linux-aarch64.run --install
-# /mnt/huawei/hyf/CANN/8.5.0.B030/Atlas-A3-cann-kernels_8.5.0_linux-aarch64.run --install
 
 NNODES=$WORLD_SIZE  # WORLD_SIZE是clusterx训练时注入的环境变量
 if [ "x${NNODES}" == "x" ]; then
@@ -58,12 +59,14 @@ NPROC_PER_NODE=${PROC_PER_NODE-"8"}  # yidian
 fi
 
 # hyf
+export SHARD_512=true
+# export TRITON_ALWAYS_COMPILE=1
 export TRITON_ALL_BLOCKS_PARALLEL=1
 export WORLD_SIZE=${WORLD_SIZE:-$NODE_COUNT}
 export RANK=${RANK:-$NODE_RANK} 
 
 # source /usr/local/Ascend/ascend-toolkit/set_env.sh 
-export LD_LIBRARY_PATH=/mnt/huawei/hyf/CANN/8.5.0-2/cann-8.5.0/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=/mnt/huawei/hyf/CANN/8.5.2/cann-8.5.2/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
 export MULTI_STREAM_MEMORY_REUSE=2
 export MODEL_PATH=/mnt/huawei/weight/Qwen3.5-35B-A3B
 export MEDIA_ROOT=''

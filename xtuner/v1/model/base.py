@@ -448,6 +448,7 @@ class BaseModel(nn.Module):
         mp_policy: MixedPrecisionPolicy,
         reshard_after_forward: bool,
         offload_policy: CPUOffloadPolicy | None,
+        hook_module: nn.Module | None = None,
         module: nn.Module | None = None,
     ) -> None:
         def traverse(module):
@@ -498,8 +499,10 @@ class BaseModel(nn.Module):
         if patterns:
             traverse(target)
 
+        from torch.distributed.fsdp import fully_shard
         fully_shard(
             target,
+            hook_module=hook_module,
             mesh=mesh,
             mp_policy=mp_policy,
             reshard_after_forward=reshard_after_forward,

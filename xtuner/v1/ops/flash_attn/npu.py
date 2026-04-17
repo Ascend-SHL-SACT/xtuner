@@ -46,8 +46,8 @@ def npu_flash_varlen_attn(
             scale=q.shape[-1] ** -0.5,
             keep_prob=1 - dropout_p,
             input_layout="TND",
-            actual_seq_qlen=tuple(cu_seqlens_q[1:].tolist()),
-            actual_seq_kvlen=tuple(cu_seqlens_k[1:].tolist()),
+            actual_seq_qlen=tuple(cu_seqlens_q[1:]),
+            actual_seq_kvlen=tuple(cu_seqlens_k[1:]),
             sparse_mode=3,
         )[0]
     return fa_out

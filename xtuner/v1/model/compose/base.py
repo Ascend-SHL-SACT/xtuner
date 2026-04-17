@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Callable, Self
 
@@ -123,8 +124,11 @@ class BaseComposeModel(BaseModel):
                 [self.multi_modal_projector]
             )
         self.multi_modal_projector.set_modules_to_forward_prefetch([self.language_model])  # type: ignore
-        self.language_model.set_modules_to_forward_prefetch([self.language_model.layers["0"]])  # type: ignore
-
+        if os.environ.get("SHARD_512", "false").lower() == "true":
+            self.language_model.set_modules_to_forward_prefetch([self.language_model.layers["0"], self.language_model.layers["0"].experts])  # type: ignore
+        else:
+            self.language_model.set_modules_to_forward_prefetch([self.language_model.layers["0"]])  # type: ignore
+        
         self._to_empty_meta()
         return self
 

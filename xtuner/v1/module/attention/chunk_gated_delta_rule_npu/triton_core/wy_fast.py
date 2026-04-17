@@ -366,13 +366,14 @@ def recompute_w_u_fwd_new(
     g: Optional[torch.Tensor] = None,
     gk: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    chunk_indices: Optional[torch.LongTensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, H, T, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
     BK = 128
     BV = 128
 
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    # chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     w = torch.empty_like(k)
