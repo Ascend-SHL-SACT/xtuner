@@ -47,57 +47,73 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         tasks_this_core = base_tasks_per_block
         start_idx = core_id * base_tasks_per_block + remainder_tasks
 
-    for idx in range(start_idx, start_idx + tasks_this_core):
-        i_b = idx // NT
-        local_idx = idx % NT
+    SUB_BT: tl.constexpr = 32
+    NUM_SUBS: tl.constexpr = BT // SUB_BT
+    NUM_K_BLOCKS = tl.cdiv(K, BK)
+    k_batch_stride = T_max * H * K
+    state_batch_stride = H * T_max
+    A_batch_stride = T_max * H * BT
+    k_seq_stride = H * K
+    A_seq_stride = H * BT
+    sub_row_template = tl.arange(0, SUB_BT)
+    col_indices = tl.arange(0, BT)[None, :]
 
-        if IS_VARLEN:
-            i_n = tl.load(chunk_indices + local_idx * 2).to(tl.int32)
-            i_t = tl.load(chunk_indices + local_idx * 2 + 1).to(tl.int32)
-            bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-            T_local = eos - bos
-        else:
-            bos, eos = 0, T
-            i_t = local_idx
-            T_local = T
+    for i_sub in range(NUM_SUBS):
+        sub_row_off = i_sub * SUB_BT
+        sub_row_indices = sub_row_off + sub_row_template
+        base_tril_mask = (sub_row_indices[:, None] > col_indices).to(tl.float32)
 
-        for i_h in range(H):
-            k_batch_off = i_b * T_max * H * K
-            beta_batch_off = i_b * H * T_max
-            g_batch_off = i_b * H * T_max
-            A_batch_off = i_b * T_max * H * BT
+        for idx in range(start_idx, start_idx + tasks_this_core):
+            i_b = idx // NT
+            local_idx = idx % NT
 
-            p_beta = tl.make_block_ptr(beta + beta_batch_off + bos + i_h * T_max, (T_local,), (1,), (i_t * BT,), (BT,), (0,))
-            b_beta = tl.load(p_beta, boundary_check=(0,))
+            if IS_VARLEN:
+                i_n = tl.load(chunk_indices + local_idx * 2).to(tl.int32)
+                i_t = tl.load(chunk_indices + local_idx * 2 + 1).to(tl.int32)
+                bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+                eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+                T_local = eos - bos
+            else:
+                bos, eos = 0, T
+                i_t = local_idx
+                T_local = T
 
-            b_A = tl.zeros([BT, BT], dtype=tl.float32)
-            for i_k in range(tl.cdiv(K, BK)):
-                p_k = tl.make_block_ptr(k + k_batch_off + i_h * T_max * K + bos * K, (T_local, K), (K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-                b_k = tl.load(p_k, boundary_check=(0, 1))
-                dot_product = tl.dot(b_k, tl.trans(b_k))
+            k_batch_off = i_b * k_batch_stride
+            state_batch_off = i_b * state_batch_stride
+            A_batch_off = i_b * A_batch_stride
+            state_seq_off = state_batch_off + bos
+            k_seq_off = bos * k_seq_stride
+            A_seq_off = bos * A_seq_stride
 
-                o_t = i_t * BT + tl.arange(0, BT)
-                o_t = o_t.to(tl.float32)
-                T_mask = (o_t < T_local).to(tl.float32)
+            o_t = (i_t * BT + sub_row_indices).to(tl.float32)
+            T_mask = (o_t < T_local).to(tl.float32)
+            tril_mask = base_tril_mask * T_mask[:, None]
 
-                row_indices = tl.arange(0, BT)[:, None]
-                col_indices = tl.arange(0, BT)[None, :]
-                tril_mask = (row_indices > col_indices).to(tl.float32)
-                tril_mask = tril_mask * T_mask[:, None]
-                masked_dot = dot_product * tril_mask
-                b_A += masked_dot
+            for i_h in range(H):
+                b_A_sub = tl.zeros([SUB_BT, BT], dtype=tl.float32)
+                for i_k in range(NUM_K_BLOCKS):
+                    p_k_sub = tl.make_block_ptr(k + k_batch_off + k_seq_off + i_h * K, (T_local, K), (H * K, 1), (i_t * BT + sub_row_off, i_k * BK), (SUB_BT, BK), (1, 0))
+                    b_k_sub = tl.load(p_k_sub, boundary_check=(0, 1))
+                    p_k_full = tl.make_block_ptr(k + k_batch_off + k_seq_off + i_h * K, (T_local, K), (H * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+                    b_k_full = tl.load(p_k_full, boundary_check=(0, 1))
+                    dot_product = tl.dot(b_k_sub, tl.trans(b_k_full))
+                    b_A_sub += dot_product * tril_mask
 
-            if USE_G:
-                p_g = tl.make_block_ptr(g + g_batch_off + bos + i_h * T_max, (T_local,), (1,), (i_t * BT,), (BT,), (0,))
-                b_g = tl.load(p_g, boundary_check=(0,))
-                b_g_diff = b_g[:, None] - b_g[None, :]
-                b_g_diff = tl.minimum(tl.maximum(b_g_diff, -50.0), 50.0)
-                b_A *= tl.exp(b_g_diff)
-            b_A *= b_beta[:, None]
+                if USE_G:
+                    p_g_sub = tl.make_block_ptr(g + state_seq_off + i_h * T_max, (T_local,), (1,), (i_t * BT + sub_row_off,), (SUB_BT,), (0,))
+                    b_g_sub = tl.load(p_g_sub, boundary_check=(0,))
+                    p_g_full = tl.make_block_ptr(g + state_seq_off + i_h * T_max, (T_local,), (1,), (i_t * BT,), (BT,), (0,))
+                    b_g_full = tl.load(p_g_full, boundary_check=(0,))
+                    b_g_diff = b_g_sub[:, None] - b_g_full[None, :]
+                    b_g_diff = tl.minimum(tl.maximum(b_g_diff, -50.0), 50.0)
+                    b_A_sub *= tl.exp(b_g_diff)
 
-            p_A = tl.make_block_ptr(A + A_batch_off + (bos * H + i_h) * BT, (T_local, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-            tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+                p_beta_sub = tl.make_block_ptr(beta + state_seq_off + i_h * T_max, (T_local,), (1,), (i_t * BT + sub_row_off,), (SUB_BT,), (0,))
+                b_beta_sub = tl.load(p_beta_sub, boundary_check=(0,))
+                b_A_sub *= b_beta_sub[:, None]
+
+                p_A_sub = tl.make_block_ptr(A + A_batch_off + A_seq_off + i_h * BT, (T_local, BT), (BT * H, 1), (i_t * BT + sub_row_off, 0), (SUB_BT, BT), (1, 0))
+                tl.store(p_A_sub, b_A_sub.to(p_A_sub.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.heuristics({
@@ -282,7 +298,8 @@ def chunk_scaled_dot_kkt_fwd(
     Returns:
         beta * K * K^T of shape `[B, T, H, BT]` where `BT` is the chunk size.
     """
-    B, H, T, K = k.shape
+    k = k.transpose(1, 2).contiguous()
+    B, T, H, K = k.shape
     BT = chunk_size
     # chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)

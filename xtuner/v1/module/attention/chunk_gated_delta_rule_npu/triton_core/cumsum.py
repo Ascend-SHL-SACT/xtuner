@@ -90,7 +90,12 @@ def chunk_local_cumsum_scalar(
         raise ValueError(
             f"chunk_size must be a power of 2, chunk_size is{chunk_size}"
         )
-    BT = triton.next_power_of_2((1 << 17) // (H * chunk_size))
+    # BT = triton.next_power_of_2((1 << 17) // (H * chunk_size))
+    base_bt = max(1, (1 << 17) // (H * chunk_size))
+    # 确保base_bt是CHUNK_SIZE的整数倍
+    base_bt = ((base_bt + chunk_size - 1) // chunk_size) * chunk_size
+    # 取2的幂作为最终的BLOCK_T
+    BT = triton.next_power_of_2(base_bt)
     chunk_indices = chunk_indices_out[str(BT)] if cu_seqlens is not None else None
     # chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)

@@ -411,7 +411,7 @@ def flash_gated_delta_rule(
     cu_seqlens_list: Optional[list[int]] = None,
     chunk_indices: Dict[str, Optional[torch.LongTensor]] = None,
     chunk_indices_list: Dict[str, Optional[list[int]]] = None,
-    chunk_size: int = 64,
+    chunk_size: int = 128,
     head_first: bool = False,
 ):
     r"""

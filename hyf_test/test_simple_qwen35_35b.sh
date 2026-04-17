@@ -59,7 +59,7 @@ NPROC_PER_NODE=${PROC_PER_NODE-"8"}  # yidian
 fi
 
 # hyf
-export SHARD_512=true
+export SHARD_512=false
 # export TRITON_ALWAYS_COMPILE=1
 export TRITON_ALL_BLOCKS_PARALLEL=1
 export WORLD_SIZE=${WORLD_SIZE:-$NODE_COUNT}

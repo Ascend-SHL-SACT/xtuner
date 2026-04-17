@@ -1,22 +1,27 @@
-# Adapted and Merge from
-#   https://github.com/sglang/python/sglang/srt/layers/attention/fla/solve_tril.py
 # -*- coding: utf-8 -*-
-# Copyright (c) 2023-2025, By Triton_Ascend & sglang_ascend
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import List, Optional, Tuple, Union, Callable, Dict
+from statistics import quantiles
+from typing import Optional, Dict
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from .utils import prepare_chunk_indices
-# from sgl_kernel_npu.fla.utils import (
-#     exp,
-#     prepare_chunk_indices,
-#     prepare_chunk_offsets,
-#     safe_exp,
-# )
+import os
 
+def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
+    return cu_seqlens[1:] - cu_seqlens[:-1]
+
+
+def prepare_chunk_indices(
+    cu_seqlens: torch.LongTensor,
+    chunk_size: int
+) -> torch.LongTensor:
+    indices = torch.cat([torch.arange(n) for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()])
+    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+
+FLA_TRIL_PRECISION = os.environ.get('FLA_TRIL_PRECISION', 'ieee')
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.jit(do_not_specialize=["T"])
@@ -248,11 +253,11 @@ def merge_16x16_to_32x32_inverse_kernel(
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_tt, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
+        i_n, i_t = tl.load(chunk_indices + i_tt * 2).to(tl.int32), tl.load(
+            chunk_indices + i_tt * 2 + 1
         ).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
             cu_seqlens + i_n + 1
@@ -261,12 +266,12 @@ def merge_16x16_to_32x32_inverse_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    A += (bos * H + i_h) * 32
+    A += (bos * H + i_h) * BT
     Ad += (bos * H + i_h) * 16
     Ai += (bos * H + i_h) * 32
 
     p_A_21 = tl.make_block_ptr(
-        A, (T, 32), (H * 32, 1), (i_t * 32 + 16, 0), (16, 16), (1, 0)
+        A, (T, BT), (H * BT, 1), (i_t * 32 + 16, 0 + i_t % (BT // 32) * 32), (16, 16), (1, 0)
     )
     p_Ad_11 = tl.make_block_ptr(
         Ad, (T, 16), (H * 16, 1), (i_t * 32, 0), (16, 16), (1, 0)
@@ -306,6 +311,160 @@ def merge_16x16_to_32x32_inverse_kernel(
         boundary_check=(0, 1),
     )
 
+
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T"])
+def merge_32x32_to_64x64_inverse_kernel(
+    A,
+    Ad,
+    Ai,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    A += (bos * H + i_h) * BT
+    Ad += (bos * H + i_h) * 32
+    Ai += (bos * H + i_h) * 64
+
+    p_A_21 = tl.make_block_ptr(
+        A, (T, BT), (H * BT, 1), (i_t * 64 + 32, 0 + i_t % (BT // 64) * 64), (32, 32), (1, 0)
+    )
+
+    p_Ad_11 = tl.make_block_ptr(
+        Ad, (T, 32), (H * 32, 1), (i_t * 64, 0), (32, 32), (1, 0)
+    )
+    p_Ad_22 = tl.make_block_ptr(
+        Ad, (T, 32), (H * 32, 1), (i_t * 64 + 32, 0), (32, 32), (1, 0)
+    )
+
+    p_Ai_11 = tl.make_block_ptr(
+        Ai, (T, 64), (H * 64, 1), (i_t * 64, 0), (32, 32), (1, 0)
+    )
+    p_Ai_22 = tl.make_block_ptr(
+        Ai, (T, 64), (H * 64, 1), (i_t * 64 + 32, 32), (32, 32), (1, 0)
+    )
+    p_Ai_21 = tl.make_block_ptr(
+        Ai, (T, 64), (H * 64, 1), (i_t * 64 + 32, 0), (32, 32), (1, 0)
+    )
+
+    A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
+    Ai_11 = tl.load(p_Ad_11, boundary_check=(0, 1)).to(tl.float32)
+    Ai_22 = tl.load(p_Ad_22, boundary_check=(0, 1)).to(tl.float32)
+    Ai_21 = -tl.dot(
+        tl.dot(Ai_22, A_21, input_precision="ieee"), Ai_11, input_precision="ieee"
+    )
+    tl.store(
+        p_Ai_11,
+        Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_22,
+        Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_21,
+        Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T"])
+def merge_64x64_to_128x128_inverse_kernel(
+    A,
+    Ad,
+    Ai,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    A += (bos * H + i_h) * 128
+    Ad += (bos * H + i_h) * 64
+    Ai += (bos * H + i_h) * 128
+
+    p_A_21 = tl.make_block_ptr(
+        A, (T, 128), (H * 128, 1), (i_t * 128 + 64, 0), (64, 64), (1, 0)
+    )
+
+    p_Ad_11 = tl.make_block_ptr(
+        Ad, (T, 64), (H * 64, 1), (i_t * 128, 0), (64, 64), (1, 0)
+    )
+    p_Ad_22 = tl.make_block_ptr(
+        Ad, (T, 64), (H * 64, 1), (i_t * 128 + 64, 0), (64, 64), (1, 0)
+    )
+
+    p_Ai_11 = tl.make_block_ptr(
+        Ai, (T, 128), (H * 128, 1), (i_t * 128, 0), (64, 64), (1, 0)
+    )
+    p_Ai_22 = tl.make_block_ptr(
+        Ai, (T, 128), (H * 128, 1), (i_t * 128 + 64, 64), (64, 64), (1, 0)
+    )
+    p_Ai_21 = tl.make_block_ptr(
+        Ai, (T, 128), (H * 128, 1), (i_t * 128 + 64, 0), (64, 64), (1, 0)
+    )
+
+    A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
+    Ai_11 = tl.load(p_Ad_11, boundary_check=(0, 1)).to(tl.float32)
+    Ai_22 = tl.load(p_Ad_22, boundary_check=(0, 1)).to(tl.float32)
+    Ai_21 = -tl.dot(
+        tl.dot(Ai_22, A_21, input_precision="ieee"), Ai_11, input_precision="ieee"
+    )
+    tl.store(
+        p_Ai_11,
+        Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_22,
+        Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+    tl.store(
+        p_Ai_21,
+        Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
 
 @triton.heuristics(
     {
@@ -447,12 +606,12 @@ def merge_16x16_to_64x64_inverse_kernel_reorder_all_masked(
     )
 
     # ------------------ Zero out the upper-right 32x32 block (rows 0~31, cols 32~63) ------------------
-    offs_m = i_t * 64 + tl.arange(0, 32)
-    offs_n = 32 + tl.arange(0, 32)
-    mask_store = (offs_m[:, None] < T) & (offs_n[None, :] < BT)  # BT=64
-    ptr_Ai = Ai + offs_m[:, None] * (H * BT) + offs_n[None, :]
-    zero_block = tl.zeros((32, 32), dtype=ptr_Ai.dtype.element_ty)
-    tl.store(ptr_Ai, zero_block, mask=mask_store)
+    # offs_m = i_t * 64 + tl.arange(0, 32)
+    # offs_n = 32 + tl.arange(0, 32)
+    # mask_store = (offs_m[:, None] < T) & (offs_n[None, :] < BT)  # BT=64
+    # ptr_Ai = Ai + offs_m[:, None] * (H * BT) + offs_n[None, :]
+    # zero_block = tl.zeros((32, 32), dtype=ptr_Ai.dtype.element_ty)
+    # tl.store(ptr_Ai, zero_block, mask=mask_store)
 
 
 def solve_tril_npu(
@@ -477,7 +636,7 @@ def solve_tril_npu(
     Returns:
         (I + A)^-1 with the same shape as A
     """
-    assert A.shape[-1] in [16, 32, 64]
+    assert A.shape[-1] in [16, 32, 64, 128]
 
     B, T, H, BT = A.shape
     Ad = torch.empty(
@@ -486,10 +645,10 @@ def solve_tril_npu(
 
     LARGE_BLOCK_T = 608 * 2
     # assert A.shape[1]%LARGE_BLOCK_T == 0 # or last N_BLOCKS have not enough block which leads to tl.arange failed
-    
+    # LARGE_BLOCK_T = BT
     chunk_indices = (chunk_indices_out[str(LARGE_BLOCK_T)] if cu_seqlens is not None else None)
     # chunk_indices = (
-    #     prepare_chunk_indices_608x2(cu_seqlens, LARGE_BLOCK_T)
+    #     prepare_chunk_indices(cu_seqlens, LARGE_BLOCK_T)
     #     if cu_seqlens is not None
     #     else None
     # )
@@ -503,25 +662,49 @@ def solve_tril_npu(
         H=H,
         BT=BT,
         LARGE_BLOCK_T=LARGE_BLOCK_T,
-        num_warps=1,
-        num_stages=4,
+        # num_warps=1,
+        # num_stages=4,
     )
 
     if BT == 16:
         return Ad
 
-    Ai = torch.zeros_like(A, device=A.device, dtype=output_dtype)
+    Ai = torch.zeros(
+        B, T, H, 32, device=A.device, dtype=torch.float if BT != 32 else output_dtype
+    )
     merge_fn = (
         merge_16x16_to_32x32_inverse_kernel
         if BT == 32
         else merge_16x16_to_64x64_inverse_kernel_reorder_all_masked
     )
-    chunk_indices = (chunk_indices_out[str(BT)] if cu_seqlens is not None else None)
     # chunk_indices = (
-    #     prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    #     prepare_chunk_indices(cu_seqlens, 32 if BT == 32 else 64) if cu_seqlens is not None else None
     # )
-    NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
-    merge_fn[NT, B * H](
+    # NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, 32 if BT == 32 else 64)
+    # breakpoint()
+    
+    # merge_fn[NT, B * H](
+    #     A=A,
+    #     Ad=Ad,
+    #     Ai=Ai,
+    #     cu_seqlens=cu_seqlens,
+    #     chunk_indices=chunk_indices,
+    #     T=T,
+    #     H=H,
+    #     BT=32 if BT == 32 else 64,
+    #     # BT=BT,
+    #     # num_warps=4,
+    #     # num_stages=3,
+    # )
+
+    chunk_indices = (chunk_indices_out[str(32)] if cu_seqlens is not None else None)
+    # chunk_indices = (
+    #     # prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    #     prepare_chunk_indices(cu_seqlens, 32) if cu_seqlens is not None else None
+    # )
+    NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, 32)
+    # print(A.shape)
+    merge_16x16_to_32x32_inverse_kernel[NT, B * H](
         A=A,
         Ad=Ad,
         Ai=Ai,
@@ -530,7 +713,182 @@ def solve_tril_npu(
         T=T,
         H=H,
         BT=BT,
-        num_warps=4,
-        num_stages=3,
     )
-    return Ai
+    if BT == 32:
+        return Ai
+
+    Ad = Ai
+    Ai = torch.zeros(
+        B, T, H, 64, device=A.device, dtype=torch.float if BT != 64 else output_dtype
+    )
+    chunk_indices = (chunk_indices_out[str(64)] if cu_seqlens is not None else None)
+    # chunk_indices = (
+    #     # prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    #     prepare_chunk_indices(cu_seqlens, 64) if cu_seqlens is not None else None
+    # )
+    NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, 64)
+    merge_32x32_to_64x64_inverse_kernel[NT, B * H](
+        A=A,
+        Ad=Ad,
+        Ai=Ai,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        BT=BT,
+    )
+    if BT == 64:
+        return Ai
+    
+    assert BT == 128
+    Aii = torch.zeros_like(A, device=A.device, dtype=output_dtype)
+    chunk_indices = (chunk_indices_out[str(128)] if cu_seqlens is not None else None)
+    # chunk_indices = (
+    #     prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    # )
+    NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
+    merge_64x64_to_128x128_inverse_kernel[NT, B * H](
+        A=A,
+        Ad=Ai,
+        Ai=Aii,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        BT=BT,
+        # num_warps=4,
+        # num_stages=3,
+    )
+
+    return Aii
+
+
+
+if __name__ == "__main__":
+
+    # 参数配置
+    # B, H, T, K, V, BT = 1, 32, 65536, 128, 128, 64
+    # B, H, T, K, V, BT = 1, 32, 209, 128, 128, 64
+    B, H, T, K, V, BT = 1, 32, 65536, 128, 128, 128
+    # B, H, T, K, V, BT = 1, 1, 209, 1, 1, 128
+    # B, H, T, K, V, BT = 1, 32, 209, 128, 1, 64
+    # B, H, T, K, V, BT = 1, 1, 128, 128, 1, 64
+    device = "npu:0"
+    
+    # 设置随机种子以保证可复现性
+    torch.manual_seed(42)
+    
+    # 统一生成随机数据
+    k = torch.randn(B, T, H, K, device=device, dtype=torch.bfloat16)
+    # v = torch.randn(B, T, H, V, device=device, dtype=torch.bfloat16)
+    beta = torch.randn(B, T, H, device=device, dtype=torch.bfloat16)
+    A = torch.randn(B, T, H, BT, device=device, dtype=torch.bfloat16)
+    g = torch.randn(B, T, H, device=device, dtype=torch.bfloat16)
+    data = [0,   112,   209,   240,   281,   489,   523,   566,   689,   721,
+          785,   837,   985,  1071,  1121,  1186,  1255,  1328,  1449,  1592,
+         1733,  1766,  1830,  1870,  2054,  2181,  2219,  2332,  2560,  2690,
+         2855,  2955,  3012,  3044,  3835,  3910,  3964,  4005,  4050,  4079,
+         4110,  4240,  4308,  4410,  4552,  4684,  4763,  4805,  4862,  5006,
+         5112,  5133,  5293,  5443,  5512,  5606,  5728,  5794,  5966,  6035,
+         6170,  6272,  6470,  6598,  6691,  6747,  6819,  6860,  6884,  7129,
+         7164,  7218,  7320,  7411,  7500,  7561,  7626,  7679,  7769,  7809,
+         7893,  7951,  8000,  8092,  8209,  8305,  8343,  8392,  8451,  8509,
+         8761,  8929,  9014,  9130,  9182,  9211,  9245,  9278,  9331,  9476,
+         9536,  9575,  9627,  9785,  9899,  9982, 10080, 10119, 10192, 10270,
+        10305, 10384, 10455, 10595, 10683, 10721, 10767, 11032, 11148, 11297,
+        11388, 11533, 11588, 11643, 11723, 11857, 11915, 11959, 12229, 12282,
+        12310, 12382, 12487, 12543, 12638, 12678, 12730, 12812, 12951, 13000,
+        13126, 13165, 13236, 13306, 13436, 13514, 13541, 13677, 13729, 13845,
+        13872, 13962, 14079, 14175, 14205, 14325, 14406, 14434, 14555, 14596,
+        14662, 14728, 14883, 14916, 14999, 15092, 15226, 15257, 15453, 15550,
+        15771, 15896, 15965, 16009, 16066, 16136, 16254, 16488, 16649, 16724,
+        16846, 16970, 17142, 17185, 17304, 17340, 17514, 17577, 17689, 17867,
+        17909, 17948, 17977, 18050, 18153, 18218, 18311, 18365, 18419, 18443,
+        18473, 18724, 18865, 19017, 19061, 19226, 19265, 19349, 19454, 19494,
+        19518, 19578, 19642, 19702, 19848, 19884, 20027, 20074, 20273, 20443,
+        20501, 20583, 20729, 20796, 20818, 20866, 20911, 21157, 21196, 21259,
+        21312, 21471, 21647, 21750, 21870, 21920, 21952, 21982, 22027, 22141,
+        22183, 22287, 22423, 22470, 22664, 22764, 22859, 23027, 23142, 23241,
+        23330, 23377, 23441, 23574, 23603, 23727, 23859, 23956, 24001, 24107,
+        24302, 24398, 24476, 24545, 24614, 24659, 24854, 24987, 25309, 25352,
+        25548, 25627, 25744, 25837, 25869, 25913, 26004, 26044, 26076, 26100,
+        26227, 26291, 26344, 26515, 26547, 26593, 26625, 26698, 26726, 26847,
+        26964, 27136, 27327, 27357, 27440, 27540, 27571, 27672, 27718, 27872,
+        27913, 28010, 28068, 28106, 28270, 28318, 28363, 28508, 28603, 28686,
+        28722, 28754, 28793, 28835, 28867, 28928, 28975, 29064, 29107, 29194,
+        29231, 29265, 29449, 29519, 29560, 29608, 29652, 29758, 29794, 29851,
+        29887, 29981, 30058, 30118, 30306, 30445, 30580, 30621, 30645, 30691,
+        31252, 31332, 31362, 31501, 31566, 31641, 31675, 31748, 31805, 31927,
+        32000, 32081, 32143, 32235, 32359, 32405, 32505, 32683, 32718, 32803,
+        32902, 32942, 33006, 33109, 33227, 33316, 33370, 33475, 33505, 33554,
+        33627, 33703, 33749, 33926, 33962, 34392, 34552, 34585, 34616, 34654,
+        34723, 34887, 34926, 34964, 35015, 35169, 35251, 35307, 35485, 35604,
+        35642, 35819, 35930, 35959, 36102, 36256, 36348, 36550, 36585, 36621,
+        36696, 36834, 36912, 36957, 36983, 37037, 37152, 37298, 37327, 37364,
+        37474, 37522, 37550, 37669, 37718, 37778, 37807, 37909, 37979, 38086,
+        38179, 38291, 38385, 38417, 38545, 38661, 38828, 38883, 39006, 39051,
+        39083, 39126, 39202, 39236, 39331, 39414, 39541, 39566, 39661, 39715,
+        39759, 39796, 39840, 39881, 39911, 39963, 40083, 40124, 40258, 40338,
+        40378, 40427, 40487, 40680, 40783, 40852, 40897, 40947, 40987, 41069,
+        41099, 41131, 41214, 41247, 41375, 41414, 41449, 41543, 41600, 41685,
+        41721, 41883, 41991, 42086, 42233, 42265, 42302, 42356, 42445, 42504,
+        42534, 42653, 42693, 42778, 42828, 42937, 43030, 43209, 43351, 43530,
+        43573, 43603, 43651, 43731, 43777, 43886, 43925, 44068, 44112, 44163,
+        44204, 44301, 44476, 44616, 44689, 44716, 44847, 44917, 45020, 45151,
+        45216, 45309, 45370, 45524, 45628, 45669, 45813, 45846, 45931, 45963,
+        46111, 46386, 46484, 46554, 46599, 46631, 46704, 46882, 47012, 47087,
+        47158, 47262, 47359, 47458, 47497, 47526, 47807, 47959, 48162, 48267,
+        48298, 48348, 48389, 48482, 48600, 48714, 48806, 48856, 48893, 49008,
+        49070, 49158, 49302, 49364, 49572, 49618, 49653, 49750, 49782, 49852,
+        49883, 49910, 49944, 50014, 50142, 50220, 50301, 50338, 50448, 50503,
+        50699, 50808, 50947, 51093, 51178, 51221, 51292, 51314, 51363, 51428,
+        51497, 51639, 51790, 51874, 51968, 52068, 52105, 52221, 52270, 52340,
+        52453, 52527, 52623, 52679, 52801, 52844, 52893, 52977, 53074, 53183,
+        53222, 53258, 53348, 53417, 53541, 53579, 53713, 53813, 53843, 53881,
+        53930, 54070, 54106, 54249, 54317, 54351, 54392, 54483, 54513, 54577,
+        54980, 55029, 55182, 55253, 55284, 55342, 55446, 55680, 55717, 55747,
+        55772, 55811, 56027, 56098, 56135, 56229, 56270, 56332, 56370, 56405,
+        56499, 56730, 56919, 57037, 57081, 57189, 57220, 57332, 57372, 57409,
+        57459, 57520, 57599, 57698, 57770, 57948, 58053, 58184, 58300, 58414,
+        58491, 58577, 58671, 58715, 58793, 58838, 58866, 59001, 59041, 59096,
+        59220, 59273, 59323, 59418, 59467, 59532, 59638, 59762, 59832, 59959,
+        60107, 60164, 60316, 60421, 60553, 60621, 60823, 60875, 60934, 61021,
+        61058, 61109, 61141, 61234, 61322, 61479, 61505, 61634, 61765, 61805,
+        61855, 62014, 62064, 62148, 62247, 62303, 62392, 62530, 62575, 62615,
+        62760, 62884, 62984, 63025, 63085, 63138, 63167, 63355, 63388, 63495,
+        63604, 63681, 63767, 64013, 64051, 64189, 64321, 64459, 64501, 64620,
+        64682, 64712, 64798, 64838, 64869, 65066, 65222, 65357, 65535, 65536]
+    # data = data[:3]
+    # data = data[::15] + [data[-1]]
+    # data = [0, 64, 128]
+    cu_seqlens = torch.tensor(data, dtype=torch.long, device=device)
+    # 调用测试函数
+    # g = test_kkt(k, g, beta, cu_seqlens, BT)
+    # A = solve_tril(A,cu_seqlens)
+
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    A_list = []
+    ref_list = []
+    for t in seqlens:
+        k = F.normalize(torch.randn((B, H, t, K), dtype=torch.float32, device=device), dim=-1)
+        padding_size = (BT - t % BT) % BT
+        k_padded = F.pad(k, (0, 0, 0, padding_size, 0, 0, 0, 0))
+        k_padded = k_padded.reshape(B, H, -1, BT, K)
+        A_part = (k_padded @ k_padded.transpose(-1, -2)).tril(-1)
+
+        ref_part = torch.inverse(A_part + torch.eye(A_part.shape[-1], device=A_part.device)[None, None, None, ...])
+        ref_part = ref_part.reshape(B, H, -1, BT)[:, :, :t, :]
+        ref_list.append(ref_part)
+
+        A_part = A_part.reshape(B, H, -1, BT)[:, :, :t, :]
+        A_list.append(A_part)
+
+    A = torch.cat(A_list, dim=2).transpose(1, 2).contiguous()
+    ref = torch.cat(ref_list, dim=2).transpose(1, 2).contiguous()
+
+    # breakpoint()
+    tt_A = solve_tril_npu(A,cu_seqlens)
+    print(triton.testing.do_bench(lambda: solve_tril_npu(A,cu_seqlens)))
+    # tt_V_A = solve_tril(A, cuseqlens)
+    # breakpoint()
+    torch.testing.assert_close(tt_A, ref, atol=0.001, rtol=0.001)
