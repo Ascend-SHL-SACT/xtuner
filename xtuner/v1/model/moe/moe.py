@@ -727,7 +727,7 @@ class MoE(BaseModel):
         with ThreadPoolExecutor() as executor:
             chunk_indices = dict(executor.map(compute_chunk_indices, CHUNK_SIZES))
                 
-        cur_chunk_size = 128
+        cur_chunk_size = int(os.environ.get("CHUNK_SIZE", "64"))
         chunk_indices_list = {str(cur_chunk_size): prepare_chunk_indices_list(cu_seq_lens_int64, chunk_size=cur_chunk_size)}
         seq_ctx.chunk_indices = chunk_indices
         seq_ctx.chunk_indices_list = chunk_indices_list

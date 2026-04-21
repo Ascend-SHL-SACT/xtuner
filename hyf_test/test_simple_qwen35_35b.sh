@@ -8,14 +8,15 @@
 
 # pip install transformers==5.3.0
 # pip install triton_ascend==3.2.0
-source /mnt/huawei/hyf/CANN/8.5.2/ascend-toolkit/set_env.sh
-source /mnt/huawei/hyf/CANN/8.5.2/cann-8.5.2/set_env.sh
-source /mnt/huawei/hyf/CANN/8.5.2/nnal/atb/set_env.sh
-pip install /mnt/huawei/hyf/torch_npu-2.7.1.post4-cp311-cp311-linux_aarch64.whl
-pip install /mnt/huawei/hyf/sgl-kernel-npu/output/sgl_kernel_npu-2026.3.1-cp311-cp311-linux_aarch64.whl
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+# source /mnt/huawei/hyf/CANN/8.5.2/ascend-toolkit/set_env.sh
+# source /mnt/huawei/hyf/CANN/8.5.2/cann-8.5.2/set_env.sh
+# source /mnt/huawei/hyf/CANN/8.5.2/nnal/atb/set_env.sh
+# pip install /mnt/huawei/hyf/torch_npu-2.7.1.post4-cp311-cp311-linux_aarch64.whl
+# pip install /mnt/huawei/hyf/sgl-kernel-npu/output/sgl_kernel_npu-2026.3.1-cp311-cp311-linux_aarch64.whl
 # cp -f /mnt/huawei/hyf/_add_fsdp_patch.py /usr/local/lib/python3.11/site-packages/torch_npu/distributed/fsdp/_add_fsdp_patch.py
-cp /mnt/huawei/hyf/libstdc++.so.6.0.34 /usr/lib64
-ln -sf /usr/lib64/libstdc++.so.6.0.34 /usr/lib64/libstdc++.so.6
+# cp /mnt/huawei/hyf/libstdc++.so.6.0.34 /usr/lib64
+# ln -sf /usr/lib64/libstdc++.so.6.0.34 /usr/lib64/libstdc++.so.6
 
 config_file=${1}
 datetime=$(date +%Y%m%d_%H%M%S)
@@ -60,13 +61,14 @@ fi
 
 # hyf
 export SHARD_512=false
+export CHUNK_SIZE=64
 # export TRITON_ALWAYS_COMPILE=1
 export TRITON_ALL_BLOCKS_PARALLEL=1
 export WORLD_SIZE=${WORLD_SIZE:-$NODE_COUNT}
 export RANK=${RANK:-$NODE_RANK} 
 
 # source /usr/local/Ascend/ascend-toolkit/set_env.sh 
-export LD_LIBRARY_PATH=/mnt/huawei/hyf/CANN/8.5.2/cann-8.5.2/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
+# export LD_LIBRARY_PATH=/mnt/huawei/hyf/CANN/8.5.2/cann-8.5.2/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
 export MULTI_STREAM_MEMORY_REUSE=2
 export MODEL_PATH=/mnt/huawei/weight/Qwen3.5-35B-A3B
 export MEDIA_ROOT=''

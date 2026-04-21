@@ -5,6 +5,7 @@
 import warnings
 from typing import Optional, Dict
 import math
+import os
 
 import torch
 import torch_npu
@@ -411,7 +412,7 @@ def flash_gated_delta_rule(
     cu_seqlens_list: Optional[list[int]] = None,
     chunk_indices: Dict[str, Optional[torch.LongTensor]] = None,
     chunk_indices_list: Dict[str, Optional[list[int]]] = None,
-    chunk_size: int = 128,
+    chunk_size: int = int(os.environ.get("CHUNK_SIZE", "64")),
     head_first: bool = False,
 ):
     r"""
