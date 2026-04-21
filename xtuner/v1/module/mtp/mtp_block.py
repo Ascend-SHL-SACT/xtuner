@@ -109,6 +109,8 @@ class MTPBlock(nn.Module):
             # Roll sequence context to get future tokens
             # This shifts each packed sequence independently, respecting boundaries
             current_seq_ctx = roll_sequence_context(current_seq_ctx, shifts=-1)
+            if hasattr(seq_ctx, "cu_seq_lens_list"):
+                current_seq_ctx.cu_seq_lens_list = seq_ctx.cu_seq_lens_list
 
             # Get embeddings for future tokens
             if current_seq_ctx.inputs_embeds is None:
