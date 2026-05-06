@@ -5,6 +5,7 @@ from xtuner.v1.config import (
     AdamWConfig,
     FSDPConfig,
     LRConfig,
+    MuonConfig,
 )
 from xtuner.v1.datasets import FTDPTokenizeFnConfig
 from xtuner.v1.loss.ce_loss import CELossConfig
@@ -35,12 +36,21 @@ float8_cfg = Float8Config(
 
 
 moe_cfg = Qwen3_5_VLMoE35BA3Config()
-# moe_cfg.text_config.num_hidden_layers = 20
+# moe_cfg.text_config.num_hidden_layers = 4
 moe_cfg.text_config.ep_size = 1
+NORMAL_MTP_LAYERS = 4 # 示例，按需替换
+SCI_MTP_LAYERS = 1
+NORMAL_MTP_FACTOR = 1.0
+SCI_MTP_FACTOR = 0.3
+moe_cfg.text_config.mtp_config = [
+    MTPConfig(name="normal", mask_type=None, num_layers=NORMAL_MTP_LAYERS , share_weights=NORMAL_MTP_LAYERS>1, loss_scaling_factor=NORMAL_MTP_FACTOR),
+    MTPConfig(name="sci", mask_type="v3", num_layers=SCI_MTP_LAYERS, share_weights=SCI_MTP_LAYERS>1, loss_scaling_factor=SCI_MTP_FACTOR),
+]
 # if MTPConfig is not None:
 #     moe_cfg.text_config.mtp_config = MTPConfig(num_layers=1, loss_scaling_factor=1.0)
 # moe_cfg.text_config.layer_balancing_loss_cfg = LayerBalancingLossConfig()
-optim_cfg = AdamWConfig(lr=6e-05, foreach=False, swap_optimizer=False)
+# optim_cfg = AdamWConfig(lr=6e-05, foreach=False, swap_optimizer=False)
+optim_cfg = MuonConfig(lr=6e-05, weight_decay=0.05)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 fsdp_cfg = FSDPConfig(
     torch_compile=True,
@@ -57,7 +67,7 @@ dataset_config = [
 ]
 
 dataloader_config = DataloaderConfig(
-    pack_max_length=64*1024,
+    pack_max_length=256*1024,
     pack_level="hard"
 )
 
@@ -79,10 +89,11 @@ trainer = TrainerConfig(
     # hf_interval=2,
     work_dir="/mnt/huawei/hyf/xtuner_logs_0410",
     # seed=0,
-    profile_step=20,
-    profile_time=True,
-    # profile_memory=False,
-    # sp_size=2
+    # profile_step=20,
+    # profile_time=True,
+    # profile_memory=True,
+    sp_size=4,
+    # strict_load=False,
 )
 
 def seed_all(seed=42):

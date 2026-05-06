@@ -580,32 +580,20 @@ class MoE(BaseModel):
         all_router_logits = []
         all_router_weights = []
 
-            for micro_batch_idx, (micro_batch_router_logits, micro_batch_router_weights) in enumerate(
-                zip(router_logits_list, router_weights_list)
-            ):
-                if micro_batch_router_logits:
-                    _router_logits_list: list[torch.Tensor] = [
-                        maybe_wait_offload_tensor(
-                            router_logits_tensor,
-                            self._is_layer_balancing_enabled(),
-                        )
-                        for router_logits_tensor in micro_batch_router_logits.values()
-                    ]
-                    _router_weights_list: list[torch.Tensor] = [
-                        maybe_wait_offload_tensor(
-                            router_weights_tensor,
-                            self._is_layer_balancing_enabled(),
-                        )
-                        for router_weights_tensor in micro_batch_router_weights.values()
-                    ]
+        for micro_batch_idx, (micro_batch_router_logits, micro_batch_router_weights) in enumerate(
+            zip(router_logits_list, router_weights_list)
+        ):
+            if micro_batch_router_logits:
+                _router_logits_list = list(micro_batch_router_logits.values())
+                _router_weights_list = list(micro_batch_router_weights.values())
 
-                    attn_mask = seq_ctx_list[micro_batch_idx].mask
-                    router_logits = self._select_non_pad_router_logits(_router_logits_list, attn_mask)
-                    router_weights = self._select_non_pad_router_logits(_router_weights_list, attn_mask)
-                    all_router_logits.append(router_logits)
-                    all_router_weights.append(router_weights)
+                attn_mask = seq_ctx_list[micro_batch_idx].mask
+                router_logits = self._select_non_pad_router_logits(_router_logits_list, attn_mask)
+                router_weights = self._select_non_pad_router_logits(_router_weights_list, attn_mask)
+                all_router_logits.append(router_logits)
+                all_router_weights.append(router_weights)
 
-            assert all_router_logits, "Expected router logits from MoE layers."
+        if all_router_logits:
             # Concatenate router logits from all micro-batches
             combined_router_logits = torch.cat(all_router_logits, dim=1)  # [num_layers, total_seq, num_experts]
             combined_router_weights = torch.cat(all_router_weights, dim=1)
@@ -719,7 +707,7 @@ class MoE(BaseModel):
         cu_seq_lens_int64 = seq_ctx.cu_seq_lens_q.to(torch.int64).to(seq_ctx.inputs_embeds.device)
         seq_ctx.cu_seq_lens_q = cu_seq_lens_int64
         seq_ctx.cu_seq_lens_list = cu_seq_lens_int64.tolist()  # for compatibility with prepare_chunk_indices1
-        CHUNK_SIZES = [16, 32, 64, 128, 608 * 2]
+        CHUNK_SIZES = [16, 32, 64, 128, 256, 608 * 2]
 
         def compute_chunk_indices(chunk_size):
             return str(chunk_size), prepare_chunk_indices(cu_seq_lens_int64, chunk_size=chunk_size)
@@ -1197,6 +1185,7 @@ class MoE(BaseModel):
                     mtp_block.layers[mtp_idx] = mtp_layer
 
                     reshard_after_forward = mtp_idx != len(mtp_block.layers) - 1
+                    # reshard_after_forward = True
                     self._fully_shard(
                         mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
                         mp_policy=mp_policy,
