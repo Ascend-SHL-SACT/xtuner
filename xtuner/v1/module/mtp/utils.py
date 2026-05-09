@@ -3,6 +3,7 @@
 import torch
 
 from xtuner.v1.data_proto import SequenceContext
+from xtuner.v1.data_proto.utils import split_for_sequence_parallel
 
 
 def roll_packed_tensor(
@@ -124,7 +125,7 @@ def roll_sequence_context(
         overrides["raw_inputs_embeds"] = rolled_e
         if is_sp:
             s = seq_ctx._shard_start
-            overrides["inputs_embeds"] = rolled_e[:, s : s + seq_ctx._shard_size]
+            overrides["inputs_embeds"] = rolled_e[:, s : s + seq_ctx._shard_size].clone()
         else:
             overrides["inputs_embeds"] = rolled_e
 
