@@ -826,16 +826,51 @@ class MoE(BaseModel):
                 inputs_embeds=seq_ctx.inputs_embeds.clone() if seq_ctx.inputs_embeds is not None else None,
             )
 
+            mtp_outputs_dict = {}
             for mtp_config in self.config.mtp_config:
-                self._mtp_forward(
-                    mtp_config,
-                    output,
-                    layer_hidden_states,
-                    position_embeddings,
-                    seq_ctx,
-                    mtp_seq_ctx,
-                    mtp_loss_ctx_dict,
+
+                name = mtp_config.name
+
+                # Forward through MTP block
+                mtp_outputs = self.mtp_block[name](
+                    hidden_states=layer_hidden_states,
+                    embed_tokens_fn=self.embed_tokens,
+                    position_embeddings=position_embeddings,
+                    seq_ctx=mtp_seq_ctx,
                 )
+                mtp_outputs_dict[name] = mtp_outputs
+                # self._mtp_forward(
+                #     mtp_config,
+                #     output,
+                #     layer_hidden_states,
+                #     position_embeddings,
+                #     seq_ctx,
+                #     mtp_seq_ctx,
+                #     mtp_loss_ctx_dict,
+                # )
+
+            # Compute MTP losses for each depth
+            for mtp_config in self.config.mtp_config:
+
+                name = mtp_config.name
+                mtp_losses = torch.tensor(0.0, device=DEVICE)
+                mtp_loss_ctx_list = mtp_loss_ctx_dict[name]
+                for idx, (mtp_hidden, mtp_ctx) in enumerate(zip(mtp_outputs_dict[name], mtp_loss_ctx_list)):
+                    mtp_hidden_states, mtp_router_results, mtp_router_weights = mtp_hidden
+                    mtp_loss, _ = self.lm_head(
+                        mtp_hidden_states, cast(MTPLossContext, mtp_ctx), mtp_config=mtp_config, layer_idx=idx
+                    )
+                    mtp_losses += mtp_loss
+
+                    output["router_logits"][f"{name}_mtp_layer{idx}"] = mtp_router_results
+                    output["router_weights"][f"{name}_mtp_layer{idx}"] = mtp_router_weights
+
+                # Average MTP losses across depths and scale
+                mtp_losses = mtp_losses / len(mtp_loss_ctx_list)
+                scaled_mtp_loss = mtp_losses * mtp_config.loss_scaling_factor  # type: ignore
+
+                # Add to total loss
+                output["mtp_loss"][name] = scaled_mtp_loss
 
         router_logits_list = list(output["router_logits"].values())  # type: ignore
         router_weights_list = list(output["router_weights"].values())  # type: ignore
@@ -1193,14 +1228,15 @@ class MoE(BaseModel):
                         offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
                         module=mtp_layer,
                     )
-                    if mtp_idx == 0:
-                        layer_next.set_modules_to_forward_prefetch([mtp_layer])  # type: ignore
+                    # if mtp_idx == 0:
+                    #     layer_next.set_modules_to_forward_prefetch([mtp_layer])  # type: ignore
 
             # Set up prefetch chains across all MTP blocks
             if self.config.mtp_config is not None:
                 mtp_block_layers = []
                 for mtp_config in self.config.mtp_config:
                     mtp_block_layers.extend(list(self.mtp_block[mtp_config.name].layers))
+                layer_next.set_modules_to_forward_prefetch([mtp_block_layers[0]])  # type: ignore
                 for prev_mtp_layer, next_mtp_layer in zip(
                     mtp_block_layers[:-1],
                     mtp_block_layers[1:],
