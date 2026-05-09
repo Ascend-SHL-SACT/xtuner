@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Dict
 
 import torch
 import triton
@@ -21,6 +21,7 @@ class CausalConv1dFunction(torch.autograd.Function):
         initial_state: Optional[torch.Tensor] = None,
         activation: str = None,
         cu_seqlens: Optional[torch.Tensor] = None,
+        chunk_indices: Dict[str, Optional[torch.LongTensor]] = None,
         output_final_state: bool = False,
     ):
         # Save necessary tensors for backward pass
@@ -29,6 +30,7 @@ class CausalConv1dFunction(torch.autograd.Function):
         ctx.save_for_backward(x, weight, bias, residual, initial_state)
         ctx.activation = activation
         ctx.cu_seqlens = cu_seqlens
+        ctx.chunk_indices = chunk_indices
         ctx.H = H
         
         # Call the forward implementation
@@ -41,6 +43,7 @@ class CausalConv1dFunction(torch.autograd.Function):
             initial_state=initial_state,
             activation=activation,
             cu_seqlens=cu_seqlens,
+            chunk_indices_origin=chunk_indices,
             output_final_state=output_final_state,
         )
         # y = y.transpose(-1, -2).contiguous()
@@ -56,6 +59,7 @@ class CausalConv1dFunction(torch.autograd.Function):
         x, weight, bias, residual, initial_state = ctx.saved_tensors
         activation = ctx.activation
         cu_seqlens = ctx.cu_seqlens
+        chunk_indices = ctx.chunk_indices
         H = ctx.H
 
         # Call the backward implementation with dht (could be None)
@@ -70,11 +74,12 @@ class CausalConv1dFunction(torch.autograd.Function):
             initial_state=initial_state,
             activation=activation,
             cu_seqlens=cu_seqlens,
+            chunk_indices_origin=chunk_indices,
         )
 
         # Return gradients in the order of forward inputs
-        # Note: We don't return gradients for non-tensor inputs (activation, cu_seqlens, output_final_state)
-        return dx, dw.transpose(0, 1).contiguous(), None, db, dr, dh0, None, None, None
+        # Note: We don't return gradients for non-tensor inputs (activation, cu_seqlens, chunk_indices, output_final_state)
+        return dx, dw.transpose(0, 1).contiguous(), None, db, dr, dh0, None, None, None, None
 
 
 def causal_conv1d_triton(
@@ -86,6 +91,7 @@ def causal_conv1d_triton(
     initial_state: Optional[torch.Tensor] = None,
     activation: str = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_indices: Dict[str, Optional[torch.LongTensor]] = None,
     output_final_state: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
@@ -106,5 +112,5 @@ def causal_conv1d_triton(
         final_state: Optional final state tensor if output_final_state is True
     """
     return CausalConv1dFunction.apply(
-        x, weight, H, bias, residual, initial_state, activation, cu_seqlens, output_final_state
+        x, weight, H, bias, residual, initial_state, activation, cu_seqlens, chunk_indices, output_final_state
     )

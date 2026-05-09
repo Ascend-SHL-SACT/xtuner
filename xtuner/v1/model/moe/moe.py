@@ -707,7 +707,7 @@ class MoE(BaseModel):
         cu_seq_lens_int64 = seq_ctx.cu_seq_lens_q.to(torch.int64).to(seq_ctx.inputs_embeds.device)
         seq_ctx.cu_seq_lens_q = cu_seq_lens_int64
         seq_ctx.cu_seq_lens_list = cu_seq_lens_int64.tolist()  # for compatibility with prepare_chunk_indices1
-        CHUNK_SIZES = [16, 32, 64, 128, 256, 608 * 2]
+        CHUNK_SIZES = [4, 8, 16, 32, 64, 128, 256, 512, 608 * 2]
 
         def compute_chunk_indices(chunk_size):
             return str(chunk_size), prepare_chunk_indices(cu_seq_lens_int64, chunk_size=chunk_size)

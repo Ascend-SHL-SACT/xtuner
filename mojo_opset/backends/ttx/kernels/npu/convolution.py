@@ -1,7 +1,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang, Wenshuo Zhao
 
 
-from typing import Optional
+from typing import Optional, Dict
 
 import torch
 import triton
@@ -558,6 +558,7 @@ def causal_conv1d_fwd_impl_old(
     output_final_state: bool = False,
     activation: Optional[str] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_indices_origin: Dict[str, Optional[torch.LongTensor]] = None,
 ) -> torch.Tensor:
     shape = x.shape
     assert x.shape[-1] == weight.shape[-1], "x [B, T, D], weight [W, D], please check."
@@ -572,7 +573,7 @@ def causal_conv1d_fwd_impl_old(
     NUM_BLKS_D = triton.cdiv(D, BD)
 
     if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        chunk_indices = chunk_indices_origin[str(BT)]
         NUM_CHKS = len(chunk_indices)
     else:
         chunk_indices = None
@@ -626,6 +627,7 @@ def causal_conv1d_fwd_impl(
     output_final_state: bool = False,
     activation: Optional[str] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_indices_origin: Dict[str, Optional[torch.LongTensor]] = None,
 ) -> torch.Tensor:
     shape = x.shape
     assert x.shape[-1] == weight.shape[-1], "x [B, T, D], weight [W, D], please check."
@@ -640,7 +642,7 @@ def causal_conv1d_fwd_impl(
     NUM_BLKS_D = triton.cdiv(D, BD)
 
     if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        chunk_indices = chunk_indices_origin[str(BT)]
         NUM_CHKS = len(chunk_indices)
     else:
         chunk_indices = None
@@ -695,6 +697,7 @@ def causal_conv1d_bwd_impl(
     initial_state: Optional[torch.Tensor] = None,
     activation: str = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_indices_origin: Dict[str, Optional[torch.LongTensor]] = None,
 ):
     
     shape = x.shape
@@ -710,12 +713,13 @@ def causal_conv1d_bwd_impl(
 
     # BD = 64
     BD = 512
-    
+    if D < BD:
+        BD = D
     assert D % BD == 0, "D must be divisible by BD."
     NUM_Blk_D = triton.cdiv(D, BD)
 
     if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        chunk_indices = chunk_indices_origin[str(BT)]
         NUM_CHKS = len(chunk_indices)
 
         NT = len(chunk_indices)
@@ -736,6 +740,7 @@ def causal_conv1d_bwd_impl(
             activation=None,
             cu_seqlens=cu_seqlens,
             output_final_state=False,
+            chunk_indices_origin=chunk_indices_origin,
         )
     dx = torch.empty_like(x)
     dw = weight.new_empty(B * NT, W, D, dtype=torch.float) if weight is not None else None
