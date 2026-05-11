@@ -154,9 +154,12 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
             assert self.only_llm_forward is False, "only_llm_forward is True, but pixel_values is not None. Please check your config setting."
             assert image_grid_thw is not None
             assert input_ids is not None
+            pixel_values = pixel_values.to(inputs_embeds.device)
             visual_embeds, deepstack_visual_embeds = self.get_visual_features(pixel_values,
                                                                               image_grid_thw,
                                                                               sequence_parallel_mesh)
+            origin_pixel_len = pixel_values.size(0)
+            pixel_values = pixel_values.to('cpu')
             try:
                 # To simplify and facilitate the processing of deepstack_visual_embeds inside language_model,
                 # we all-gather visual_embeds, and then split them based on the input_ids,
@@ -166,7 +169,7 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
                     visual_features=visual_embeds,
                     deepstack_visual_embeds=deepstack_visual_embeds,
                     sequence_parallel_mesh=sequence_parallel_mesh,
-                    origin_pixel_len=pixel_values.size(0)
+                    origin_pixel_len=origin_pixel_len
                 )
                 inputs_embeds[visual_pos_masks] = inputs_embeds[visual_pos_masks] * 0.0 + visual_features
             except Exception as e:

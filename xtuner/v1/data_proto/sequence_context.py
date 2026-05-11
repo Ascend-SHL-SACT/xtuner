@@ -488,7 +488,7 @@ class SequenceContext:
             self.block_table = self.block_table.to(device)  # type: ignore
 
         if self.pixel_values is not None and hasattr(self.pixel_values, "to"):
-            self.pixel_values = self.pixel_values.to(device)  # type: ignore
+            self.pixel_values = self.pixel_values.to('cpu')  # type: ignore
 
         if self.inputs_embeds is not None and hasattr(self.inputs_embeds, "to"):
             self.inputs_embeds = self.inputs_embeds.to(device)  # type: ignore
