@@ -130,6 +130,6 @@ docs/zh_cn/api/generated/
 logs
 # xtuner/v1/module/attention/chunk_gated_delta_rule_npu
 extra-info
-mojo_opset
 sample_1k
 putils
+perf_part
