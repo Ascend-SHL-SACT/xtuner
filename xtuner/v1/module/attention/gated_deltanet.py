@@ -700,6 +700,7 @@ class GatedDeltaNet(nn.Module):
                 bias=bias,
                 activation=self.activation,
                 cu_seqlens=seq_ctx.cu_seq_lens_q,
+                chunk_indices=seq_ctx.chunk_indices,
             )
 
         query, key, value = torch.split(
