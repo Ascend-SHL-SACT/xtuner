@@ -11,6 +11,11 @@ T = TypeVar("T", bound=torch.Tensor)
 # TODO: (yehaochen) Missing typehint here
 
 
+def calculate_seq_staleness(model_step: int, current_train_step: int) -> int:
+    # model_step 是指哪个 train_step 训练后的模型；完全同步时 current_train_step 领先 1 步。
+    return current_train_step - model_step - 1
+
+
 def pad_to_multiple_of(sequence, padding_value, multiple_of, dim=-1):
     length = sequence.shape[dim]
     if length % multiple_of == 0:
@@ -57,16 +62,26 @@ def packed_cumulative_length(num_tokens: torch.Tensor):
     return torch.cumsum(_pad_length, 0).int()
 
 
-def split_for_sequence_parallel(input: T, dim: int, sp_mesh: DeviceMesh) -> T:
-    """Splits the input tensor along a given dimension for sequence parallel.
+def split_for_sequence_parallel(
+    input: T,
+    dim: int,
+    sp_mesh: DeviceMesh,
+    split_size: int | None = None,
+) -> T:
+    """Split ``input`` along ``dim`` for sequence parallel.
 
     Args:
-        input: The input tensor to be split.
-        dim: The dimension along which the tensor should be split.
-        sp_group: The sequence parallel process group.
+        input (Tensor): The tensor to be split.
+        dim (int): The dimension along which to split.
+        sp_mesh (DeviceMesh): The sequence-parallel device mesh.
+        split_size (int | None): Per-rank chunk size along ``dim``. When ``None``,
+            defaults to ``ceil(input.size(dim) / sp_size)``. When provided,
+            ``split_size * sp_size`` may exceed ``input.size(dim)``; trailing
+            ranks then receive a shorter (or empty) slice and the caller is
+            responsible for any padding back to ``split_size``.
 
     Returns:
-        The split tensor corresponding to the current rank's chunk.
+        Tensor: This rank's slice along ``dim`` (possibly empty).
     """
     sp_group = sp_mesh.get_group()
     sp_size = sp_mesh.size()
@@ -74,13 +89,15 @@ def split_for_sequence_parallel(input: T, dim: int, sp_mesh: DeviceMesh) -> T:
         return input
 
     rank = dist.get_rank(sp_group)
-    dim_size = input.size(dim)
-    assert dim_size % sp_size == 0, (
-        f"The dimension to split ({dim_size}) is not a multiple of sp size ({sp_size}), cannot split tensor evenly"
-    )
 
-    tensor_list = torch.split(input, dim_size // sp_size, dim=dim)
-    output = tensor_list[rank].contiguous()
+    if split_size is None:
+        split_size = (input.size(dim) + sp_size - 1) // sp_size
+
+    start = min(rank * split_size, input.size(dim))
+    end = min(start + split_size, input.size(dim))
+
+    output = input.narrow(dim, start, end - start)
+    output = output.contiguous()
 
     return cast(T, output)
 

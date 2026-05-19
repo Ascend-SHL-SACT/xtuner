@@ -2,7 +2,7 @@ import re
 from typing import Literal
 
 import torch
-from pydantic import computed_field
+from pydantic import Field, computed_field
 from typing_extensions import override
 
 from xtuner.v1.model.base import (
@@ -12,7 +12,7 @@ from xtuner.v1.model.base import (
 )
 from xtuner.v1.model.moe.moe import BalancingLossConfig, MoEConfig, ZLossConfig
 from xtuner.v1.module.attention import GatedDeltaNetConfig, MHAConfig
-from xtuner.v1.module.rope import RopeScalingConfig
+from xtuner.v1.module.rope import RopeParametersConfig
 from xtuner.v1.module.router.greedy import GreedyRouterConfig
 
 from .qwen3vl_text import Qwen3VLTextMoE
@@ -26,7 +26,7 @@ MOE_NON_EP_COMPILE_CFG: dict[str, TorchCompileOption] = {
     ),
     "xtuner.v1.module.attention.mha.MultiHeadAttention.forward": TorchCompileOption(fullgraph=True),
     # TODO: GatedDeltaNet does not currently support torch.compile(full_graph=True); support will be added in the future.
-    "xtuner.v1.module.attention.gated_deltanet.GatedDeltaNet.forward": TorchCompileOption(fullgraph=False),
+    "xtuner.v1.module.attention.gated_deltanet.GatedDeltaNet.forward": TorchCompileOption(fullgraph=True),
     "xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer._shared_experts_forward": TorchCompileOption(
         fullgraph=True
     ),
@@ -242,7 +242,6 @@ class Qwen3_5_VLTextMoE35BA3BConfig(Qwen3_5_VLTextMoEConfig):
     hidden_size: int = 2048
     intermediate_size: int = 0  # not used
     rms_norm_eps: float = 1e-6
-    rope_theta: float = 10000000.0
     hidden_act: str = "silu"
     attention: MHAConfig = MHAConfig(
         with_gate=True,
@@ -275,8 +274,13 @@ class Qwen3_5_VLTextMoE35BA3BConfig(Qwen3_5_VLTextMoEConfig):
         norm_topk_prob=True,
         router_scaling_factor=1.0,
     )
-    rope_scaling_cfg: RopeScalingConfig = RopeScalingConfig(
-        type="qwen3_vl", mrope_section=[11, 11, 10], partial_rotary_factor=0.25
+    rope_parameters_cfg: RopeParametersConfig = Field(
+        default_factory=lambda: RopeParametersConfig(
+            rope_theta=10000000.0,
+            rope_type="qwen3_vl",
+            mrope_section=[11, 11, 10],
+            partial_rotary_factor=0.25,
+        )
     )
     balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig()
     z_loss_cfg: ZLossConfig | None = None

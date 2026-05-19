@@ -159,6 +159,69 @@ class XTunerMeta(BaseModel):
                     return exp
         return None
 
+    @classmethod
+    def build(cls, work_dir: Path, meta_filename: str, resume: bool) -> "XTunerMeta":
+        """Create or load meta from work_dir and optionally start a new exp or
+        resume.
+
+        Single-process helper (e.g. for rl_trainer). For distributed training use the trainer's _init_xtuner_meta.
+        """
+        if not work_dir.exists():
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+        meta_path = work_dir / meta_filename
+        if not meta_path.exists():
+            meta = cls(exps=[])
+            with open(meta_path, "w") as f:
+                f.write(meta.model_dump_json(indent=2))
+
+        meta = cast(XTunerMeta, cls.model_validate(load(meta_path, file_format="json")))
+        resume = resume and bool(meta.exps)
+
+        if resume and meta.exps:
+            latest_exp = meta.exps[-1]
+            latest_exp_history = latest_exp.history[-1]
+            begin = cast(int, latest_exp_history.get("end") or latest_exp_history["begin"])
+            exp_dir = Path(latest_exp.exp_dir)
+            git_dir = exp_dir / f"git-info-begin-{begin}"
+            if not git_dir.exists():
+                git_dir.mkdir(parents=True, exist_ok=True)
+            staged_path, unstaged_path = git_dir / "staged.diff", git_dir / "unstaged.diff"
+            commit = record_git_info(staged_path, unstaged_path)
+            git_info = GitInfo(
+                commit=commit,
+                staged=str(staged_path),
+                unstaged=str(unstaged_path),
+            )
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            new_exp_history = ExpHistory(
+                begin=begin,
+                timestamp=timestamp,
+                git_info=git_info,
+            )
+            latest_exp.history.append(new_exp_history)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            exp_dir = work_dir / timestamp
+            git_dir = Path(f"{exp_dir}/git-info-begin-0")
+            if not git_dir.exists():
+                git_dir.mkdir(parents=True, exist_ok=True)
+            staged_path, unstaged_path = git_dir / "staged.diff", git_dir / "unstaged.diff"
+            commit = record_git_info(staged_path, unstaged_path)
+            git_info = GitInfo(
+                commit=commit,
+                staged=str(staged_path),
+                unstaged=str(unstaged_path),
+            )
+            new_history = ExpHistory(
+                begin=0,
+                timestamp=timestamp,
+                git_info=git_info,
+            )
+            new_exp = ExpInfo(history=[new_history], exp_dir=str(exp_dir))
+            meta.exps.append(new_exp)
+        return meta
+
 
 class ResumeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -585,7 +648,7 @@ class Trainer:
         self.sp_mesh = self.data_mesh["sp"]
 
         if global_batch_size is None:
-            global_batch_size = self.data_mesh["dp"].size()
+            global_batch_size = self.data_mesh["dp"].size() * intra_layer_micro_batch
         self._global_batch_size = global_batch_size
 
         self._resolve_model_loss_cfg(model_cfg, loss_cfg)
@@ -594,12 +657,6 @@ class Trainer:
             loss_cfg = CELossConfig()
 
         self._resolve_config_conflicts(self.tokenizer, model_cfg, dataloader_cfg, fsdp_cfg)
-
-        if intra_layer_micro_batch > 1 and isinstance(model_cfg, MoEConfig) and model_cfg.mtp_config is not None:
-            raise ValueError(
-                "MTP (Multi-Token Prediction) is not supported with intra_layer_micro_batch > 1. "
-                f"Got intra_layer_micro_batch={intra_layer_micro_batch} and mtp_config={model_cfg.mtp_config}."
-            )
 
         if dataset_cfg is not None:  # TODO: Removed in version 1.1.0
             logger.warning("`dataset_cfg` is deprecated, please use `dataloader_cfg.dataset_config_list` instead")
@@ -732,23 +789,21 @@ class Trainer:
             ProberList.set_step(self._cur_step + 1)
             DEVICE_MODULE.reset_peak_memory_stats()
 
-            engine_input = self._prepare_model_input(data_batch)
-
             with self._maybe_profiling():
+                engine_input = self._prepare_model_input(data_batch)
                 train_step_info = self._engine.train_step(engine_input)
+                hooks = self.hooks_config.get_hooks(HookStage.AFTER_TRAIN_STEP)
+                for hook in hooks:
+                    hook(
+                        train_step_info=train_step_info,
+                        step=self.cur_step,
+                        epoch=self._cur_epoch,
+                        total_step=self.total_step,
+                        total_epoch=self.total_epoch,
+                    )
 
-            hooks = self.hooks_config.get_hooks(HookStage.AFTER_TRAIN_STEP)
-            for hook in hooks:
-                hook(
-                    train_step_info=train_step_info,
-                    step=self.cur_step,
-                    epoch=self._cur_epoch,
-                    total_step=self.total_step,
-                    total_epoch=self.total_epoch,
-                )
-
-            grad_norm = self._engine.clip_grad_norm(do_clip=self._do_clip, dtype=self._grad_norm_dtype)
-            self._engine.step_optimizer(grad_norm)
+                grad_norm = self._engine.clip_grad_norm(do_clip=self._do_clip, dtype=self._grad_norm_dtype)
+                self._engine.step_optimizer(grad_norm)
 
             time_after_train_step = time.time()
             ProberList.after_step()
@@ -1338,6 +1393,7 @@ class Trainer:
         dist.all_reduce(warmup_tensor)
 
     def _init_xtuner_meta(self, work_dir: Path, auto_resume: bool) -> XTunerMeta:
+        # TODO: simplify with XTunerMeta.build() of dist version
         if not work_dir.exists():
             if self.rank == 0:
                 work_dir.mkdir(parents=True, exist_ok=True)

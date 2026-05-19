@@ -1,5 +1,5 @@
 import torch
-import types
+import copy
 from .qwen3_vl_config import Qwen3VLBaseConfig
 from xtuner.v1.loss import CELossContext
 import torch.distributed as dist
@@ -12,15 +12,20 @@ from xtuner.v1.model.moe.qwen3 import Qwen3MoE
 from torch.distributed.device_mesh import DeviceMesh
 from xtuner.v1.data_proto.utils import split_for_sequence_parallel
 from xtuner.v1.model import TorchCompileOption, DEFAULT_FLOAT8_CFG
+import torch
+from packaging.version import Version
 from ..base import BaseComposeModel, to_hf_key_list_wrapper
 
 logger = get_logger()
 
-QWEN3VL_COMPILE_CFG: dict[str, TorchCompileOption] = {
-    # "xtuner.v1.model.compose.qwen3_vl.modeling_projector.Qwen3VLProjector.forward": TorchCompileOption(fullgraph=True),
-    "xtuner.v1.model.compose.qwen3_vl.modeling_vision.Qwen3VLVisionLayer.forward": TorchCompileOption(fullgraph=True),
-    **DEFAULT_FLOAT8_CFG,
-}
+if Version(torch.__version__) >= Version("2.9.1"):
+    QWEN3VL_COMPILE_CFG: dict[str, TorchCompileOption] = {
+        "xtuner.v1.model.compose.qwen3_vl.modeling_projector.Qwen3VLProjector.forward": TorchCompileOption(fullgraph=True),
+        "xtuner.v1.model.compose.qwen3_vl.modeling_vision.Qwen3VLVisionLayer.forward": TorchCompileOption(fullgraph=True),
+        **DEFAULT_FLOAT8_CFG,
+    }
+else:
+    QWEN3VL_COMPILE_CFG = copy.deepcopy(DEFAULT_FLOAT8_CFG)
 
 
 class Qwen3VLForConditionalGeneration(BaseComposeModel):
@@ -138,11 +143,10 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
 
         return special_visual_mask, visual_features, deepstack_visual_embeds
 
-    def forward(
+    def _prepare_llm_inputs(
             self,
             seq_ctx: SequenceContext,
-            loss_ctx: dict[str, CELossContext] | None = None
-    ) -> MoEModelOutputs:
+    ) -> tuple[torch.FloatTensor, list[torch.Tensor] | None, torch.Tensor | None]:
         input_ids = seq_ctx.input_ids
         pixel_values = seq_ctx.pixel_values
         image_grid_thw = seq_ctx.image_grid_thw
@@ -200,14 +204,31 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
             )
             deepstack_visual_embeds = None
             visual_pos_masks = None
+        return inputs_embeds, deepstack_visual_embeds, visual_pos_masks
 
-        # NOTE: 一定不要原地覆盖，否则第二次 forward 会缺少数据
-        lang_seq_ctx = seq_ctx.copy(
-            input_ids=None,
-            inputs_embeds=inputs_embeds,
-            deepstack_visual_embeds=deepstack_visual_embeds,
-            visual_pos_masks=visual_pos_masks,
-        )
+    def forward(self, seq_ctx: SequenceContext | list[SequenceContext], loss_ctx: dict[str, CELossContext] | None = None) -> MoEModelOutputs:
+        lang_seq_ctx: SequenceContext | list[SequenceContext]
+        if isinstance(seq_ctx, list):
+            lang_seq_ctx_list: list[SequenceContext] = []
+            for single_seq_ctx in seq_ctx:
+                inputs_embeds, deepstack_visual_embeds, visual_pos_masks = self._prepare_llm_inputs(single_seq_ctx)
+                lang_seq_ctx_list.append(
+                    single_seq_ctx.copy(
+                        input_ids=None,
+                        inputs_embeds=inputs_embeds,
+                        deepstack_visual_embeds=deepstack_visual_embeds,
+                        visual_pos_masks=visual_pos_masks,
+                    )
+                )
+            lang_seq_ctx = lang_seq_ctx_list
+        elif isinstance(seq_ctx, SequenceContext):
+            inputs_embeds, deepstack_visual_embeds, visual_pos_masks = self._prepare_llm_inputs(seq_ctx)
+            lang_seq_ctx = seq_ctx.copy(
+                input_ids=None,
+                inputs_embeds=inputs_embeds,
+                deepstack_visual_embeds=deepstack_visual_embeds,
+                visual_pos_masks=visual_pos_masks,
+            )
         outputs = self.language_model(
             lang_seq_ctx,
             loss_ctx

@@ -123,7 +123,8 @@ class BaseComposeModel(BaseModel):
             self.vision_tower.blocks[-1].set_modules_to_forward_prefetch(  # type: ignore
                 [self.multi_modal_projector]
             )
-        self.multi_modal_projector.set_modules_to_forward_prefetch([self.language_model])  # type: ignore
+        if isinstance(self.multi_modal_projector, FSDPModule):
+            self.multi_modal_projector.set_modules_to_forward_prefetch([self.language_model])  # type: ignore
         if os.environ.get("SHARD_512", "false").lower() == "true":
             self.language_model.set_modules_to_forward_prefetch([self.language_model.layers["0"], self.language_model.layers["0"].experts])  # type: ignore
         else:
