@@ -4,14 +4,12 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
-import os
 
 from xtuner.v1.data_proto import SequenceContext
 
 from .config import MTPConfig
 from .mtp_layer import MTPLayer
 from .utils import roll_sequence_context
-from xtuner.v1.utils.activation_offload import async_save_on_cpu
 
 
 MTPDepthOutput = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
