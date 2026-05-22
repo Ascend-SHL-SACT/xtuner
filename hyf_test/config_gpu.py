@@ -14,7 +14,8 @@ try:
 except:
     from xtuner.v1.model.moe.moe import ZLossConfig
 from xtuner.v1.datasets.config import DatasetConfig, DataloaderConfig
-from xtuner.v1.model.compose.qwen3_5 import Qwen3_5_VLMoE35BA3Config
+from xtuner.v1.model.compose.qwen3_5 import Qwen3_5_VLMoE35BA3SplitConfig, Qwen3_5_VLMoE35BA3Config
+from xtuner.v1.model.compose.qwen3_5.qwen3_5_config import Qwen3_5_VLMoE397BA17SplitConfig
 try:
     from xtuner.v1.model.moe.moe import MTPConfig
 except:
@@ -24,8 +25,8 @@ from xtuner.v1.datasets import PretrainTokenizeFunctionConfig
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 # from xtuner.v1.loss.layer_moe_loss import LayerBalancingLossConfig
 
-QWEN3_MOE_PATH = "/mnt/huawei/weight/Qwen3.5-35B-A3B"
-# QWEN3_MOE_PATH = "/mnt/huawei/weight/Qwen3.5-397B-A17B"
+# QWEN3_MOE_PATH = "/mnt/huawei/weight/Qwen3.5-35B-A3B"
+QWEN3_MOE_PATH = "/mnt/huawei/weight/Qwen3.5-397B-A17B-split"
 # QWEN3_MOE_PATH = "/mnt/shared-storage-user/llmrazor-share/yehaochen/tmp/asdfasfasdf/20260320160600/hf-2"
 # ALPACA_PATH = "/mnt/huawei/wsl/datasets"
 ALPACA_PATH = "/mnt/huawei/hyf/xtuner_0410/sample_1k"
@@ -34,13 +35,13 @@ float8_cfg = Float8Config(
     scaling_granularity_gemm=ScalingGranularity.TILEWISE,
     scaling_granularity_grouped_gemm=ScalingGranularity.TILEWISE,
 )
-ep_size=4
+ep_size=1
 
-moe_cfg = Qwen3_5_VLMoE35BA3Config()
-# moe_cfg = Qwen3_5_VLMoE397BA17BConfig()
-moe_cfg.text_config.num_hidden_layers = 4
+# moe_cfg = Qwen3_5_VLMoE35BA3Config()
+moe_cfg = Qwen3_5_VLMoE397BA17SplitConfig()
+moe_cfg.text_config.num_hidden_layers = 2
 moe_cfg.text_config.ep_size = ep_size
-NORMAL_MTP_LAYERS = 4 # 示例，按需替换
+NORMAL_MTP_LAYERS = 2 # 示例，按需替换
 SCI_MTP_LAYERS = 1
 NORMAL_MTP_FACTOR = 1.0
 SCI_MTP_FACTOR = 0.3
@@ -56,7 +57,7 @@ moe_cfg.text_config.mtp_config = MTPConfig(num_layers=NORMAL_MTP_LAYERS , share_
 optim_cfg = MuonConfig(lr=6e-05, weight_decay=0.05)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 fsdp_cfg = FSDPConfig(
-    torch_compile=True,
+    torch_compile=False,
     cpu_offload=False,
     ep_size=ep_size
 )
@@ -92,11 +93,11 @@ trainer = TrainerConfig(
     # hf_interval=2,
     work_dir="/mnt/huawei/hyf/xtuner_logs_0410",
     # seed=0,
-    # profile_step=20,
-    # profile_time=True,
+    profile_step=5,
+    profile_time=True,
     # profile_memory=True,
     sp_size=1,
-    strict_load=False,
+    # strict_load=False,
 )
 
 def seed_all(seed=42):
