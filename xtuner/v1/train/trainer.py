@@ -783,6 +783,9 @@ class Trainer:
         """
         train_begin = time.time()
         time_before_get_data = time.time()
+        # if torch.distributed.get_rank()==0:
+        #     import torch_npu
+        #     torch_npu.npu.memory._record_memory_history()
         for data_batch in self._data_iter():
             time_before_train_step = time.time()
 
@@ -807,6 +810,9 @@ class Trainer:
 
             time_after_train_step = time.time()
             ProberList.after_step()
+
+            # if torch.distributed.get_rank()==0 and self._cur_step==1:
+            #     torch_npu.npu.memory._dump_snapshot("397B_全层_ep8_16k_16机_mm.pickle")
 
             data_time = time_before_train_step - time_before_get_data
             step_time = time_after_train_step - time_before_train_step
