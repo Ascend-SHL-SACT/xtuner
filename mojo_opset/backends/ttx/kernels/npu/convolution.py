@@ -569,6 +569,8 @@ def causal_conv1d_fwd_impl_old(
     BT = min(32, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
 
     BD = 256
+    if D < BD:
+        BD = D
     assert D % BD == 0, "D must be divisible by BD."
     NUM_BLKS_D = triton.cdiv(D, BD)
 
@@ -638,6 +640,8 @@ def causal_conv1d_fwd_impl(
     BT = min(32, triton.next_power_of_2(triton.cdiv(max(16, B * T), NUM_CORES)))
 
     BD = 256
+    if D < BD:
+        BD = D
     assert D % BD == 0, "D must be divisible by BD."
     NUM_BLKS_D = triton.cdiv(D, BD)
 
