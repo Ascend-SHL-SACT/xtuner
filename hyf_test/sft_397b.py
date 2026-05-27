@@ -22,8 +22,8 @@ from pathlib import Path
 # 规模: 8 节点 × 16 Die = 128 Die, sp_size=4, dp_size=32, gbs=32
 
 ceph_config = "/llmit-data/yujiashuo/petreloss.conf"
-# meta_data_path = "/llmit-data/yujiashuo/a3_base05/metas/interns2_pre_base05_20260424a_a3_test10_mm.json"
-meta_data_path = "/llmit-data/yujiashuo/a3_base05/metas/interns2_pre_base05_20260424a_a3.json"
+meta_data_path = "/llmit-data/yujiashuo/a3_base05/metas/interns2_pre_base05_20260424a_a3_test10_mm.json"
+# meta_data_path = "/llmit-data/yujiashuo/a3_base05/metas/interns2_pre_base05_20260424a_a3.json"
 # meta_data_path = "/mnt/huawei/hyf/xtuner_0410/hyf_test/test_yidian.json"
 model_path = "/mnt/huawei/weight/Qwen3.5-397B-A17B-split"
 work_dir = "/mnt/huawei/hyf/xtuner_logs_0410_397b"
@@ -34,11 +34,11 @@ if not os.path.exists(work_dir):
 shutil.copy(__file__, work_dir)
 
 # 训练超参数
-sample_max_length = 64 * 1024
-pack_max_length = 64 * 1024
+sample_max_length = 32 * 1024
+pack_max_length = 32 * 1024
 rand_video_max_frames = 24
 num_workers = 2
-global_batch_size = 128          # dp_size = 128/sp_size(4) = 32
+global_batch_size = 128 * 4          # dp_size = 128/sp_size(4) = 32
 total_epoch = 1
 hf_interval = 10
 hf_max_keep = 2
@@ -51,7 +51,7 @@ warmup_ratio = 0.1
 recompute_ratio = 1.0
 loss_reduction = "square"
 max_pixels = 16777216
-sp_size = 4
+sp_size = 2
 ep_size = 16
 
 # model config
@@ -161,7 +161,7 @@ trainer = TrainerConfig(
     work_dir=work_dir,
     profile_step=5,
     profile_time=True,
-    profile_memory=True,
+    # profile_memory=True,
     seed=0,
     strict_load=False,
 )
