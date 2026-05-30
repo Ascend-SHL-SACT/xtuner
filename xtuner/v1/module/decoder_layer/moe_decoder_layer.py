@@ -373,6 +373,50 @@ class MoEDecoderLayer(nn.Module):
         combined_hidden_states = combined_hidden_states.view(*origin_shape)
         return combined_hidden_states
 
+    def _token_distribution_across_experts(self, tokens_per_expert: torch.Tensor, skip: bool = True):
+        if skip:
+            return
+        """Token distribution across experts."""
+        if self.ep_mesh is not None and self.ep_mesh.size() > 1:
+            tokens_per_expert_local = tokens_per_expert
+            # Create a list to hold gathered tensors from all EP ranks
+            tokens_per_expert_list = [torch.zeros_like(tokens_per_expert_local) for _ in range(self.ep_mesh.size())]
+            # AllGather within EP group
+            ep_group = self.ep_mesh.get_group()
+            torch.distributed.all_gather(tokens_per_expert_list, tokens_per_expert_local, group=ep_group)
+            # Stack all gathered tensors
+            tokens_per_expert_gathered = torch.stack(tokens_per_expert_list, dim=0)
+            tokens_per_expert_gathered = tokens_per_expert_gathered.reshape(-1)
+
+            # Save to CSV only on expert 1's rank (rank 1 within EP group)
+            ep_rank = torch.distributed.get_rank(group=ep_group)
+            if ep_rank == 1:
+                import csv
+                import os
+                # Create output directory under log_dir
+                log_dir = os.environ.get("LOG_DIR", "/mnt/huawei/hyf/xtuner_logs_0410_397b")
+                # output_dir = os.path.join(log_dir, "expert_stats")
+                # os.makedirs(output_dir, exist_ok=True)
+                
+                # Use a single file for all layers
+                rank = torch.distributed.get_rank()
+                filename = os.path.join(log_dir, f"all_layers_tokens_per_expert_{rank}.csv")
+                
+                # Check if file exists to determine if we need to write header
+                file_exists = os.path.exists(filename)
+                
+                # Write to CSV in append mode
+                with open(filename, 'a', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    # Write header only if file is newly created
+                    if not file_exists:
+                        writer.writerow(['layer_idx'] + [f'expert_id_{i}' for i in range(self.n_routed_experts)])
+                    # Write data for each EP rank and expert
+                    writer.writerow([self.layer_idx] + tokens_per_expert_gathered.tolist())
+                
+                # print(f"[EP Rank {ep_rank}] Appended layer {self.layer_idx} tokens_per_expert to {filename}")
+
+
     def _forward(
         self,
         hidden_states: torch.Tensor,
@@ -412,6 +456,9 @@ class MoEDecoderLayer(nn.Module):
         #     post_dispatched.get("row_ids_map"),  # type: ignore[arg-type]
         #     dispatched["topk_weights"],
         # )
+        # print(post_dispatched["hidden_states"].shape)
+        self._token_distribution_across_experts(post_dispatched["tokens_per_expert"], skip=True)
+        
         experts_out = self.experts(
             post_dispatched["hidden_states"],
             post_dispatched["tokens_per_expert"],

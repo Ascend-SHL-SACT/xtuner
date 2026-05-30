@@ -23,10 +23,11 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 config_file=${1}
 datetime=$(date +%Y%m%d_%H%M%S)
 log_dir="logs/${datetime}"
+export LOG_DIR="${log_dir}"
 
 export HCCL_BUFFSIZE=256
 export XTUNER_TOKENIZE_WORKERS=1
-# export TORCH_HCCL_ZERO_COPY=1
+export TORCH_HCCL_ZERO_COPY=1
 
 export HCCL_CONNECT_TIMEOUT=600
 export HCCL_EXEC_TIMEOUT=600
@@ -34,6 +35,7 @@ export HCCL_EXEC_TIMEOUT=600
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True,segment_size_mb:128
 export MOE_AIV=1
 export XTUNER_ACTIVATION_OFFLOAD=1
+export VL_XTUNER_ACTIVATION_OFFLOAD=1
 export CPU_AFFINITY_FORCE=True
 export CPU_AFFINITY_CONF=1,npu0:12-23,npu1:26-37,npu2:52-63,npu3:66-77,npu4:92-103,npu5:106-117,npu6:132-143,npu7:146-157,npu8:172-183,npu9:186-197,npu10:212-223,npu11:226-237,npu12:252-263,npu13:266-277,npu14:292-303,npu15:306-317
 # unset XTUNER_ACTIVATION_OFFLOAD
@@ -77,7 +79,7 @@ export MEDIA_ROOT=''
 export DATA_PATH='/mnt/hwfile/vc-intern-delivery/vl_delivery/code/huawei_debug/task_entries/meta_data/export_meta_internvl3_5_internvlm3_tiny_final_debug.json'
 export WORK_DIR="/mnt/huawei/hyf/"
 NRANK=${NRANK-"0"}
-NNODES=32
+NNODES=16
 NPROC_PER_NODE=16
 MASTER_ADDR=${MASTER_ADDR-"127.0.0.1"}
 MASTER_PORT=23467
