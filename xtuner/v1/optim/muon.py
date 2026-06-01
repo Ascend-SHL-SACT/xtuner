@@ -848,6 +848,7 @@ def muon_update_batch_async(
             # Phase 1: All-Gather — each rank contributes R local shards,
             # producing W*R shards across all ranks.
             U_stacked = torch.stack(U)  # (R, *shard_shape)
+            U_stacked_shape = U_stacked.shape
             ag_output = torch.empty((W * R,) + U[0].shape, dtype=U[0].dtype, device=U[0].device)
 
             work = dist.all_gather_into_tensor(ag_output, U_stacked.contiguous(), group=process_group, async_op=True)
@@ -858,6 +859,8 @@ def muon_update_batch_async(
             # ag_output layout: [rank0_param0, rank0_param1, ..., rank1_param0, ...]
             # Reshape to (W, R, *shard_shape), then merge shard_dim to get full params.
             ag_reshaped = ag_output.view(W, R, *U[0].shape)
+            del ag_output
+            del U_stacked
 
             if shard_dim == 0:
                 # (W, R, shard_size, ...) → (R, W, shard_size, ...) → (R, W*shard_size, ...)
@@ -872,7 +875,7 @@ def muon_update_batch_async(
                 perm.insert(shard_dim + 1, 0)  # put W next to shard chunk (offset +1 for R dim)
                 full_params = ag_reshaped.permute(perm).flatten(shard_dim + 1, shard_dim + 2)
             # full_params shape: (R, *full_param_shape)
-
+            del ag_reshaped
             # Phase 2: Selective Newton-Schulz — each rank orthogonalizes a subset.
             # Rank r processes parameters where i % W == r, others get zeros.
             ns_results = []
@@ -893,6 +896,8 @@ def muon_update_batch_async(
             # Phase 3: Reduce-Scatter — sum partial NS results across ranks,
             # each rank gets back its local shard of each parameter.
             ns_stacked = torch.stack(ns_results)  # (R, *full_shape)
+            del full_params
+            del ns_results
             full_dim = ns_stacked.shape[shard_dim + 1]  # +1 because dim 0 is R
             shard_size = full_dim // W
 
@@ -900,7 +905,7 @@ def muon_update_batch_async(
             new_shape = list(ns_stacked.shape)
             new_shape[shard_dim + 1 : shard_dim + 2] = [W, shard_size]
             rs_input = ns_stacked.view(new_shape)
-
+            del ns_stacked
             # Move the W dimension to front for reduce_scatter_tensor
             w_pos = shard_dim + 1
             perm = [w_pos] + list(range(0, w_pos)) + list(range(w_pos + 1, rs_input.ndim))
@@ -921,7 +926,7 @@ def muon_update_batch_async(
             work.wait()  # type: ignore[union-attr]
 
             # Unpack back to list of R local shards
-            U = list(rs_flat_out.view(R, *U_stacked.shape[1:]).unbind(0))
+            U = list(rs_flat_out.view(R, *U_stacked_shape[1:]).unbind(0))
 
         elif subgroup_process_group is not None:
             # Sub-group all-gather path: reconstruct a complete expert from a small
