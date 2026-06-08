@@ -21,7 +21,7 @@ from mojo_opset.backends.ttx.kernels.utils import prepare_chunk_indices
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=['NUM_CHKS'])
 def causal_conv1d_fwd_kernel_old(
     x,
     y,
@@ -151,7 +151,7 @@ def causal_conv1d_fwd_kernel_old(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=['NUM_CHKS'])
 def causal_conv1d_fwd_kernel(
     x,
     y,
@@ -300,7 +300,7 @@ def causal_conv1d_fwd_kernel(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=['NUM_CHKS'])
 def causal_conv1d_bwd_kernel(
     x,
     y,
