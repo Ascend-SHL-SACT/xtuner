@@ -78,7 +78,19 @@ class GreedyRouter(nn.Module, RouterProtocol):
             topk_weights = routing_weights.gather(dim=1, index=topk_ids)
         else:
             topk_weights, topk_ids = torch.topk(routing_weights, self.top_k, dim=-1)
-
+        
+        enforce_moe_load_balancing = os.getenv("XTUNER_ROUTER_ENFORCE_BALANCING", "False") == "True"
+        if enforce_moe_load_balancing and topk_ids.shape[0] % self.n_routed_experts == 0:
+            seq_len, topk = topk_ids.shape
+            # 计算每份的大小
+            chunk_size = seq_len // self.n_routed_experts
+            # 创建份数编号
+            chunk_ids = torch.arange(seq_len, device=topk_ids.device) // chunk_size
+            # 限制在0-255范围内
+            chunk_ids = chunk_ids.clamp(max=self.n_routed_experts)
+            # 广播到每行的所有topk位置
+            topk_ids = chunk_ids.view(-1, 1).expand(-1, topk)
+        
         if self.norm_topk_prob:
             topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
 
