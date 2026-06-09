@@ -1046,6 +1046,8 @@ class BaseModel(nn.Module):
             "step_consumed_img_tokens": cast(float, step_consumed_img_tokens.item()),
             "efficient_attn_ratio": cast(float, efficient_attn_ratio.item()),
             "img_efficient_attn_ratio": cast(float, img_efficient_attn_ratio.item()),
+            "max_seq_len": cast(int, num_tokens.max().item()),
+            "mean_seq_len": cast(float, num_tokens.float().mean().item()),
         }
         return batch_info
 
