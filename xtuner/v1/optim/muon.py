@@ -849,6 +849,18 @@ def muon_update_batch_async(
             # producing W*R shards across all ranks.
             U_stacked = torch.stack(U)  # (R, *shard_shape)
             U_stacked_shape = U_stacked.shape
+            ## split all-gather
+            # first_U, second_U = U_stacked.chunk(2, dim=-1)
+            # ag_output_first = torch.empty((W * R,) + first_U[0].shape, dtype=first_U[0].dtype, device=first_U[0].device)
+            # work_first = dist.all_gather_into_tensor(ag_output_first, first_U.contiguous(), group=process_group, async_op=True)
+            # yield
+            # work_first.wait()
+            # ag_output_second = torch.empty((W * R,) + second_U[0].shape, dtype=second_U[0].dtype, device=second_U[0].device)
+            # work_second = dist.all_gather_into_tensor(ag_output_second, second_U.contiguous(), group=process_group, async_op=True)
+            # yield
+            # work_second.wait()
+            # ag_output = torch.cat((ag_output_first, ag_output_second), dim=-1)
+
             ag_output = torch.empty((W * R,) + U[0].shape, dtype=U[0].dtype, device=U[0].device)
 
             work = dist.all_gather_into_tensor(ag_output, U_stacked.contiguous(), group=process_group, async_op=True)
