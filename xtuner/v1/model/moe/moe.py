@@ -735,7 +735,9 @@ class MoE(BaseModel):
         non_pad_token = nonpad_indices.numel()
         num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, seq_ctx.mask.device)
 
+        from xtuner.v1.utils.event_record import event_timer
         for idx, decoder_layer in self.layers.items():
+            event_timer.add_event(f"moe_decoder_layer")
             if int(idx) < self.config.first_k_dense_replace:
                 hidden_states = decoder_layer(
                     hidden_states,
@@ -781,6 +783,7 @@ class MoE(BaseModel):
 
             if self.config.return_hidden_states:
                 output["hidden_states"].append(hidden_states)
+            event_timer.add_event(f"moe_decoder_layer")
 
         layer_hidden_states = hidden_states
         hidden_states = self.norm(hidden_states)

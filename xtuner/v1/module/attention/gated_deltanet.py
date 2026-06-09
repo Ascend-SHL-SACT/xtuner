@@ -422,7 +422,8 @@ class GatedDeltaNet(nn.Module):
         #     breakpoint()
         # torch.distributed.barrier()
         # query, key, value, g, beta = varlen_to_nonvarlen(seq_ctx.cu_seq_lens_q, query, key, value, g, beta)
-        
+        from xtuner.v1.utils.event_record import event_timer
+        event_timer.add_event("gdn_op")
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
             key,
@@ -437,6 +438,7 @@ class GatedDeltaNet(nn.Module):
             chunk_indices=seq_ctx.chunk_indices,
             chunk_indices_list=seq_ctx.chunk_indices_list 
         )
+        event_timer.add_event("gdn_op")
         # core_attn_out = torch.randn_like(query)
         # if seq_ctx.cu_seq_lens_q is not None:
         #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)

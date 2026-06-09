@@ -401,6 +401,10 @@ class MultiHeadAttention(nn.Module):
                 sinks = self.sinks
             kwargs["s_aux"] = sinks
         # [b, n_head, seq, head_dim]
+        from xtuner.v1.utils.event_record import event_timer
+        event_timer.add_event("mha_op")
+        event_timer.add_tensor_shape("mha_query", query_states)
+        event_timer.add_tensor("cu_seq_lens", seq_ctx.cu_seq_lens_q)
         attn_op_outputs = self.attn_impl_func(
             query_states,
             key_states,
@@ -416,6 +420,7 @@ class MultiHeadAttention(nn.Module):
             deterministic=XTUNER_DETERMINISTIC,
             **kwargs,
         )
+        event_timer.add_event("mha_op")
 
         raw_output = attn_op_outputs["raw_output"]
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:

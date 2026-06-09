@@ -443,6 +443,8 @@ class MoEDecoderLayer(nn.Module):
         # ProberList.before_dispatch(
         #     self.layer_idx, hidden_states, router_results["topk_ids"], router_results["topk_weights"]
         # )
+        from xtuner.v1.utils.event_record import event_timer
+        event_timer.add_event("moe")
         pre_dispatched = self.dispatcher.dispatch_preprocess(
             hidden_states=hidden_states.view(-1, hidden_states.shape[-1]),
             topk_ids=router_results["topk_ids"] if not skip_pad_tokens else router_results["topk_ids"][nonpad_indices, :],
@@ -465,12 +467,13 @@ class MoEDecoderLayer(nn.Module):
         # )
         # print(post_dispatched["hidden_states"].shape)
         self._token_distribution_across_experts(post_dispatched["tokens_per_expert"], skip=True)
-        
+        event_timer.add_event("moe_gmm")
         experts_out = self.experts(
             post_dispatched["hidden_states"],
             post_dispatched["tokens_per_expert"],
             decoding=False,
         )
+        event_timer.add_event("moe_gmm")
         # ProberList.before_combine(
         #     self.layer_idx,
         #     experts_out,
@@ -499,6 +502,7 @@ class MoEDecoderLayer(nn.Module):
             pre_combined=pre_combined,
             combined=combined,
         )
+        event_timer.add_event("moe")
         combined_hidden_states = post_combined["hidden_states"]
         combined_hidden_states = combined_hidden_states.view(*origin_shape)
 

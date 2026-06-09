@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from shutil import rmtree
-from typing import Annotated, Callable, Literal, Protocol, Sequence, Sized, cast, overload, runtime_checkable
+from typing import Annotated, Callable, Literal, Protocol, Sequence, Sized, cast, overload, runtime_checkable, List, Dict, Any
 
 import torch
 import torch.distributed as dist
@@ -810,6 +810,8 @@ class Trainer:
 
             time_after_train_step = time.time()
             ProberList.after_step()
+            from xtuner.v1.utils.event_record import event_timer
+            event_timer.flush()
 
             # if torch.distributed.get_rank()==0 and self._cur_step==1:
             #     torch_npu.npu.memory._dump_snapshot("397B_全层_ep8_16k_16机_mm.pickle")
@@ -1487,7 +1489,7 @@ class Trainer:
     @contextmanager
     def _maybe_profiling(self):
         """Check if profiling is enabled and perform profiling if necessary."""
-        if self._profile_step is not None and self._cur_step in self._profile_step:
+        if self._profile_step is not None and self._cur_step in self._profile_step and torch.distributed.get_rank()==0:
             with contextlib.ExitStack() as stack:
                 if self._profile_time:
                     time_dir = self.exp_dir / self._PROFILE_TIME_PATH / f"step-{self._cur_step}"
