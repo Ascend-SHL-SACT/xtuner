@@ -196,14 +196,26 @@ class MoE(BaseModel):
         super().__init__(config)
         if config.ep_size is not None and config.ep_size > 1:
             world_size = dist.get_world_size()
-            self.ep_mesh = init_device_mesh(
-                DEVICE,
-                (world_size // config.ep_size, config.ep_size),
-                mesh_dim_names=(f"{self.config.mesh_prefix}.dp", f"{self.config.mesh_prefix}.ep"),
-            )[f"{self.config.mesh_prefix}.ep"]
+            if True and world_size > 16:
+                experts_fsdp_size = world_size // config.ep_size
+                mesh_tensor = torch.Tensor(experts_fsdp_size, config.ep_size)
+                for i in range(experts_fsdp_size):
+                    for j in range(config.ep_size):
+                        mesh_tensor[i, j] = (i % 16 + i // 16 * (16 * config.ep_size) + j * 16)
+                self.ep_mesh = DeviceMesh(
+                    DEVICE,
+                    mesh_tensor,
+                    mesh_dim_names=(f"{self.config.mesh_prefix}.dp", f"{self.config.mesh_prefix}.ep"),
+                )[f"{self.config.mesh_prefix}.ep"]
+            else:
+                self.ep_mesh = init_device_mesh(
+                    DEVICE,
+                    (world_size // config.ep_size, config.ep_size),
+                    mesh_dim_names=(f"{self.config.mesh_prefix}.dp", f"{self.config.mesh_prefix}.ep"),
+                )[f"{self.config.mesh_prefix}.ep"]
         else:
             self.ep_mesh = None
-
+        print(f"[rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}]:self.ep_mesh: {self.ep_mesh}")
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
 
@@ -736,6 +748,8 @@ class MoE(BaseModel):
         num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, seq_ctx.mask.device)
 
         from xtuner.v1.utils.event_record import event_timer
+        
+        event_timer.patch_fsdp_all_gather("llm_all_gather", patch=True)        
         for idx, decoder_layer in self.layers.items():
             event_timer.add_event(f"moe_decoder_layer")
             if int(idx) < self.config.first_k_dense_replace:
@@ -759,7 +773,6 @@ class MoE(BaseModel):
                             position_embeddings=position_embeddings,
                             seq_ctx=seq_ctx,
                         )
-
                 else:
                     layer_results = decoder_layer(
                         hidden_states,
@@ -780,14 +793,13 @@ class MoE(BaseModel):
                     num_tokens_global=num_tokens_global,
                     world_size=z_world_size,
                 )
-
             if self.config.return_hidden_states:
                 output["hidden_states"].append(hidden_states)
             event_timer.add_event(f"moe_decoder_layer")
 
         layer_hidden_states = hidden_states
         hidden_states = self.norm(hidden_states)
-
+        event_timer.patch_fsdp_all_gather("llm_all_gather", patch=False)  
         # Get LM loss context from dict
         lm_loss_ctx = loss_ctx["lm"] if loss_ctx is not None else None
         loss, (logits, extra_info) = self.lm_head(hidden_states, lm_loss_ctx)  # type: ignore
@@ -1275,11 +1287,23 @@ class MoE(BaseModel):
         experts_fsdp_size = world_size // self.fsdp_config.ep_size
 
         if self.fsdp_config.hsdp_sharding_size is None:
-            model_mesh = init_device_mesh(
-                device,
-                (experts_fsdp_size, self.fsdp_config.ep_size),
-                mesh_dim_names=(f"{self.config.mesh_prefix}.fsdp", f"{self.config.mesh_prefix}.ep"),
-            )
+            if True and world_size > 16:
+                mesh_tensor = torch.Tensor(experts_fsdp_size, self.fsdp_config.ep_size)
+                for i in range(experts_fsdp_size):
+                    for j in range(self.fsdp_config.ep_size):
+                        mesh_tensor[i, j] = (i % 16 + i // 16 * (16 * self.fsdp_config.ep_size) + j * 16)
+                model_mesh = DeviceMesh(
+                    device,
+                    mesh_tensor,
+                    mesh_dim_names=(f"{self.config.mesh_prefix}.fsdp", f"{self.config.mesh_prefix}.ep"),
+                )
+            else:
+                model_mesh = init_device_mesh(
+                    device,
+                    (experts_fsdp_size, self.fsdp_config.ep_size),
+                    mesh_dim_names=(f"{self.config.mesh_prefix}.fsdp", f"{self.config.mesh_prefix}.ep"),
+                )
+            print(f"[rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}]:model_mesh: {model_mesh}")
             self._world_mesh = model_mesh
             if self.ep_mesh is not None:
                 # WARN: This assertion is **VERY** important.

@@ -23,6 +23,7 @@ from ..linear import build_linear
 from ..rms_norm import RMSNorm
 from .attn_outputs import AttnOutputs
 from .kv_cache import fill_paged_kv_cache
+from xtuner.v1.utils.event_record import event_timer
 
 
 logger = get_logger()
@@ -369,7 +370,7 @@ class MultiHeadAttention(nn.Module):
                 assert sp_size % num_kv_heads == 0
                 key_states = repeat_kv(key_states, sp_size // num_kv_heads)
                 value_states = repeat_kv(value_states, sp_size // num_kv_heads)
-
+            event_timer.add_event("mha_sp")
             query_states = ulysses_all_to_all(
                 query_states,
                 scatter_dim=1,
@@ -388,6 +389,7 @@ class MultiHeadAttention(nn.Module):
                 gather_dim=2,
                 mesh=seq_ctx.sequence_parallel_mesh,
             )
+            event_timer.add_event("mha_sp")
 
         assert query_states.size(0) == 1
         assert key_states.size(0) == 1
@@ -401,16 +403,17 @@ class MultiHeadAttention(nn.Module):
                 sinks = self.sinks
             kwargs["s_aux"] = sinks
         # [b, n_head, seq, head_dim]
-        from xtuner.v1.utils.event_record import event_timer
+        
         event_timer.add_event("mha_op")
-        event_timer.add_tensor_shape("mha_query", query_states)
-        event_timer.add_tensor("cu_seq_lens", seq_ctx.cu_seq_lens_q)
+        # event_timer.add_tensor_shape("mha_query", query_states)
+        fa_lens = seq_ctx.cu_seq_lens_q[1:] - seq_ctx.cu_seq_lens_q[:-1]
+        # event_timer.add_tensor("cu_seq_lens", fa_lens)
         attn_op_outputs = self.attn_impl_func(
             query_states,
             key_states,
             value_states,
-            cu_seqlens_q=seq_ctx.cu_seq_lens_q,
-            cu_seqlens_k=seq_ctx.cu_seq_lens_k,
+            cu_seqlens_q=seq_ctx.cu_seq_lens_q_list  if hasattr(seq_ctx, "cu_seq_lens_q_list") else seq_ctx.cu_seq_lens_q,
+            cu_seqlens_k=seq_ctx.cu_seq_lens_k_list  if hasattr(seq_ctx, "cu_seq_lens_k_list") else seq_ctx.cu_seq_lens_k,
             max_seqlen_q=seq_ctx.max_length_q,
             max_seqlen_k=seq_ctx.max_length_k,
             window_size=self.window_size,
@@ -421,7 +424,7 @@ class MultiHeadAttention(nn.Module):
             **kwargs,
         )
         event_timer.add_event("mha_op")
-
+        event_timer.add_event("mha_all2all_o")
         raw_output = attn_op_outputs["raw_output"]
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
             raw_output = ulysses_all_to_all(
@@ -430,7 +433,7 @@ class MultiHeadAttention(nn.Module):
                 gather_dim=2,
                 mesh=seq_ctx.sequence_parallel_mesh,
             )
-
+        event_timer.add_event("mha_all2all_o")
         raw_output = raw_output.reshape(*input_shape, -1).contiguous()
         if self.with_gate:
             assert gate is not None

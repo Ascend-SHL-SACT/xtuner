@@ -22,6 +22,7 @@ from ...ops.gated_deltanet.gen_seq_idx import gen_seq_idx
 from ..linear import build_linear
 from .attn_outputs import AttnOutputs
 from .causal_conv1d import causal_conv1d_triton
+from xtuner.v1.utils.event_record import event_timer
 
 
 # Temporary solution: use separate function objects for each call site, Dynamo will cache them separately
@@ -261,6 +262,18 @@ class GatedDeltaNet(nn.Module):
         else:
             seq_idx = seq_ctx.seq_idx
 
+        beta = b.sigmoid()
+        # If the model is loaded in fp16, without the .float() here, A might be -inf
+        A_log = self.A_log
+        dt_bias = self.dt_bias
+        if isinstance(A_log, DTensor):
+            A_log = A_log.to_local()
+        if isinstance(dt_bias, DTensor):
+            dt_bias = dt_bias.to_local()
+
+        A_log = A_log.to(mixed_qkv.device)
+        g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+
         query, key, value = torch.split(
             mixed_qkv,  # (1, L/sp_size, 8192)
             [
@@ -273,7 +286,7 @@ class GatedDeltaNet(nn.Module):
         query = query.transpose(1, 2)  # (1, dim, L/sp_size)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
-
+        event_timer.add_event("gdn_sp", group=seq_ctx.sequence_parallel_mesh.get_group())
         query = _all_to_all_conv_pre_qk(
             query,
             scatter_dim=1,
@@ -293,6 +306,26 @@ class GatedDeltaNet(nn.Module):
             mesh=seq_ctx.sequence_parallel_mesh,
         )
 
+        if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
+            g = g.transpose(1, 2)
+            beta = beta.transpose(1, 2)
+
+            g = _all_to_all_gb(
+                g,  # (1, num_v_heads, L/sp_size)
+                scatter_dim=1,
+                gather_dim=2,
+                mesh=seq_ctx.sequence_parallel_mesh,
+            )
+            beta = _all_to_all_gb(
+                beta,  # (1, num_v_heads, L/sp_size)
+                scatter_dim=1,
+                gather_dim=2,
+                mesh=seq_ctx.sequence_parallel_mesh,
+            )
+            g = g.transpose(1, 2)
+            beta = beta.transpose(1, 2)
+        event_timer.add_event("gdn_sp", group=seq_ctx.sequence_parallel_mesh.get_group())
+
         query_weight, key_weight, value_weight = torch.split(
             weight,  # (8192, 4)
             [
@@ -311,29 +344,6 @@ class GatedDeltaNet(nn.Module):
         query = query.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
         key = key.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
         value = value.transpose(1, 2).contiguous().transpose(1, 2)  # make it contiguous for causal_conv1d_fn
-        # if self.causal_conv1d_fn is not None:
-        #     query = self.causal_conv1d_fn(  # query (batch, dim, seqlen)
-        #         x=query,  # need non contiguous
-        #         weight=query_weight,
-        #         bias=bias,
-        #         activation=self.activation,
-        #         seq_idx=seq_idx,
-        #     )
-        #     key = self.causal_conv1d_fn(
-        #         x=key,  # need non contiguous
-        #         weight=key_weight,
-        #         bias=bias,
-        #         activation=self.activation,
-        #         seq_idx=seq_idx,
-        #     )
-        #     value = self.causal_conv1d_fn(
-        #         x=value,  # need non contiguous
-        #         weight=value_weight,
-        #         bias=bias,
-        #         activation=self.activation,
-        #         seq_idx=seq_idx,
-        #     )
-        # else:
         if True:
             if seq_ctx.cu_seq_lens_q is not None and seq_ctx.cu_seq_lens_q.device != query.device:
                 # origin_device = seq_ctx.cu_seq_lens_q.device
@@ -369,60 +379,12 @@ class GatedDeltaNet(nn.Module):
                 chunk_indices=seq_ctx.chunk_indices,
             )
 
-
-        beta = b.sigmoid()
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
-        A_log = self.A_log
-        dt_bias = self.dt_bias
-        if isinstance(A_log, DTensor):
-            A_log = A_log.to_local()
-        if isinstance(dt_bias, DTensor):
-            dt_bias = dt_bias.to_local()
-
-        A_log = A_log.to(query.device)
-        g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
-
-        # (1,key_dim/sp_size, L)
-        # query = query.transpose(1, 2).reshape(
-        #     batch_size, seq_len * sp_size, -1, self.head_k_dim
-        # )  # (1, L, num_k_heads/sp_size, head_k_dim)
-        # key = key.transpose(1, 2).reshape(
-        #     batch_size, seq_len * sp_size, -1, self.head_k_dim
-        # )  # (1, L, num_k_heads/sp_size, head_k_dim)
-        # value = value.transpose(1, 2).reshape(
-        #     batch_size, seq_len * sp_size, -1, self.head_v_dim
-        # )  # (1, L, num_v_heads/sp_size, head_v_dim)
-
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=1)
             # query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             # key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
-            g = g.transpose(1, 2)
-            beta = beta.transpose(1, 2)
-
-            g = _all_to_all_gb(
-                g,  # (1, num_v_heads, L/sp_size)
-                scatter_dim=1,
-                gather_dim=2,
-                mesh=seq_ctx.sequence_parallel_mesh,
-            )
-            beta = _all_to_all_gb(
-                beta,  # (1, num_v_heads, L/sp_size)
-                scatter_dim=1,
-                gather_dim=2,
-                mesh=seq_ctx.sequence_parallel_mesh,
-            )
-            g = g.transpose(1, 2)
-            beta = beta.transpose(1, 2)
         
-        # if torch.distributed.get_rank()==0:
-        #     breakpoint()
-        # torch.distributed.barrier()
-        # query, key, value, g, beta = varlen_to_nonvarlen(seq_ctx.cu_seq_lens_q, query, key, value, g, beta)
-        from xtuner.v1.utils.event_record import event_timer
         event_timer.add_event("gdn_op")
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
@@ -443,7 +405,7 @@ class GatedDeltaNet(nn.Module):
         # if seq_ctx.cu_seq_lens_q is not None:
         #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)
         # core_attn_out = nonvarlen_to_varlen(seq_ctx.cu_seq_lens_q, core_attn_out)
-
+        event_timer.add_event("gdn_all2all_o")
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
             core_attn_out = _all_to_all_out(
                 core_attn_out,  # (1, L, num_v_head/sp_size, head_dim)
@@ -451,7 +413,7 @@ class GatedDeltaNet(nn.Module):
                 gather_dim=2,
                 mesh=seq_ctx.sequence_parallel_mesh,
             )
-
+        event_timer.add_event("gdn_all2all_o")
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)

@@ -449,6 +449,7 @@ class MoEDecoderLayer(nn.Module):
             hidden_states=hidden_states.view(-1, hidden_states.shape[-1]),
             topk_ids=router_results["topk_ids"] if not skip_pad_tokens else router_results["topk_ids"][nonpad_indices, :],
         )
+        event_timer.add_event("moe_pre_all2all")
         dispatched = self.dispatcher.dispatch(
             pre_dispatched=pre_dispatched,
             topk_weights=router_results["topk_weights"] if not skip_pad_tokens else router_results["topk_weights"][nonpad_indices, :],
@@ -458,6 +459,7 @@ class MoEDecoderLayer(nn.Module):
             pre_dispatched=pre_dispatched,
             dispatched=dispatched,
         )
+        event_timer.add_event("moe_pre_all2all")
         # ProberList.after_dispatch(
         #     self.layer_idx,
         #     post_dispatched["hidden_states"],
@@ -465,8 +467,8 @@ class MoEDecoderLayer(nn.Module):
         #     post_dispatched.get("row_ids_map"),  # type: ignore[arg-type]
         #     dispatched["topk_weights"],
         # )
-        # print(post_dispatched["hidden_states"].shape)
         self._token_distribution_across_experts(post_dispatched["tokens_per_expert"], skip=True)
+
         event_timer.add_event("moe_gmm")
         experts_out = self.experts(
             post_dispatched["hidden_states"],
@@ -488,6 +490,7 @@ class MoEDecoderLayer(nn.Module):
             decoding=False,
         )
 
+        event_timer.add_event("moe_post_all2all")
         combined = self.dispatcher.combine(
             pre_dispatched=pre_dispatched,
             dispatched=dispatched,
@@ -502,6 +505,7 @@ class MoEDecoderLayer(nn.Module):
             pre_combined=pre_combined,
             combined=combined,
         )
+        event_timer.add_event("moe_post_all2all")
         event_timer.add_event("moe")
         combined_hidden_states = post_combined["hidden_states"]
         combined_hidden_states = combined_hidden_states.view(*origin_shape)
