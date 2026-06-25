@@ -417,42 +417,22 @@ class MoEDecoderLayer(nn.Module):
                 
                 # print(f"[EP Rank {ep_rank}] Appended layer {self.layer_idx} tokens_per_expert to {filename}")
 
-
-    def _forward(
+    def moe_op(
         self,
         hidden_states: torch.Tensor,
-        seq_ctx: SequenceContext,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[HiddenStates, RouterLogits, RouterWeights]:
-        residual, hidden_states, router_results = self._pre_moe_forward(
-            hidden_states=hidden_states,
-            seq_ctx=seq_ctx,
-            position_embeddings=position_embeddings,
-            state=ForwardState.TRAINING,
-        )
-        skip_pad_tokens = (os.environ.get("SKIP_PAD_TOKENS", "False") == "True")
-        if skip_pad_tokens:
-            nonpad_indices = torch.nonzero(seq_ctx.mask, as_tuple=True)[1]
-            pad_indices = torch.nonzero(~seq_ctx.mask, as_tuple=True)[1]
-            origin_hidden_states = hidden_states
-            hidden_states = origin_hidden_states[:,nonpad_indices,:]
-            pad_hidden_states = origin_hidden_states[:, pad_indices,:]
-        origin_shape = hidden_states.shape
-
-        # reshape hidden_states to (batch_size * seq_len, hidden_size)
-        # ProberList.before_dispatch(
-        #     self.layer_idx, hidden_states, router_results["topk_ids"], router_results["topk_weights"]
-        # )
+        router_results: RouterResults,
+        origin_shape: torch.Size,
+    ) -> torch.Tensor:
         from xtuner.v1.utils.event_record import event_timer
         event_timer.add_event("moe")
         pre_dispatched = self.dispatcher.dispatch_preprocess(
             hidden_states=hidden_states.view(-1, hidden_states.shape[-1]),
-            topk_ids=router_results["topk_ids"] if not skip_pad_tokens else router_results["topk_ids"][nonpad_indices, :],
+            topk_ids=router_results["topk_ids"],
         )
         event_timer.add_event("moe_pre_all2all")
         dispatched = self.dispatcher.dispatch(
             pre_dispatched=pre_dispatched,
-            topk_weights=router_results["topk_weights"] if not skip_pad_tokens else router_results["topk_weights"][nonpad_indices, :],
+            topk_weights=router_results["topk_weights"],
             decoding=False,
         )  # type: ignore[call-overload]
         post_dispatched = self.dispatcher.dispatch_postprocess(
@@ -509,6 +489,67 @@ class MoEDecoderLayer(nn.Module):
         event_timer.add_event("moe")
         combined_hidden_states = post_combined["hidden_states"]
         combined_hidden_states = combined_hidden_states.view(*origin_shape)
+        return combined_hidden_states
+
+    def _forward(
+        self,
+        hidden_states: torch.Tensor,
+        seq_ctx: SequenceContext,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[HiddenStates, RouterLogits, RouterWeights]:
+        residual, hidden_states, router_results = self._pre_moe_forward(
+            hidden_states=hidden_states,
+            seq_ctx=seq_ctx,
+            position_embeddings=position_embeddings,
+            state=ForwardState.TRAINING,
+        )
+        skip_pad_tokens = (os.environ.get("SKIP_PAD_TOKENS", "False") == "True")
+        if skip_pad_tokens:
+            nonpad_indices = torch.nonzero(seq_ctx.mask, as_tuple=True)[1]
+            pad_indices = torch.nonzero(~seq_ctx.mask, as_tuple=True)[1]
+            origin_hidden_states = hidden_states
+            hidden_states = origin_hidden_states[:,nonpad_indices,:]
+            pad_hidden_states = origin_hidden_states[:, pad_indices,:]
+        origin_shape = hidden_states.shape
+
+        # 将 hidden_states 沿 token 维拆分成 moe_chunk_size 个 chunk，分多次执行 moe_op 以降低单次显存峰值
+        moe_chunk_size = getattr(self, 'moe_chunk_size', 1)  # 默认分成 2 个 chunk
+        flat_hidden = hidden_states.view(-1, hidden_states.shape[-1])
+        num_tokens = flat_hidden.shape[0]
+        chunk_size = num_tokens // moe_chunk_size
+
+        # 对齐 router_results 的 topk_ids/topk_weights 到当前 hidden_states 的 token 集合
+        if skip_pad_tokens:
+            aligned_topk_ids = router_results["topk_ids"][nonpad_indices, :]
+            aligned_topk_weights = router_results["topk_weights"][nonpad_indices, :]
+        else:
+            aligned_topk_ids = router_results["topk_ids"]
+            aligned_topk_weights = router_results["topk_weights"]
+
+        def _run_moe_op(chunk_hidden: torch.Tensor, chunk_topk_ids: torch.Tensor, chunk_topk_weights: torch.Tensor) -> torch.Tensor:
+            chunk_router_results: RouterResults = {
+                **router_results,
+                "topk_ids": chunk_topk_ids,
+                "topk_weights": chunk_topk_weights,
+            }
+            return self.moe_op(
+                hidden_states=chunk_hidden,
+                router_results=chunk_router_results,
+                origin_shape=chunk_hidden.shape,
+            )
+
+        # 动态分块执行 moe_op
+        chunk_outputs = []
+        for i in range(moe_chunk_size):
+            start = i * chunk_size
+            end = (i + 1) * chunk_size if i < moe_chunk_size - 1 else num_tokens  # 最后一个 chunk 包含剩余 tokens
+            chunk_hidden = flat_hidden[start:end]
+            chunk_topk_ids = aligned_topk_ids[start:end, :]
+            chunk_topk_weights = aligned_topk_weights[start:end, :]
+            chunk_out = _run_moe_op(chunk_hidden, chunk_topk_ids, chunk_topk_weights)
+            chunk_outputs.append(chunk_out)
+
+        combined_hidden_states = torch.cat(chunk_outputs, dim=0).view(*origin_shape)
 
         # debug for aligning with hf implementation.
         # combined_hidden_states = self._hf_expert_forward_for_debug(hidden_states, router_results, origin_shape)
