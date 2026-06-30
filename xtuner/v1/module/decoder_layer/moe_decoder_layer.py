@@ -455,7 +455,6 @@ class MoEDecoderLayer(nn.Module):
             post_dispatched["tokens_per_expert"],
             decoding=False,
         )
-        event_timer.add_event("moe_gmm")
         # ProberList.before_combine(
         #     self.layer_idx,
         #     experts_out,

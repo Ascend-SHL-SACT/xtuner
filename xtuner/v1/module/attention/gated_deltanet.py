@@ -400,7 +400,6 @@ class GatedDeltaNet(nn.Module):
             chunk_indices=seq_ctx.chunk_indices,
             chunk_indices_list=seq_ctx.chunk_indices_list 
         )
-        event_timer.add_event("gdn_op")
         # core_attn_out = torch.randn_like(query)
         # if seq_ctx.cu_seq_lens_q is not None:
         #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)
