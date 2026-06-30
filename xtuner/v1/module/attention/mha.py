@@ -370,7 +370,6 @@ class MultiHeadAttention(nn.Module):
                 assert sp_size % num_kv_heads == 0
                 key_states = repeat_kv(key_states, sp_size // num_kv_heads)
                 value_states = repeat_kv(value_states, sp_size // num_kv_heads)
-            event_timer.add_event("mha_sp")
             query_states = ulysses_all_to_all(
                 query_states,
                 scatter_dim=1,
@@ -389,7 +388,6 @@ class MultiHeadAttention(nn.Module):
                 gather_dim=2,
                 mesh=seq_ctx.sequence_parallel_mesh,
             )
-            event_timer.add_event("mha_sp")
 
         assert query_states.size(0) == 1
         assert key_states.size(0) == 1
@@ -404,7 +402,6 @@ class MultiHeadAttention(nn.Module):
             kwargs["s_aux"] = sinks
         # [b, n_head, seq, head_dim]
         
-        event_timer.add_event("mha_op")
         # event_timer.add_tensor_shape("mha_query", query_states)
         fa_lens = seq_ctx.cu_seq_lens_q[1:] - seq_ctx.cu_seq_lens_q[:-1]
         # event_timer.add_tensor("cu_seq_lens", fa_lens)
@@ -423,8 +420,6 @@ class MultiHeadAttention(nn.Module):
             deterministic=XTUNER_DETERMINISTIC,
             **kwargs,
         )
-        event_timer.add_event("mha_op")
-        event_timer.add_event("mha_all2all_o")
         raw_output = attn_op_outputs["raw_output"]
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
             raw_output = ulysses_all_to_all(
@@ -433,7 +428,6 @@ class MultiHeadAttention(nn.Module):
                 gather_dim=2,
                 mesh=seq_ctx.sequence_parallel_mesh,
             )
-        event_timer.add_event("mha_all2all_o")
         raw_output = raw_output.reshape(*input_shape, -1).contiguous()
         if self.with_gate:
             assert gate is not None

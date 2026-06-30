@@ -286,7 +286,6 @@ class GatedDeltaNet(nn.Module):
         query = query.transpose(1, 2)  # (1, dim, L/sp_size)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
-        event_timer.add_event("gdn_sp", group=seq_ctx.sequence_parallel_mesh.get_group())
         query = _all_to_all_conv_pre_qk(
             query,
             scatter_dim=1,
@@ -324,7 +323,6 @@ class GatedDeltaNet(nn.Module):
             )
             g = g.transpose(1, 2)
             beta = beta.transpose(1, 2)
-        event_timer.add_event("gdn_sp", group=seq_ctx.sequence_parallel_mesh.get_group())
 
         query_weight, key_weight, value_weight = torch.split(
             weight,  # (8192, 4)
@@ -385,7 +383,6 @@ class GatedDeltaNet(nn.Module):
             # query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             # key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         
-        event_timer.add_event("gdn_op")
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
             key,
@@ -404,7 +401,6 @@ class GatedDeltaNet(nn.Module):
         # if seq_ctx.cu_seq_lens_q is not None:
         #     seq_ctx.cu_seq_lens_q = seq_ctx.cu_seq_lens_q.to(origin_device)
         # core_attn_out = nonvarlen_to_varlen(seq_ctx.cu_seq_lens_q, core_attn_out)
-        event_timer.add_event("gdn_all2all_o")
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
             core_attn_out = _all_to_all_out(
                 core_attn_out,  # (1, L, num_v_head/sp_size, head_dim)
@@ -412,7 +408,6 @@ class GatedDeltaNet(nn.Module):
                 gather_dim=2,
                 mesh=seq_ctx.sequence_parallel_mesh,
             )
-        event_timer.add_event("gdn_all2all_o")
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)

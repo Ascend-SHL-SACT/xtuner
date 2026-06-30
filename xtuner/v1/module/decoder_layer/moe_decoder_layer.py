@@ -298,6 +298,7 @@ class MoEDecoderLayer(nn.Module):
         *hidden_states: torch.Tensor,
         seq_ctx: SequenceContext | list[SequenceContext],
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        layer_idx: int = -1,
     ) -> tuple[HiddenStates, RouterResults] | tuple[torch.Tensor, ...]:
         """Forward pass of the MoE decoder layer.
 
@@ -321,6 +322,7 @@ class MoEDecoderLayer(nn.Module):
                 hidden_states=hidden_states[0],
                 seq_ctx=seq_ctx,
                 position_embeddings=position_embeddings,
+                layer_idx = layer_idx,
             )
         else:
             assert isinstance(seq_ctx, list) and len(seq_ctx) == len(hidden_states), (
@@ -334,6 +336,7 @@ class MoEDecoderLayer(nn.Module):
                 hidden_states_list=list(hidden_states),
                 seq_ctx_list=seq_ctx,
                 position_embeddings_list=position_embeddings,
+                layer_idx = layer_idx,
             )
 
     def _hf_expert_forward_for_debug(self, hidden_states: torch.Tensor, router_results: RouterResults, origin_shape):
@@ -423,13 +426,10 @@ class MoEDecoderLayer(nn.Module):
         router_results: RouterResults,
         origin_shape: torch.Size,
     ) -> torch.Tensor:
-        from xtuner.v1.utils.event_record import event_timer
-        event_timer.add_event("moe")
         pre_dispatched = self.dispatcher.dispatch_preprocess(
             hidden_states=hidden_states.view(-1, hidden_states.shape[-1]),
             topk_ids=router_results["topk_ids"],
         )
-        event_timer.add_event("moe_pre_all2all")
         dispatched = self.dispatcher.dispatch(
             pre_dispatched=pre_dispatched,
             topk_weights=router_results["topk_weights"],
@@ -439,7 +439,6 @@ class MoEDecoderLayer(nn.Module):
             pre_dispatched=pre_dispatched,
             dispatched=dispatched,
         )
-        event_timer.add_event("moe_pre_all2all")
         # ProberList.after_dispatch(
         #     self.layer_idx,
         #     post_dispatched["hidden_states"],
@@ -449,7 +448,6 @@ class MoEDecoderLayer(nn.Module):
         # )
         self._token_distribution_across_experts(post_dispatched["tokens_per_expert"], skip=True)
 
-        event_timer.add_event("moe_gmm")
         experts_out = self.experts(
             post_dispatched["hidden_states"],
             post_dispatched["tokens_per_expert"],
@@ -469,7 +467,6 @@ class MoEDecoderLayer(nn.Module):
             decoding=False,
         )
 
-        event_timer.add_event("moe_post_all2all")
         combined = self.dispatcher.combine(
             pre_dispatched=pre_dispatched,
             dispatched=dispatched,
@@ -484,8 +481,6 @@ class MoEDecoderLayer(nn.Module):
             pre_combined=pre_combined,
             combined=combined,
         )
-        event_timer.add_event("moe_post_all2all")
-        event_timer.add_event("moe")
         combined_hidden_states = post_combined["hidden_states"]
         combined_hidden_states = combined_hidden_states.view(*origin_shape)
         return combined_hidden_states
@@ -495,6 +490,7 @@ class MoEDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         seq_ctx: SequenceContext,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        layer_idx: int,
     ) -> tuple[HiddenStates, RouterLogits, RouterWeights]:
         residual, hidden_states, router_results = self._pre_moe_forward(
             hidden_states=hidden_states,
@@ -577,6 +573,7 @@ class MoEDecoderLayer(nn.Module):
         hidden_states_list: list[torch.Tensor],
         seq_ctx_list: list[SequenceContext],
         position_embeddings_list: list[tuple[torch.Tensor, torch.Tensor]],
+        layer_idx: int,
     ) -> tuple[torch.Tensor, ...]:  # (HiddenStates, HiddenStates, RouterLogits, RouterLogits)
         origin_shape = hidden_states_list[0].shape
         assert all(hidden_states.shape == origin_shape for hidden_states in hidden_states_list), (

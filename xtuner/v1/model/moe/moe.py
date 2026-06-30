@@ -531,6 +531,7 @@ class MoE(BaseModel):
                     cat_hidden_states,
                     position_embeddings=cat_position_embeddings,
                     seq_ctx=cat_seq_ctx,
+                    layer_idx = layer_idx,
                 )
             else:
                 if not moe_forward:
@@ -558,12 +559,14 @@ class MoE(BaseModel):
                             *hidden_states_list,
                             position_embeddings=position_embeddings_list,
                             seq_ctx=seq_ctx_list,
+                            layer_idx=layer_idx,
                         )
                 else:
                     layer_results = decoder_layer(
                         *hidden_states_list,
                         position_embeddings=position_embeddings_list,
                         seq_ctx=seq_ctx_list,
+                        layer_idx=layer_idx,
                     )
                 hidden_states = layer_results[: len(hidden_states_list)]
                 router_logits = layer_results[len(hidden_states_list) : len(hidden_states_list) * 2]
@@ -747,7 +750,6 @@ class MoE(BaseModel):
         non_pad_token = nonpad_indices.numel()
         num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, seq_ctx.mask.device)
 
-        from xtuner.v1.utils.event_record import event_timer
         
         event_timer.patch_fsdp_all_gather("llm_all_gather", patch=True)        
         for idx, decoder_layer in self.layers.items():
@@ -756,6 +758,7 @@ class MoE(BaseModel):
                     hidden_states,
                     position_embeddings=position_embeddings,
                     seq_ctx=seq_ctx,
+                    layer_idx=int(idx),
                 )
             else:
                 if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1 and \
@@ -771,12 +774,14 @@ class MoE(BaseModel):
                             hidden_states,
                             position_embeddings=position_embeddings,
                             seq_ctx=seq_ctx,
+                            layer_idx=int(idx),
                         )
                 else:
                     layer_results = decoder_layer(
                         hidden_states,
                         position_embeddings=position_embeddings,
                         seq_ctx=seq_ctx,
+                        layer_idx=int(idx),
                     )
                 hidden_states, router_results, router_weights = layer_results
                 if keep_router:
@@ -797,7 +802,6 @@ class MoE(BaseModel):
 
         layer_hidden_states = hidden_states
         hidden_states = self.norm(hidden_states)
-        event_timer.patch_fsdp_all_gather("llm_all_gather", patch=False)  
         # Get LM loss context from dict
         lm_loss_ctx = loss_ctx["lm"] if loss_ctx is not None else None
         loss, (logits, extra_info) = self.lm_head(hidden_states, lm_loss_ctx)  # type: ignore
