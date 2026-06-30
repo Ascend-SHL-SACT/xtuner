@@ -791,7 +791,12 @@ class Trainer:
 
             ProberList.set_step(self._cur_step + 1)
             DEVICE_MODULE.reset_peak_memory_stats()
-
+            # if self._cur_step in self._profile_step and torch.distributed.get_rank() % 16 == 0:
+            #     from xtuner.v1.profiler.trace_record import ftrace_record_start, ftrace_record_stop, ContainerPidMapper
+            #     ftrace_record_start(cpu_mask="23-24,37-38,63-64,77-78,103-104,117-118,143-144,157-158,183-184,197-198,223-224,237-238,263-264,277-278,303-304,317-318")
+            #     log_dir = os.environ.get("LOG_DIR", "/mnt/huawei/hyf/xtuner_logs_0410_397b")
+            #     container = ContainerPidMapper(output_file=f"{log_dir}/pid_mapping.json")
+            #     container.start()
             with self._maybe_profiling():
                 engine_input = self._prepare_model_input(data_batch)
                 train_step_info = self._engine.train_step(engine_input)
@@ -807,14 +812,17 @@ class Trainer:
 
                 grad_norm = self._engine.clip_grad_norm(do_clip=self._do_clip, dtype=self._grad_norm_dtype)
                 self._engine.step_optimizer(grad_norm)
-
+            # if self._cur_step in self._profile_step and torch.distributed.get_rank() % 16 == 0:
+            #     ftrace_record_stop(output=f"{log_dir}/trace_{torch.distributed.get_rank()}.dat")
+            # if self._cur_step == 0:
+            #     os.system("bash ../xtuner_397b/test_cpu_affinity.sh")
             time_after_train_step = time.time()
             ProberList.after_step()
             from xtuner.v1.utils.event_record import event_timer
             event_timer.flush()
 
-            # if torch.distributed.get_rank()==0 and self._cur_step==1:
-            #     torch_npu.npu.memory._dump_snapshot("397B_全层_ep8_16k_16机_mm.pickle")
+            # if torch.distributed.get_rank()==0 and self._cur_step==4:
+            #     torch_npu.npu.memory._dump_snapshot("swap_muon_0-4.pickle")
 
             data_time = time_before_train_step - time_before_get_data
             step_time = time_after_train_step - time_before_train_step
@@ -1842,7 +1850,10 @@ class Trainer:
 
     def _load_checkpoint(self):
         load_checkpoint_cfg: LoadCheckpointConfig = self._load_checkpoint_cfg
-
+        # 从本地文件获取cpu_binder文件类
+        import cpu_binder
+        # 执行cpu_binder 细粒度绑核操作
+        cpu_binder.run(self.rank)
         if (resume_from := load_checkpoint_cfg.checkpoint_path) is None:
             logger.info("No checkpoint to resume from.")
             return

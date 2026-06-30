@@ -568,7 +568,7 @@ def run(rank_id: int) -> None:
                     logging.error(f"No input bound object. One of 'pid, process_name, irq_id' are required.")
                     continue
                 if len(bind.cpu_list) > 1:
-                    bind.cpu_list = [bind.cpu_list[rank_id]]
+                    bind.cpu_list = [bind.cpu_list[rank_id % 16]]
                 bind.bind(cpu_allocer, current_pid)
         except Exception as e:
             logging.error(e)
