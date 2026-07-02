@@ -430,33 +430,14 @@ class Muon(Optimizer):
         for group in self.param_groups:
             algo = group["algorithm"]
             for param in group["params"]:
+                if not self.swap:
+                    continue
                 local_param = self._to_local_tensor(param)
                 last_local_param = local_param
-                state = self.state[param]
-                cpu_state: dict[str, Tensor | None] = {}
-
                 if algo == "muon":
-                    momentum = torch.zeros_like(local_param, memory_format=torch.preserve_format)
-                    if self.swap:
-                        momentum = momentum.to(device="cpu", non_blocking=True).pin_memory()
-                        swap_num += local_param.numel()
-                    state["momentum"] = momentum
-                    cpu_state["momentum"] = momentum
+                    swap_num += local_param.numel()
                 elif algo == "adamw":
-                    momentum = torch.zeros_like(local_param, memory_format=torch.preserve_format)
-                    if self.swap:
-                        momentum = momentum.to(device="cpu", non_blocking=True).pin_memory()
-                    state["momentum"] = momentum
-                    cpu_state["momentum"] = momentum
-
-                    variance = torch.zeros_like(local_param, memory_format=torch.preserve_format)
-                    if self.swap:
-                        variance = variance.to(device="cpu", non_blocking=True).pin_memory()
-                        swap_num += local_param.numel() * 2
-                    state["variance"] = variance
-                    cpu_state["variance"] = variance
-
-                self._param_to_cpu_states_map[param] = cpu_state
+                    swap_num += local_param.numel() * 2
 
         if last_local_param is not None:
             swap_memory = swap_num * last_local_param.element_size() / 1024 / 1024
