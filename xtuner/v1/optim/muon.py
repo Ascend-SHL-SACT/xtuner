@@ -36,13 +36,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 from torch.optim.optimizer import Optimizer, ParamsT
 
-from xtuner.v1.utils import get_device, get_logger, get_torch_device_module
 from xtuner.v1.utils.dtensor import group_tensors_by_device_mesh_and_placements
-
-
-DEVICE = get_device()
-DEVICE_MODULE = get_torch_device_module()
-logger = get_logger()
 
 
 def maybe_to_local(tensor: list[Tensor]) -> list[Tensor]:
@@ -275,10 +269,6 @@ class Muon(Optimizer):
         use_triton (bool): Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func (Callable | None): Use a custom Newton-Schulz function for orthogonalization.
             Signature is `func(input: Tensor, epsilon: float, num_experts: int) -> Tensor`.
-        swap (bool): Whether to swap optimizer states to host (pinned CPU) memory. When enabled,
-            optimizer states live on CPU and are copied to device for updates then copied back,
-            reducing device memory usage at the cost of transfer overhead. When disabled, states
-            are kept on device. Defaults to True.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -297,7 +287,6 @@ class Muon(Optimizer):
         flatten: bool = False,
         use_triton: bool = False,
         newton_schulz_func: Callable | None = None,
-        swap: bool = True,
     ):
         # Check hyperparameters
         if lr < 0.0:
@@ -373,10 +362,6 @@ class Muon(Optimizer):
         self._subgroup_cache: dict[tuple[int, int, int], tuple[ProcessGroup, int, int]] = {}
         self._init_moe_subgroups()
 
-        self._param_to_cpu_states_map: dict[Tensor, dict[str, Tensor | None]] = {}
-        self.swap = swap
-        self._init_swap_states()
-
     @overload
     def step(self, closure: None = None) -> None: ...
 
@@ -415,57 +400,16 @@ class Muon(Optimizer):
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
 
-        DEVICE_MODULE.synchronize()
         return loss
 
-    @staticmethod
-    def _to_local_tensor(tensor: Tensor) -> Tensor:
-        if hasattr(tensor, "to_local"):
-            return tensor.to_local()
-        return tensor
-
-    def _init_swap_states(self) -> None:
-        swap_num = 0
-        last_local_param = None
-        for group in self.param_groups:
-            algo = group["algorithm"]
-            for param in group["params"]:
-                if not self.swap:
-                    continue
-                local_param = self._to_local_tensor(param)
-                last_local_param = local_param
-                if algo == "muon":
-                    swap_num += local_param.numel()
-                elif algo == "adamw":
-                    swap_num += local_param.numel() * 2
-
-        if last_local_param is not None:
-            swap_memory = swap_num * last_local_param.element_size() / 1024 / 1024
-        else:
-            swap_memory = 0.0
-        logger.info(
-            f"[Rank {DEVICE_MODULE.current_device()}] swap optimizer param num: {swap_num},  "
-            f"param size: {swap_memory:.2f}MB\n",
-            end="",
-        )
-        DEVICE_MODULE.synchronize()
-
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
+        """Get optimizer state for the given parameter tensor, or lazy-
+        initialize it if it doesn't exist."""
         state = self.state[param]
         if "momentum" not in state:
-            local_param = self._to_local_tensor(param)
-            momentum = torch.zeros_like(local_param, memory_format=torch.preserve_format)
-            if self.swap:
-                momentum = momentum.to(device="cpu", non_blocking=True).pin_memory()
-            state["momentum"] = momentum
-            cpu_state: dict[str, Tensor | None] = {"momentum": momentum}
+            state["momentum"] = torch.zeros_like(param)
             if algo == "adamw":
-                variance = torch.zeros_like(local_param, memory_format=torch.preserve_format)
-                if self.swap:
-                    variance = variance.to(device="cpu", non_blocking=True).pin_memory()
-                state["variance"] = variance
-                cpu_state["variance"] = variance
-            self._param_to_cpu_states_map[param] = cpu_state
+                state["variance"] = torch.zeros_like(param)
         return state
 
     @staticmethod
@@ -723,16 +667,14 @@ class Muon(Optimizer):
 
                     states = [self._get_or_initialize_state(p, algo_name) for p in params]
 
+                    momentums = [s["momentum"] for s in states]
                     lr_ratios = [s["lr_ratio"] for s in states]
                     assert len(set(lr_ratios)) == 1, f"Found different lr_ratios: {set(lr_ratios)}"
 
-                    cpu_momentums = [self._param_to_cpu_states_map[p]["momentum"] for p in params]
-                    assert all(m is not None for m in cpu_momentums)
-                    if self.swap:
-                        device_momentums = [m.to(device=DEVICE, non_blocking=True) for m in cpu_momentums]
-                    else:
-                        device_momentums = cpu_momentums
-
+                    # AGRS (All-Gather + Reduce-Scatter) only works with even
+                    # sharding — all ranks must contribute the same number of
+                    # elements.  Uneven sharding falls back to padded all-to-all
+                    # which has dedicated uneven-shard handling.
                     is_evenly_sharded = (
                         sharded_tensor_dim is None or params[0].size(sharded_tensor_dim) % group_world_size == 0
                     )
@@ -745,82 +687,67 @@ class Muon(Optimizer):
                     )
 
                     if is_remainder:
-                        inner = muon_update_batch_async(
-                            X=params,
-                            G=gradients,
-                            M=device_momentums,
-                            lr=lr,
-                            lr_ratio=lr_ratios[0],
-                            momentum=mu,
-                            weight_decay=weight_decay,
-                            epsilon=epsilon,
-                            nesterov=nesterov,
-                            flatten=flatten,
-                            device_rank=group_device_rank,
-                            world_size=group_world_size,
-                            shard_dim=sharded_tensor_dim,
-                            process_group=group_process_group,
-                            newton_schulz_func=self._newton_schulz_func,
-                            num_experts=ns_num_experts,
-                            subgroup_process_group=subgroup_process_group,
-                            subgroup_size=subgroup_size,
-                            subgroup_rank=subgroup_rank,
-                            use_agrs=True,
-                        )
-                        if self.swap:
-                            yield AsyncTask(
-                                _muon_swap_async_wrapper(
-                                    inner=inner,
-                                    cpu_momentums=cpu_momentums,
-                                    device_momentums=device_momentums,
-                                )
+                        # AG+RS path for partial batches: no zero-padding needed
+                        yield AsyncTask(
+                            muon_update_batch_async(
+                                X=params,
+                                G=gradients,
+                                M=momentums,
+                                lr=lr,
+                                lr_ratio=lr_ratios[0],
+                                momentum=mu,
+                                weight_decay=weight_decay,
+                                epsilon=epsilon,
+                                nesterov=nesterov,
+                                flatten=flatten,
+                                device_rank=group_device_rank,
+                                world_size=group_world_size,
+                                shard_dim=sharded_tensor_dim,
+                                process_group=group_process_group,
+                                newton_schulz_func=self._newton_schulz_func,
+                                num_experts=ns_num_experts,
+                                subgroup_process_group=subgroup_process_group,
+                                subgroup_size=subgroup_size,
+                                subgroup_rank=subgroup_rank,
+                                use_agrs=True,
                             )
-                        else:
-                            yield AsyncTask(inner)
+                        )
 
                     else:
-                        padded_device_momentums = pad_batch(device_momentums, group_world_size)
-                        inner = muon_update_batch_async(
-                            X=pad_batch(params, group_world_size),
-                            G=pad_batch(gradients, group_world_size),
-                            M=padded_device_momentums,
-                            lr=lr,
-                            lr_ratio=lr_ratios[0],
-                            momentum=mu,
-                            weight_decay=weight_decay,
-                            epsilon=epsilon,
-                            nesterov=nesterov,
-                            flatten=flatten,
-                            device_rank=group_device_rank,
-                            world_size=group_world_size,
-                            shard_dim=sharded_tensor_dim,
-                            process_group=group_process_group,
-                            newton_schulz_func=self._newton_schulz_func,
-                            num_experts=ns_num_experts,
-                            subgroup_process_group=subgroup_process_group,
-                            subgroup_size=subgroup_size,
-                            subgroup_rank=subgroup_rank,
-                        )
-                        if self.swap:
-                            padded_cpu_momentums = pad_batch(cpu_momentums, group_world_size)
-                            yield AsyncTask(
-                                _muon_swap_async_wrapper(
-                                    inner=inner,
-                                    cpu_momentums=padded_cpu_momentums,
-                                    device_momentums=padded_device_momentums,
-                                )
+                        yield AsyncTask(
+                            muon_update_batch_async(
+                                X=pad_batch(params, group_world_size),
+                                G=pad_batch(gradients, group_world_size),
+                                M=pad_batch(momentums, group_world_size),
+                                lr=lr,
+                                lr_ratio=lr_ratios[0],
+                                momentum=mu,
+                                weight_decay=weight_decay,
+                                epsilon=epsilon,
+                                nesterov=nesterov,
+                                flatten=flatten,
+                                device_rank=group_device_rank,
+                                world_size=group_world_size,
+                                shard_dim=sharded_tensor_dim,
+                                process_group=group_process_group,
+                                newton_schulz_func=self._newton_schulz_func,
+                                num_experts=ns_num_experts,
+                                subgroup_process_group=subgroup_process_group,
+                                subgroup_size=subgroup_size,
+                                subgroup_rank=subgroup_rank,
                             )
-                        else:
-                            yield AsyncTask(inner)
+                        )
 
     def _create_adamw_tasks(
         self,
         param_groups: list[dict],
         algo_name: str = "adamw",
     ) -> Generator["AsyncTask", None, None]:
+        """Helper function to generate AsyncTask objects for AdamW updates."""
         for group in param_groups:
             assert group["algorithm"] == algo_name
 
+            # Get parameters and optimizer states
             params = [p for p in group["params"] if p.grad is not None]
 
             if not params:
@@ -829,85 +756,31 @@ class Muon(Optimizer):
             gradients = [p.grad for p in params]
             states = [self._get_or_initialize_state(p, algo_name) for p in params]
 
+            momentums = [s["momentum"] for s in states]
+            variances = [s["variance"] for s in states]
+
             lr = torch.tensor(group["lr"])
             beta1 = torch.tensor(group["beta1"])
             beta2 = torch.tensor(group["beta2"])
             weight_decay = torch.tensor(group["weight_decay"])
-            epsilon = group["epsilon"]
+            epsilon = group["epsilon"]  # Keep as float
 
-            step = group["step"]
+            step = group["step"]  # Keep as int
 
-            cpu_momentums = [self._param_to_cpu_states_map[p]["momentum"] for p in params]
-            cpu_variances = [self._param_to_cpu_states_map[p]["variance"] for p in params]
-            assert all(m is not None for m in cpu_momentums)
-            assert all(v is not None for v in cpu_variances)
-            if self.swap:
-                device_momentums = [m.to(device=DEVICE, non_blocking=True) for m in cpu_momentums]
-                device_variances = [v.to(device=DEVICE, non_blocking=True) for v in cpu_variances]
-            else:
-                device_momentums = cpu_momentums
-                device_variances = cpu_variances
-
-            inner = adamw_update_foreach_async(
-                X=maybe_to_local(params),
-                G=maybe_to_local(gradients),
-                M=maybe_to_local(device_momentums),
-                V=maybe_to_local(device_variances),
-                lr=lr,
-                beta1=beta1,
-                beta2=beta2,
-                weight_decay=weight_decay,
-                step=step,
-                epsilon=epsilon,
-            )
-            if self.swap:
-                yield AsyncTask(
-                    _adamw_swap_async_wrapper(
-                        inner=inner,
-                        cpu_momentums=cpu_momentums,
-                        cpu_variances=cpu_variances,
-                        device_momentums=device_momentums,
-                        device_variances=device_variances,
-                    )
+            yield AsyncTask(
+                adamw_update_foreach_async(
+                    X=maybe_to_local(params),
+                    G=maybe_to_local(gradients),
+                    M=maybe_to_local(momentums),
+                    V=maybe_to_local(variances),
+                    lr=lr,
+                    beta1=beta1,
+                    beta2=beta2,
+                    weight_decay=weight_decay,
+                    step=step,
+                    epsilon=epsilon,
                 )
-            else:
-                yield AsyncTask(inner)
-
-
-def _muon_swap_async_wrapper(
-    inner: Generator[None, None, None],
-    cpu_momentums: list[Tensor],
-    device_momentums: list[Tensor],
-) -> Generator[None, None, None]:
-    try:
-        while True:
-            next(inner)
-            yield
-    except StopIteration:
-        pass
-    for cpu_m, dev_m in zip(cpu_momentums, device_momentums):
-        if cpu_m is not None and dev_m is not None:
-            cpu_m.copy_(dev_m, non_blocking=True)
-
-
-def _adamw_swap_async_wrapper(
-    inner: Generator[None, None, None],
-    cpu_momentums: list[Tensor],
-    cpu_variances: list[Tensor],
-    device_momentums: list[Tensor],
-    device_variances: list[Tensor],
-) -> Generator[None, None, None]:
-    try:
-        while True:
-            next(inner)
-            yield
-    except StopIteration:
-        pass
-    for cpu_m, dev_m, cpu_v, dev_v in zip(cpu_momentums, device_momentums, cpu_variances, device_variances):
-        if cpu_m is not None and dev_m is not None:
-            cpu_m.copy_(dev_m, non_blocking=True)
-        if cpu_v is not None and dev_v is not None:
-            cpu_v.copy_(dev_v, non_blocking=True)
+            )
 
 
 def muon_update_batch_async(
