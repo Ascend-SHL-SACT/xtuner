@@ -196,7 +196,7 @@ class MoE(BaseModel):
         super().__init__(config)
         if config.ep_size is not None and config.ep_size > 1:
             world_size = dist.get_world_size()
-            if True and world_size > 16:
+            if False and world_size > 16:
                 experts_fsdp_size = world_size // config.ep_size
                 mesh_tensor = torch.Tensor(experts_fsdp_size, config.ep_size)
                 for i in range(experts_fsdp_size):
@@ -751,7 +751,6 @@ class MoE(BaseModel):
         num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, seq_ctx.mask.device)
 
         
-        event_timer.patch_fsdp_all_gather("llm_all_gather", patch=True)        
         for idx, decoder_layer in self.layers.items():
             if int(idx) < self.config.first_k_dense_replace:
                 hidden_states = decoder_layer(
@@ -1289,7 +1288,7 @@ class MoE(BaseModel):
         experts_fsdp_size = world_size // self.fsdp_config.ep_size
 
         if self.fsdp_config.hsdp_sharding_size is None:
-            if True and world_size > 16:
+            if False and world_size > 16:
                 mesh_tensor = torch.Tensor(experts_fsdp_size, self.fsdp_config.ep_size)
                 for i in range(experts_fsdp_size):
                     for j in range(self.fsdp_config.ep_size):
