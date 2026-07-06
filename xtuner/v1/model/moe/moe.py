@@ -751,7 +751,6 @@ class MoE(BaseModel):
         num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, seq_ctx.mask.device)
 
         
-        event_timer.patch_fsdp_all_gather("llm_all_gather", patch=True)        
         for idx, decoder_layer in self.layers.items():
             if int(idx) < self.config.first_k_dense_replace:
                 hidden_states = decoder_layer(
