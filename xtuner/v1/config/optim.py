@@ -75,7 +75,6 @@ class MuonConfig(OptimConfig):
     adjust_lr: Annotated[
         Literal["rms_norm", "spectral_norm", "none"], Parameter(help="Method for adjusting lr in Muon")
     ] = "rms_norm"
-    swap: Annotated[bool, Parameter(help="Swap optimizer states to host memory.")] = True
 
     def build(self, model):
         trainable_parameters_names = model.trainable_parameters()
@@ -198,7 +197,6 @@ class MuonConfig(OptimConfig):
             adjust_lr=self.adjust_lr,
             use_triton=False,
             epsilon=self.eps,
-            swap=self.swap,
         )
 
         return optimizer
