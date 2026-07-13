@@ -1208,7 +1208,9 @@ class MoE(BaseModel):
                 ):
                     inner.moe_chunk_size = self.moe_chunk_size
                     inner.use_recompute = True
-                else:
+                elif self._should_recompute(None, mtp_idx=mtp_idx) or (
+                    self.config.mtp_config is not None and self.config.mtp_config.share_weights
+                ) or True:
                     mtp_layer = checkpoint_wrapper(mtp_layer, checkpoint_impl=CheckpointImpl.REENTRANT)
                 self.mtp_block.layers[mtp_idx] = mtp_layer
 
