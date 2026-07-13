@@ -196,7 +196,8 @@ class MoE(BaseModel):
         super().__init__(config)
         if config.ep_size is not None and config.ep_size > 1:
             world_size = dist.get_world_size()
-            if False and world_size > 16:
+            use_device_mesh = os.getenv("XTUNER_DEVICE_MESH", "0") == "1"
+            if use_device_mesh and world_size > 16:
                 experts_fsdp_size = world_size // config.ep_size
                 mesh_tensor = torch.Tensor(experts_fsdp_size, config.ep_size)
                 for i in range(experts_fsdp_size):
@@ -1328,7 +1329,8 @@ class MoE(BaseModel):
         experts_fsdp_size = world_size // self.fsdp_config.ep_size
 
         if self.fsdp_config.hsdp_sharding_size is None:
-            if False and world_size > 16:
+            use_device_mesh = os.getenv("XTUNER_DEVICE_MESH", "0") == "1"
+            if use_device_mesh and world_size > 16:
                 mesh_tensor = torch.Tensor(experts_fsdp_size, self.fsdp_config.ep_size)
                 for i in range(experts_fsdp_size):
                     for j in range(self.fsdp_config.ep_size):

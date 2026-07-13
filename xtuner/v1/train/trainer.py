@@ -21,7 +21,7 @@ from mmengine.dist import get_rank, get_world_size
 from mmengine.runner import set_random_seed
 from pydantic import BaseModel, ConfigDict, field_serializer, field_validator, model_serializer, model_validator
 from torch.distributed import init_process_group
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, LinearLR, SequentialLR
 from typing_extensions import NotRequired, Self, TypedDict
 
@@ -783,12 +783,12 @@ class Trainer:
         """
         train_begin = time.time()
         time_before_get_data = time.time()
-        # if torch.distributed.get_rank()==0:
-        #     import torch_npu
-        #     torch_npu.npu.memory._record_memory_history()
+        
         for data_batch in self._data_iter():
             time_before_train_step = time.time()
-
+            # if torch.distributed.get_rank()==0:
+            #     import torch_npu
+            #     torch_npu.npu.memory._record_memory_history()
             ProberList.set_step(self._cur_step + 1)
             DEVICE_MODULE.reset_peak_memory_stats()
             # if self._cur_step in self._profile_step and torch.distributed.get_rank() % 16 == 0:
@@ -819,8 +819,9 @@ class Trainer:
             time_after_train_step = time.time()
             ProberList.after_step()
 
-            # if torch.distributed.get_rank()==0 and self._cur_step==4:
-            #     torch_npu.npu.memory._dump_snapshot("swap_muon_0-4.pickle")
+            # if torch.distributed.get_rank()==0 and self._cur_step==2:
+            #     import torch_npu
+            #     torch_npu.npu.memory._dump_snapshot("ep1.pickle")
 
             data_time = time_before_train_step - time_before_get_data
             step_time = time_after_train_step - time_before_train_step
@@ -1058,11 +1059,28 @@ class Trainer:
         # TODO: fsdp_config could be None
         device = str(DEVICE) if self._fsdp_config.cpu_offload else "cpu"
 
-        data_mesh = init_device_mesh(
-            device,
-            (dp_size, sp_size, tp_size),
-            mesh_dim_names=("dp", "sp", "tp"),
-        )
+        use_device_mesh = os.getenv("XTUNER_DEVICE_MESH", "0") == "1"
+        if use_device_mesh and self.world_size > 16:
+            mesh_tensor = torch.Tensor(dp_size, sp_size, tp_size)
+            for i in range(dp_size):
+                for j in range(sp_size):
+                    for k in range(tp_size):
+                        mesh_tensor[i, j, k] = (
+                            i % 16 + i // 16 * (16 * sp_size * tp_size) + (j * tp_size + k) * 16
+                        )
+            data_mesh = DeviceMesh(
+                device,
+                mesh_tensor,
+                mesh_dim_names=("dp", "sp", "tp"),
+            )
+        else:
+            data_mesh = init_device_mesh(
+                device,
+                (dp_size, sp_size, tp_size),
+                mesh_dim_names=("dp", "sp", "tp"),
+            )
+        if torch.distributed.get_rank() == 0:
+            print(f"data_mesh: {data_mesh}")
         return data_mesh
 
     def build_engine(

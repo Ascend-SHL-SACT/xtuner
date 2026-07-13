@@ -1218,10 +1218,22 @@ class BaseModel(nn.Module):
                         all_hf_keys = hf_keys
 
                     current_rank = dist.get_rank()
+                    if load_spec.group is not None:
+                        group_rank = dist.get_group_rank(load_spec.group, current_rank)
+                        group_size = load_spec.group.size()
+                        group_ranks: list[int | None] = [None for _ in range(group_size)]
+                        dist.all_gather_object(group_ranks, current_rank, group=load_spec.group)
+                        # Save fused tensors from one complete EP group.  With custom inter-node EP meshes,
+                        # global ranks 0..max_save_rank may no longer belong to the same process group.
+                        if min(cast(list[int], group_ranks)) != 0:
+                            continue
+                    else:
+                        group_rank = current_rank
+                        group_size = dist.get_world_size()
 
                     expected_fused_save_ranks = self._get_ranks_to_save_fused_tensor(len(all_hf_keys))
                     hardcode_fused_save_ranks = list(
-                        range(min((dist.get_world_size(), self.config.hf_save_cfg.max_save_rank)))
+                        range(min((group_size, self.config.hf_save_cfg.max_save_rank)))
                     )
 
                     key_per_rank = len(all_hf_keys) / len(hardcode_fused_save_ranks)
@@ -1232,13 +1244,10 @@ class BaseModel(nn.Module):
                     if not key_per_rank.is_integer():
                         key_per_rank = len(all_hf_keys) / len(expected_fused_save_ranks)
 
-                    start = int(current_rank * key_per_rank)
+                    start = int(group_rank * key_per_rank)
                     end = int(start + key_per_rank)
 
                     _hf_key_list = all_hf_keys[start:end]
-
-                    if not _hf_key_list:
-                        continue
 
                     hf_keys_list.append(_hf_key_list)
 
@@ -1251,7 +1260,12 @@ class BaseModel(nn.Module):
                         dist.all_gather(_gathered_tensor_list, fsdp_unshared_tensor, group=load_spec.group)
                         _gathered_tensor = torch.cat(_gathered_tensor_list, dim=load_spec.dim)
                     else:
+                        if not _hf_key_list:
+                            continue
                         _gathered_tensor = fsdp_unshared_tensor
+                    if not _hf_key_list:
+                        hf_keys_list.pop()
+                        continue
                     hf_tensor_size = _gathered_tensor.shape[load_spec.dim] / len(all_hf_keys)
                     _saved_fused_tensor = torch.index_select(
                         _gathered_tensor,
