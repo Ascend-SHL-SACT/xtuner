@@ -232,6 +232,26 @@ class MoE(BaseModel):
         self._maybe_enable_compile(self.compile_cfg)
 
         self.offload_stream = torch.cuda.Stream()
+        # XTUNER_CHUNK_MOE controls split recomputation (attention + MoE chunks)
+        # for the main decoder layers:
+        #   1 -> split recompute (use_recompute=True). _moe_forward uses
+        #        use_reentrant=True to tolerate EP dispatch non-determinism.
+        #   0 -> fall back to whole-layer checkpoint_wrapper(REENTRANT).
+        # Default is 0 (whole-layer reentrant checkpoint, original behaviour).
+        self.chunk_moe = int(os.getenv("XTUNER_CHUNK_MOE", "0")) == 1
+        # XTUNER_MOE_CHUNK_SIZE controls how many chunks the MoE part is split
+        # into along the sequence dimension inside _moe_forward. 1 = no split.
+        # Default 2.
+        self.moe_chunk_size = int(os.getenv("XTUNER_MOE_CHUNK_SIZE", "2"))
+        if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1 and self.chunk_moe:
+            for layer in self.layers.values():
+                if hasattr(layer, "offload_stream"):
+                    layer.offload_stream = self.offload_stream
+            if self.mtp_block is not None:
+                for mtp_layer in self.mtp_block.layers:
+                    inner = getattr(mtp_layer, "decoder_layer", mtp_layer)
+                    if hasattr(inner, "offload_stream"):
+                        inner.offload_stream = self.offload_stream
         self.aux_loss: AuxLossContext = self.config.aux_loss_cfg.build(
             n_routed_experts=self.config.n_routed_experts,
             num_experts_per_tok=self.config.num_experts_per_tok,
@@ -1102,7 +1122,16 @@ class MoE(BaseModel):
                 layer_idx=layer_idx,
                 mtp_idx=None,
             ):
-                layer = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.REENTRANT)
+                if isinstance(layer, MoEDecoderLayer) and self.chunk_moe:
+                    # Split recomputation into two independent units (attention and
+                    # MoE expert computation) via functional checkpointing inside
+                    # ``MoEDecoderLayer._forward``. The whole layer is NOT wrapped
+                    # with ``checkpoint_wrapper`` so the two units recompute
+                    # separately; FSDP still shards the raw layer below.
+                    layer.moe_chunk_size = self.moe_chunk_size
+                    layer.use_recompute = True
+                else:
+                    layer = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.REENTRANT)
 
             self.layers[str(layer_idx)] = layer
             if layer_idx >= len(self.layers) - 1 and self.mtp_block is None:
@@ -1132,7 +1161,10 @@ class MoE(BaseModel):
             list(self.layers.values())[1:],
         ):
             if os.environ.get("SHARD_512", "false").lower() == "true":
-                layer_cur._checkpoint_wrapped_module.experts.set_modules_to_forward_prefetch([layer_next, layer_next.experts])  # type: ignore
+                # MoE layers with split recompute are not wrapped in a
+                # CheckpointWrapper, so unwrap only when present.
+                layer_cur_inner = getattr(layer_cur, "_checkpoint_wrapped_module", layer_cur)
+                layer_cur_inner.experts.set_modules_to_forward_prefetch([layer_next, layer_next.experts])  # type: ignore
                 layer_next.set_modules_to_backward_prefetch([layer_cur, layer_cur.experts])  # type: ignore
             else:
                 layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
@@ -1165,9 +1197,17 @@ class MoE(BaseModel):
         # Shard MTP block if it exists
         if self.mtp_block is not None:
             for mtp_idx, mtp_layer in enumerate(self.mtp_block.layers):
-                if self._should_recompute(None, mtp_idx=mtp_idx) or (
-                    self.config.mtp_config is not None and self.config.mtp_config.share_weights
-                ) or True:  # share mtp head must recompute
+                # MTP split recomputation is gated by XTUNER_CHUNK_MOE. When disabled the
+                # whole MTPLayer is wrapped with reentrant checkpoint, matching
+                # the original behaviour.
+                inner = getattr(mtp_layer, "decoder_layer", mtp_layer)
+                if (
+                    isinstance(inner, MoEDecoderLayer)
+                    and self.chunk_moe
+                ):
+                    inner.moe_chunk_size = self.moe_chunk_size
+                    inner.use_recompute = True
+                else:
                     mtp_layer = checkpoint_wrapper(mtp_layer, checkpoint_impl=CheckpointImpl.REENTRANT)
                 self.mtp_block.layers[mtp_idx] = mtp_layer
 

@@ -1,9 +1,11 @@
-from functools import partial
-from typing import Literal, Protocol, TypeAlias, cast
+import contextlib
 import os
+from functools import partial
+from typing import Literal, Protocol, TypeAlias, cast, Dict
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 from pydantic import BaseModel, ConfigDict
 from torch.autograd.function import Function
 from torch.distributed.device_mesh import DeviceMesh
@@ -38,6 +40,7 @@ from xtuner.v1.module.grouped_linear.moe_group_linear import build_grouped_linea
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_act_fn
 from xtuner.v1.utils import ForwardState
+from xtuner.v1.utils.activation_offload import async_save_on_cpu
 
 from ..linear import build_linear
 
@@ -195,6 +198,76 @@ class MoEBlock(nn.Module):
         return res
 
 
+class MoEAttention:
+    """Attention computation of the MoE decoder layer.
+
+    Encapsulates the self-attention + post-attention layernorm forward so it
+    can be recomputed independently from the MoE expert computation (e.g.
+    wrapped with ``torch.utils.checkpoint``). The attention submodules
+    (``self_attn`` / ``input_layernorm`` / ``post_attention_layernorm``) are
+    owned and registered by the parent :class:`MoEDecoderLayer` to keep
+    parameter names -- and therefore HF weight loading -- unchanged; this
+    class only holds references to them.
+    """
+
+    def __init__(
+        self,
+        self_attn: MultiHeadAttention | MultiLatentAttention | GatedDeltaNet,
+        input_layernorm: RMSNorm,
+        post_attention_layernorm: RMSNorm,
+    ):
+        self.self_attn = self_attn
+        self.input_layernorm = input_layernorm
+        self.post_attention_layernorm = post_attention_layernorm
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        seq_ctx: SequenceContext,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        state: ForwardState,
+        past_key_values: list[list[torch.Tensor]] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # NOTE: In order to allow `torch.compile` to compile the ops before and after attention as much as possible,
+        # attention and post-layernorm are implemented in one function.
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        if state == ForwardState.TRAINING:
+            attn_outputs: AttnOutputs = self.self_attn(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                seq_ctx=seq_ctx,
+            )
+            hidden_states = attn_outputs["projected_output"]
+        elif state == ForwardState.PREFILLING:
+            assert past_key_values is not None, "past_key_values should be provided in pre-filling state"
+            hidden_states = self.self_attn.prefilling(  # type: ignore
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                seq_ctx=seq_ctx,
+                past_key_values=past_key_values,
+            )
+        elif state == ForwardState.DECODING:
+            assert past_key_values is not None, "past_key_values should be provided in decoding state"
+            hidden_states = self.self_attn.decoding(  # type: ignore
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                seq_ctx=seq_ctx,
+                past_key_values=past_key_values,
+            )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected (post-attention layernorm)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        return residual, hidden_states
+
+    def __call__(self, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward(*args, **kwargs)
+
+
 class MoEDecoderLayer(nn.Module):
     """MoE decoder layer."""
 
@@ -244,7 +317,16 @@ class MoEDecoderLayer(nn.Module):
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
         self.layer_idx = layer_idx
-
+        # When True, attention and MoE expert computation are each wrapped with
+        # ``torch.utils.checkpoint`` inside ``_forward`` so they are recomputed
+        # independently during backward (two separate recompute units) instead of
+        # wrapping the whole layer with ``checkpoint_wrapper``. Set by the model
+        # (``fully_shard``) for layers that should use gradient checkpointing.
+        self.use_recompute: bool = False
+        # Number of chunks to split the MoE part along the sequence dimension
+        # (1 = no split). Configurable via XTUNER_MOE_CHUNK_SIZE on the model.
+        self.moe_chunk_size: int = 1
+        self.offload_stream: torch.cuda.Stream | None = None
         self.with_shared_expert_gate = with_shared_expert_gate
         self.shared_expert_gate: nn.Module | None
         self.shared_experts: MoEMLP | None
@@ -265,6 +347,15 @@ class MoEDecoderLayer(nn.Module):
             self.shared_expert_gate = None
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
+
+        # Attention computation is factored out into ``MoEAttention`` so that it
+        # can be recomputed independently from the MoE expert computation. The
+        # submodules remain registered on this layer (see MoEAttention docstring).
+        self.attention = MoEAttention(
+            self_attn=self.self_attn,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+        )
 
         self.gate = MoEGate(
             hidden_size=hidden_size,
@@ -485,6 +576,96 @@ class MoEDecoderLayer(nn.Module):
         combined_hidden_states = combined_hidden_states.view(*origin_shape)
         return combined_hidden_states
 
+    def _moe_forward(
+        self,
+        chunk_hidden: torch.Tensor,
+        chunk_residual: torch.Tensor,
+        seq_ctx: SequenceContext,
+        chunk_start: int,
+        chunk_end: int,
+        router_results: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """MoE expert computation unit for a single chunk of attention output.
+
+        Runs (optional) skip-pad -> moe_op -> shared experts -> post-moe
+        layernorm on ``chunk_hidden`` (a contiguous slice of the attention
+        output along the sequence dimension). This is the unit that is wrapped
+        with ``torch.utils.checkpoint`` for independent recomputation from the
+        attention unit. ``chunk_start`` / ``chunk_end`` are used to align the
+        skip-pad mask to the chunk's token range.
+
+        ``router_results`` must be provided; the gate is computed
+        on the full sequence inside ``_attention_with_gate`` to avoid GPU kernel
+        divergence from different input shapes.
+        """
+        skip_pad_tokens = (os.environ.get("SKIP_PAD_TOKENS", "False") == "True")
+        if skip_pad_tokens:
+            chunk_mask = seq_ctx.mask[:, chunk_start:chunk_end]
+            nonpad_indices = torch.nonzero(chunk_mask, as_tuple=True)[1]
+            pad_indices = torch.nonzero(~chunk_mask, as_tuple=True)[1]
+            origin_hidden_states = chunk_hidden
+            chunk_hidden = origin_hidden_states[:, nonpad_indices, :]
+            chunk_residual = chunk_residual[:, nonpad_indices, :]
+            pad_hidden_states = origin_hidden_states[:, pad_indices, :]
+            aligned_topk_ids = router_results["topk_ids"][nonpad_indices, :]
+            aligned_topk_weights = router_results["topk_weights"][nonpad_indices, :]
+        else:
+            aligned_topk_ids = router_results["topk_ids"]
+            aligned_topk_weights = router_results["topk_weights"]
+        origin_shape = chunk_hidden.shape
+
+        chunk_router_results = {
+            "topk_ids": aligned_topk_ids,
+            "topk_weights": aligned_topk_weights,
+        }
+        combined_hidden_states = self.moe_op(
+            hidden_states=chunk_hidden,
+            router_results=chunk_router_results,
+            origin_shape=origin_shape,
+        )
+
+        if self.n_shared_experts > 0:
+            shared_experts_out = self._shared_experts_forward(hidden_states=chunk_hidden)
+        else:
+            shared_experts_out = None
+
+        chunk_hidden = self._post_moe_forward(
+            combined_hidden_states=combined_hidden_states,
+            residual=chunk_residual,
+            shared_experts_out=shared_experts_out,
+        )
+        if skip_pad_tokens:
+            result = torch.zeros_like(origin_hidden_states)
+            result[:, nonpad_indices, :] = chunk_hidden
+            result[:, pad_indices, :] = pad_hidden_states
+            chunk_hidden = result
+        return chunk_hidden
+
+    def _attention_with_gate(
+        self,
+        hidden_states: torch.Tensor,
+        seq_ctx: SequenceContext,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        state: ForwardState,
+    ) -> tuple[HiddenStates, HiddenStates, RouterResults]:
+        """Attention + gate computed as a single unit for checkpoint compatibility.
+
+        The gate is computed on the full attention output so that the router
+        sees the same input shape regardless of ``moe_chunk_size``, avoiding
+        GPU kernel divergence in the linear layer.
+        """
+        residual, hidden_states = self.attention(
+            hidden_states=hidden_states,
+            seq_ctx=seq_ctx,
+            position_embeddings=position_embeddings,
+            state=state,
+        )
+        rollout_routed_experts = None
+        if seq_ctx.rollout_routed_experts is not None and self.layer_idx < seq_ctx.rollout_routed_experts.shape[1]:
+            rollout_routed_experts = seq_ctx.rollout_routed_experts[:, self.layer_idx, :]
+        router_results: RouterResults = self.gate(hidden_states, rollout_routed_experts)
+        return residual, hidden_states, router_results
+
     def _forward(
         self,
         hidden_states: torch.Tensor,
@@ -492,80 +673,100 @@ class MoEDecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         layer_idx: int,
     ) -> tuple[HiddenStates, RouterLogits, RouterWeights]:
-        residual, hidden_states, router_results = self._pre_moe_forward(
-            hidden_states=hidden_states,
-            seq_ctx=seq_ctx,
-            position_embeddings=position_embeddings,
-            state=ForwardState.TRAINING,
-        )
-        skip_pad_tokens = (os.environ.get("SKIP_PAD_TOKENS", "False") == "True")
-        if skip_pad_tokens:
-            nonpad_indices = torch.nonzero(seq_ctx.mask, as_tuple=True)[1]
-            pad_indices = torch.nonzero(~seq_ctx.mask, as_tuple=True)[1]
-            origin_hidden_states = hidden_states
-            hidden_states = origin_hidden_states[:,nonpad_indices,:]
-            pad_hidden_states = origin_hidden_states[:, pad_indices,:]
-        origin_shape = hidden_states.shape
-
-        # 将 hidden_states 沿 token 维拆分成 moe_chunk_size 个 chunk，分多次执行 moe_op 以降低单次显存峰值
-        moe_chunk_size = getattr(self, 'moe_chunk_size', 1)  # 默认分成 2 个 chunk
-        flat_hidden = hidden_states.view(-1, hidden_states.shape[-1])
-        num_tokens = flat_hidden.shape[0]
-        chunk_size = num_tokens // moe_chunk_size
-
-        # 对齐 router_results 的 topk_ids/topk_weights 到当前 hidden_states 的 token 集合
-        if skip_pad_tokens:
-            aligned_topk_ids = router_results["topk_ids"][nonpad_indices, :]
-            aligned_topk_weights = router_results["topk_weights"][nonpad_indices, :]
-        else:
-            aligned_topk_ids = router_results["topk_ids"]
-            aligned_topk_weights = router_results["topk_weights"]
-
-        def _run_moe_op(chunk_hidden: torch.Tensor, chunk_topk_ids: torch.Tensor, chunk_topk_weights: torch.Tensor) -> torch.Tensor:
-            chunk_router_results: RouterResults = {
-                **router_results,
-                "topk_ids": chunk_topk_ids,
-                "topk_weights": chunk_topk_weights,
-            }
-            return self.moe_op(
-                hidden_states=chunk_hidden,
-                router_results=chunk_router_results,
-                origin_shape=chunk_hidden.shape,
+        # Attention unit (recomputed independently when use_recompute is set).
+        # The gate is computed inside the same checkpoint as attention so that
+        # the router sees the full attention output regardless of moe_chunk_size.
+        if self.use_recompute:
+            residual, hidden_states, router_results = torch.utils.checkpoint.checkpoint(
+                self._attention_with_gate,
+                hidden_states,
+                seq_ctx,
+                position_embeddings,
+                ForwardState.TRAINING,
+                use_reentrant=False,
             )
+        else:
+            residual, hidden_states, router_results = self._attention_with_gate(
+                hidden_states=hidden_states,
+                seq_ctx=seq_ctx,
+                position_embeddings=position_embeddings,
+                state=ForwardState.TRAINING,
+            )
+        # MoE unit: the attention output is split into ``moe_chunk_size`` chunks
+        # along the sequence dimension and each chunk is fed to
+        # ``_moe_forward`` (which runs skip-pad -> moe_op -> shared -> post-moe).
+        # The gate is computed on the full sequence inside
+        # ``_attention_with_gate``, and the router results are sliced and passed
+        # to each chunk to avoid GPU kernel divergence.
+        #
+        # When ``offload_stream`` is set (XTUNER_ACTIVATION_OFFLOAD=1), the
+        # entire chunk loop is wrapped with ``async_save_on_cpu`` (group="moe")
+        # so that the checkpoint-saved inputs to ``_moe_forward`` -- i.e. the
+        # attention output slices -- are offloaded to CPU during forward and
+        # fetched back during backward. This complements the decoder-layer-level
+        # offload (group="text") driven from ``moe.py`` which offloads the
+        # decoder layer's input activation.
+        seq_len = hidden_states.shape[1]
+        moe_chunk_size = self.moe_chunk_size
+        chunk_size = seq_len // moe_chunk_size if moe_chunk_size > 1 else seq_len
 
-        # 动态分块执行 moe_op
-        chunk_outputs = []
+        outputs: list[torch.Tensor] = []
+        # print(f"{torch.distributed.get_rank()==0}:moe_chunk_size={moe_chunk_size},hidden_states.shape={hidden_states.shape}")
         for i in range(moe_chunk_size):
             start = i * chunk_size
-            end = (i + 1) * chunk_size if i < moe_chunk_size - 1 else num_tokens  # 最后一个 chunk 包含剩余 tokens
-            chunk_hidden = flat_hidden[start:end]
-            chunk_topk_ids = aligned_topk_ids[start:end, :]
-            chunk_topk_weights = aligned_topk_weights[start:end, :]
-            chunk_out = _run_moe_op(chunk_hidden, chunk_topk_ids, chunk_topk_weights)
-            chunk_outputs.append(chunk_out)
-
-        combined_hidden_states = torch.cat(chunk_outputs, dim=0).view(*origin_shape)
-
-        # debug for aligning with hf implementation.
-        # combined_hidden_states = self._hf_expert_forward_for_debug(hidden_states, router_results, origin_shape)
-
-        # ProberList.after_combine(self.layer_idx, combined_hidden_states)
-
-        if self.n_shared_experts > 0:
-            shared_experts_out = self._shared_experts_forward(hidden_states=hidden_states)
-        else:
-            shared_experts_out = None
-
-        hidden_states = self._post_moe_forward(
-            combined_hidden_states=combined_hidden_states,
-            residual=residual if not skip_pad_tokens else residual[:,nonpad_indices,:],
-            shared_experts_out=shared_experts_out,
-        )
-        if skip_pad_tokens:
-            result = torch.zeros_like(origin_hidden_states)
-            result[:, nonpad_indices, :] = hidden_states
-            result[:, pad_indices, :] = pad_hidden_states
-            hidden_states = result
+            end = (i + 1) * chunk_size if i < moe_chunk_size - 1 else seq_len
+            chunk_hidden = hidden_states[:, start:end, :].clone()
+            chunk_residual = residual[:, start:end, :].clone()
+            # Slice the pre-computed full-sequence router results to this chunk.
+            chunk_router_results = {
+                "topk_ids": router_results["topk_ids"][start:end, :].clone(),
+                "topk_weights": router_results["topk_weights"][start:end, :].clone(),
+            }
+            # Only offload the _moe_forward *inputs* (chunk_hidden / chunk_residual /
+            # chunk_router_results tensors) to CPU; skip all intermediate activations
+            # produced inside _moe_forward (e.g. npu_moe_token_permute outputs whose
+            # storage layout is incompatible with the naive storage copy). Matched by
+            # data_ptr, mirroring the decoder-layer-level offload in moe.py.
+            if self.offload_stream is not None:
+                router_ptrs = [chunk_router_results["topk_ids"].data_ptr(), chunk_router_results["topk_weights"].data_ptr()]
+                offload_ctx = async_save_on_cpu(
+                    h2d_stream=self.offload_stream,
+                    d2h_stream=self.offload_stream,
+                    block_idx=self.layer_idx,
+                    group=f"moe_chunk_{i}",
+                    custom_check_fn=lambda x, ch=chunk_hidden, cr=chunk_residual, rp=router_ptrs: (
+                        x.data_ptr() == ch.data_ptr()
+                        or x.data_ptr() == cr.data_ptr()
+                        or x.data_ptr() in rp
+                    ),
+                )
+            else:
+                offload_ctx = contextlib.nullcontext()
+            with offload_ctx:
+                if self.use_recompute:
+                    out_h = torch.utils.checkpoint.checkpoint(
+                        self._moe_forward,
+                        chunk_hidden,
+                        chunk_residual,
+                        seq_ctx,
+                        start,
+                        end,
+                        chunk_router_results,
+                        use_reentrant=False,
+                    )
+                else:
+                    out_h = self._moe_forward(
+                        chunk_hidden=chunk_hidden,
+                        chunk_residual=chunk_residual,
+                        seq_ctx=seq_ctx,
+                        chunk_start=start,
+                        chunk_end=end,
+                        router_results=chunk_router_results,
+                    )
+            outputs.append(out_h)
+        # if self.offload_stream is not None:
+        #     torch.cuda.current_stream().wait_stream(self.offload_stream)
+        hidden_states = torch.cat(outputs, dim=1)
         return hidden_states, router_results["logits"], router_results["router_weights"]
 
     def _micro_batch_forward(
@@ -711,40 +912,17 @@ class MoEDecoderLayer(nn.Module):
         state: ForwardState,
         past_key_values: list[list[torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RouterResults]:
-        # NOTE: In order to allow `torch.compile` to compile the ops before and after attention as much as possible,
-        # attention, post-layernorm and gate are implemented in one function
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        if state == ForwardState.TRAINING:
-            attn_outputs: AttnOutputs = self.self_attn(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                seq_ctx=seq_ctx,
-            )
-            hidden_states = attn_outputs["projected_output"]
-        elif state == ForwardState.PREFILLING:
-            assert past_key_values is not None, "past_key_values should be provided in pre-filling state"
-            hidden_states = self.self_attn.prefilling(  # type: ignore
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                seq_ctx=seq_ctx,
-                past_key_values=past_key_values,
-            )
-        elif state == ForwardState.DECODING:
-            assert past_key_values is not None, "past_key_values should be provided in decoding state"
-            hidden_states = self.self_attn.decoding(  # type: ignore
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                seq_ctx=seq_ctx,
-                past_key_values=past_key_values,
-            )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # NOTE: The attention + post-attention-layernorm computation is factored
+        # out into ``self.attention`` (MoEAttention) so that it can be recomputed
+        # independently from the MoE expert computation. The router gate stays
+        # here since it is part of the MoE routing.
+        residual, hidden_states = self.attention(
+            hidden_states=hidden_states,
+            seq_ctx=seq_ctx,
+            position_embeddings=position_embeddings,
+            state=state,
+            past_key_values=past_key_values,
+        )
 
         if seq_ctx.rollout_routed_experts is not None and self.layer_idx < seq_ctx.rollout_routed_experts.shape[1]:
             rollout_routed_experts = seq_ctx.rollout_routed_experts[:, self.layer_idx, :]  # seq_l, expert
