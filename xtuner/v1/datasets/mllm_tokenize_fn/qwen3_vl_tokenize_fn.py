@@ -922,7 +922,10 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
                 )
                 timestamps_list[i] = timestamps  # 记得要重新更新
 
-            video_data = torch.stack(image_list)  # num_patch,3,h,w
+            if int(os.getenv("XTUNER_VIDEO_DECODE_CHUNK", "0")) > 0:
+                video_data = image_list  # read_frames_decord already returns a stacked (T,3,H,W) tensor
+            else:
+                video_data = torch.stack(image_list)  # num_patch,3,h,w
             num_frames = len(image_list)
 
             # 前面保证了一定可以被 merge_size 整除，因此内部一定不会额外 padding
