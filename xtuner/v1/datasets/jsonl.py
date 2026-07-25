@@ -258,6 +258,8 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
     # TODO: Using shared memory should be optional since the size of `/dev/shm` could be not enough for some devices
     _shared_memory: SharedMemory | None = None
     _meta: dict[str, np.ndarray]
+    # Cache the parsed dict per meta_path at class level: each rank reads it at most once.
+    _cache_meta: dict[str, dict] = {}
 
     def __init__(
         self,
@@ -806,24 +808,27 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         if self.meta_path is None or not os.path.exists(self.meta_path):
             return None
 
-        # TODO: (yehaochen) This is very suck. I do not know why sometimes the meta file could be
-        # a broken json. The barrier has been put at the right place, but it still happens.
-        # I believe this is cause by the bug of filesystem (maybe), hope someone could help to fix it.
-        for _ in range(10):
-            try:
-                with open(self.meta_path) as f:
-                    content = f.read()
-                    meta = json.loads(content)
-            except json.JSONDecodeError:
-                time.sleep(0.01)
-                continue
+        meta = JsonlDataset._cache_meta.get(self.meta_path)
+        if meta is None:
+            # TODO: (yehaochen) This is very suck. I do not know why sometimes the meta file could be
+            # a broken json. The barrier has been put at the right place, but it still happens.
+            # I believe this is cause by the bug of filesystem (maybe), hope someone could help to fix it.
+            for _ in range(10):
+                try:
+                    with open(self.meta_path) as f:
+                        content = f.read()
+                        meta = json.loads(content)
+                except json.JSONDecodeError:
+                    time.sleep(0.01)
+                    continue
+                else:
+                    break
             else:
-                break
-        else:
-            raise json.JSONDecodeError("Failed to decode JSON file after 10 attempts.", doc=content, pos=0)
+                raise json.JSONDecodeError("Failed to decode JSON file after 10 attempts.", doc=content, pos=0)
+            JsonlDataset._cache_meta[self.meta_path] = meta
 
-        if dist.is_initialized():
-            dist.barrier()
+            if dist.is_initialized():
+                dist.barrier()
 
         tok_hash = tokenizer_fn.hash()
 
