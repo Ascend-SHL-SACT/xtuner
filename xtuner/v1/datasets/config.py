@@ -538,6 +538,7 @@ class DataloaderConfig(BaseDataloaderConfig):
             dataset,
             batch_size=micro_batch_size,
             num_workers=self.num_workers,
+            prefetch_factor=int(os.environ.get("XTUNER_PREFETCH_FACTOR", "1")) if self.num_workers > 0 else None,
             # Ensure to round up or drop last based on the `global_batch_size`,
             # if you want to replace a custom sampler.
             sampler=sampler,
