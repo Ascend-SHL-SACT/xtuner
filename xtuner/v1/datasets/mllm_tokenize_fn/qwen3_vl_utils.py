@@ -49,6 +49,33 @@ def numpy_to_tensor(frames):
     return result
 
 
+def _decode_to_stacked_tensor(video_reader, frames_indices, chunk_size):
+    """Decode sampled frames in chunks directly into one stacked (T,3,H,W)
+    tensor.
+
+    Bounds peak host RAM: the full (T,H,W,C) numpy buffer and the
+    per-frame tensor list are never materialized at once. For vlen=768 @
+    1080x1920 this drops the decode peak from ~2x4.78GB to ~4.78GB + 1 chunk.
+    Pure helper; the on/off switch lives in read_frames_decord.
+    """
+    n = len(frames_indices)
+    chunk_size = max(1, min(chunk_size, n))
+    out = None
+    for s in range(0, n, chunk_size):
+        idx = frames_indices[s : s + chunk_size]
+        raw = video_reader.get_batch(idx).asnumpy()  # (c, H, W, C) uint8, small
+        for j in range(raw.shape[0]):
+            chw = to_channel_dimension_format(raw[j], ChannelDimension.FIRST)
+            if out is None:
+                out = torch.empty(
+                    (n, chw.shape[0], chw.shape[1], chw.shape[2]),
+                    dtype=torch.from_numpy(chw).dtype,
+                )
+            out[s + j].copy_(torch.from_numpy(chw))  # copy_ handles non-contiguous src
+        del raw
+    return out
+
+
 def calc_frame_index_for_folder(image_list, frames_indices, timestamps, video_path):
     if isinstance(frames_indices, list):
         assert timestamps is not None, "timestamps should be provided when frames_indices is a list"
@@ -104,21 +131,30 @@ def read_frames_folder(
             image_list = sort_frames(list(os.listdir(video_path)))
 
     frames_indices = calc_frame_index_for_folder(image_list, frames_indices, timestamps, video_path)
+    _chunk = int(os.getenv("XTUNER_VIDEO_DECODE_CHUNK", "0"))
+    _out = None
     frame_list = []
-    for frame_index in frames_indices:
+    for i, frame_index in enumerate(frames_indices):
         if "s3://" in video_path:
             start_time = time.time()
             image_byte = client.get(image_list[frame_index])
             oss_read_time += time.time() - start_time
             with io.BytesIO(image_byte) as buff:
                 with Image.open(buff) as frame:
-                    frame_list.append(np.array(frame))
+                    arr = np.array(frame)
         else:
             fp = os.path.join(video_path, image_list[frame_index])
             with Image.open(fp) as frame:
-                frame_list.append(np.array(frame.convert("RGB")))
+                arr = np.array(frame.convert("RGB"))
+        if _chunk > 0:
+            chw = to_channel_dimension_format(arr, ChannelDimension.FIRST)
+            if _out is None:
+                _out = torch.empty((len(frames_indices), *chw.shape), dtype=torch.from_numpy(chw).dtype)
+            _out[i].copy_(torch.from_numpy(chw))
+        else:
+            frame_list.append(arr)
 
-    frames = numpy_to_tensor(frame_list)
+    frames = _out if _chunk > 0 else numpy_to_tensor(frame_list)
     return frames, oss_read_time, len(frames), frames_indices, timestamps
 
 
@@ -142,12 +178,21 @@ def read_frames_decord(
         start_time = time.time()
     vlen = len(video_reader)
 
+    # env switch at each decode point below: 0/unset = original path;
+    # >0 = chunked _decode_to_stacked_tensor (1 -> chunk 32, N>1 -> chunk N).
+    _chunk = int(os.getenv("XTUNER_VIDEO_DECODE_CHUNK", "0"))
+
     if isinstance(frames_indices, list):
         assert timestamps is not None, "timestamps should be provided when frames_indices is a list"
         assert len(frames_indices) == len(timestamps) * 2, "frames_indices and timestamps should have the same length"
         # 如果外面提供了，则用 index 进行采样，但是如果采样错误，则改为随机均匀采样。这种情况要注意，实际上是不合理的，说明数据存储有问题
         try:
-            frames = video_reader.get_batch(frames_indices).asnumpy()  # (T, H, W, C), np.uint8
+            if _chunk > 0:
+                frames = _decode_to_stacked_tensor(
+                    video_reader, frames_indices, chunk_size=32 if _chunk == 1 else _chunk
+                )
+            else:
+                frames = video_reader.get_batch(frames_indices).asnumpy()  # (T, H, W, C), np.uint8
         except KeyboardInterrupt as e:
             raise e
         except Exception as e:
@@ -156,14 +201,23 @@ def read_frames_decord(
             )
             timestamps = None  # 防止错误，强制清空
             frames_indices = np.linspace(0, vlen - 1, len(frames_indices)).round().astype(int)
-            frames = video_reader.get_batch(frames_indices).asnumpy()  # (T, H, W, C), np.uint8
+            if _chunk > 0:
+                frames = _decode_to_stacked_tensor(
+                    video_reader, frames_indices, chunk_size=32 if _chunk == 1 else _chunk
+                )
+            else:
+                frames = video_reader.get_batch(frames_indices).asnumpy()  # (T, H, W, C), np.uint8
     else:
         # 如果外面没有提供 frame index，则随机均匀采样，并且时间戳清空
         assert timestamps is None, "timestamps should be None when frames_indices is an int"
         frames_indices = np.linspace(0, vlen - 1, frames_indices).round().astype(int)
-        frames = video_reader.get_batch(frames_indices).asnumpy()  # (T, H, W, C), np.uint8
+        if _chunk > 0:
+            frames = _decode_to_stacked_tensor(video_reader, frames_indices, chunk_size=32 if _chunk == 1 else _chunk)
+        else:
+            frames = video_reader.get_batch(frames_indices).asnumpy()  # (T, H, W, C), np.uint8
     video_get_batch_time = time.time() - start_time
-    frames = numpy_to_tensor(frames)
+    if _chunk == 0:
+        frames = numpy_to_tensor(frames)
     return frames, oss_read_time, video_get_batch_time, vlen, frames_indices, timestamps
 
 
