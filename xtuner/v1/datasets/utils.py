@@ -47,6 +47,17 @@ atexit.register(_cleanup_mmap_files)
 def _get_mmap_dir() -> Path:
     global _MMAP_DIR
     if _MMAP_DIR is None:
+        # If a persistent cache dir is requested, use it instead of /dev/shm.
+        # /dev/shm is tmpfs (RAM-backed, per-node, EPHEMERAL): wiped on pod
+        # restart, so the content-addressed pack_infos cache never survives to
+        # the next run and packing recomputes every time.  Pointing this at a
+        # shared filesystem (NFS/similar) lets the cache HIT across runs,
+        # skipping the packing compute on run 2+.  Must be visible from all ranks.
+        cache_dir = os.environ.get("XTUNER_PACK_CACHE_DIR")
+        if cache_dir:
+            _MMAP_DIR = Path(cache_dir) / f"xtuner_mmap_{os.getuid()}"
+            _MMAP_DIR.mkdir(parents=True, exist_ok=True)
+            return _MMAP_DIR
         # Prefer /dev/shm (tmpfs, RAM-backed) for lowest-latency mmap;
         # fall back to the system tmp dir.
         for candidate in ("/dev/shm",):
