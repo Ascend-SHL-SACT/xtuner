@@ -174,7 +174,6 @@ class MTPBlock(nn.Module):
         mtp_outputs: list[MTPDepthOutput] = []
         current_hidden_states = hidden_states.detach() if self.mtp_config.detach_mtp_inputs else hidden_states
         current_seq_ctx = seq_ctx
-        shared_layer = self.layers[0] if self.mtp_config.share_weights else None
 
         num_steps = self.mtp_config.num_layers
         for step in range(num_steps):
@@ -194,12 +193,6 @@ class MTPBlock(nn.Module):
                 seq_ctx=current_seq_ctx,
             )
             mtp_outputs.append((current_hidden_states, router_logits, router_weights, router_topk_ids))
-
-
-        # Shared MTP reuses one physical FSDP layer across multiple steps.
-        # Keep it unsharded during inner steps, then reshard once at block end.
-        if shared_layer is not None:
-            shared_layer.reshard()
 
         return mtp_outputs
 

@@ -468,6 +468,11 @@ class MoEDecoderLayer(nn.Module):
             residual=residual if not skip_pad_tokens else residual[:,nonpad_indices,:],
             shared_experts_out=shared_experts_out,
         )
+        if skip_pad_tokens:
+            result = torch.zeros_like(origin_hidden_states)
+            result[:, nonpad_indices, :] = hidden_states
+            result[:, pad_indices, :] = pad_hidden_states
+            hidden_states = result
         return (
             hidden_states,
             router_results["logits"],

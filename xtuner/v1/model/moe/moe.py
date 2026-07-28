@@ -1218,7 +1218,7 @@ class MoE(BaseModel):
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
             module=self.lm_head,
         )
-        layer_next.set_modules_to_forward_prefetch([self.lm_head])
+
         # Shard MTP block if it exists
         if self.mtp_block is not None:
             for mtp_idx, mtp_layer in enumerate(self.mtp_block.layers):
@@ -1264,12 +1264,12 @@ class MoE(BaseModel):
                 self._fully_shard(
                     mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
                     mp_policy=mp_policy,
-                    reshard_after_forward=True,
+                    reshard_after_forward=reshard_after_forward,
                     offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
                     module=mtp_layer,
                 )
                 if mtp_idx == 0:
-                    self.lm_head.set_modules_to_forward_prefetch([mtp_layer])  # type: ignore
+                    layer_next.set_modules_to_forward_prefetch([mtp_layer])  # type: ignore
 
             if self.config.mtp_config is not None and self.config.mtp_config.num_layers > 0:
                 for prev_mtp_layer, next_mtp_layer in zip(
