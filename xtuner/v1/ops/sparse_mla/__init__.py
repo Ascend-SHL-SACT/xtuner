@@ -14,6 +14,10 @@ def get_sparse_mla(backend: SparseMLABackend) -> SparseMLAProtocol:
         from .tilelang import tilelang_sparse_mla
 
         return tilelang_sparse_mla
+    if backend == "torch_npu":
+        from .npu_sparse_mla import npu_sparse_mla
+
+        return npu_sparse_mla
     if backend == "cudnn_dsa":
         from .cudnn_dsa import cudnn_dsa_sparse_mla
 
@@ -39,6 +43,10 @@ def get_dsa_topk_indices(backend: SparseMLABackend) -> DSATopKIndicesProtocol:
         from .tilelang import tilelang_dsa_topk_indices
 
         return tilelang_dsa_topk_indices
+    if backend == "torch_npu":
+        from .npu_lightning_indexer import npu_lightning_dsa_topk_indices
+
+        return npu_lightning_dsa_topk_indices
     raise ValueError(f"Unsupported DSA indexer backend: {backend}")
 
 
