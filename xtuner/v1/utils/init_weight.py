@@ -3,7 +3,7 @@ from typing import Callable, cast
 
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor
 
 from .device import get_device
 from .misc import clean_param_name
@@ -21,12 +21,13 @@ def init_params(param: torch.Tensor, init_fn: Callable[[torch.Tensor], torch.Ten
         init_fn (Callable[[torch.Tensor], torch.Tensor | None]): **in-place** initialization function to be applied.
     """
     assert not param.is_meta, "Internal Error. Found meta tensor during initialize model weight"
-    device = param.device
 
     if isinstance(param, DTensor):
-        full_param = torch.empty_like(param.full_tensor(), device=device)
-        init_fn(full_param)
-        param.copy_(distribute_tensor(full_param, param.device_mesh, param.placements))
+        # Init the local shard in-place. init_fn is element-wise (normal_/zeros_/
+        # ones_), so per-rank shard init is valid without the full-tensor
+        # all-gather. to_local() shares storage with the shard, so in-place
+        # init persists.
+        init_fn(param.to_local())
     else:
         init_fn(param)
 
