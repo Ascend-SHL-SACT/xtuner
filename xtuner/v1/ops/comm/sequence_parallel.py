@@ -8,6 +8,11 @@ def gather_for_sequence_parallel(input: torch.Tensor, dim: int, sp_mesh: DeviceM
     """Gather sequence shards while reducing gradients back to their owners."""
     if sp_mesh is None or sp_mesh.size() == 1:
         return input
+    # selective-ckpt: record this SP group so the NO_REENTRANT recompute policy can
+    # MUST_SAVE it (skip re-issuing the collective). No-op unless gated on.
+    from xtuner.v1.ops.comm.selective_ckpt_sp import record_sp_group
+
+    record_sp_group(sp_mesh)
     return all_gather_tensor_autograd(input, gather_dim=dim, group=sp_mesh)
 
 
