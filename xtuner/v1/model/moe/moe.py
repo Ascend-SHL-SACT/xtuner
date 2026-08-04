@@ -1173,7 +1173,40 @@ class MoE(BaseModel):
                 layer_idx=layer_idx,
                 mtp_idx=None,
             ):
-                layer = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.REENTRANT)
+                # Two independent knobs (the launch .sh picks the combo per scale);
+                # the code binds neither feature to the other.
+                #   XTUNER_MOE_REENTRANT (default 1): 1=REENTRANT (re-enters autograd
+                #     on backward recompute), 0=NO_REENTRANT (re-runs the forward,
+                #     re-issuing the SP all-gather).
+                #   XTUNER_MOE_NO_RECOMPUTE_SP_GATHER (default 0): 1 attaches a
+                #     selective-ckpt context that MUST_SAVEs the SP all-gather so it
+                #     is skipped on recompute. context_fn needs use_reentrant=False
+                #     (torch constraint), so the REENTRANT + sel-ckpt combo is
+                #     refused below.
+                _use_reentrant = os.environ.get("XTUNER_MOE_REENTRANT", "1") == "1"
+                _save_sp_gather = os.environ.get(
+                    "XTUNER_MOE_NO_RECOMPUTE_SP_GATHER", "0") == "1"
+                if _save_sp_gather and _use_reentrant:
+                    raise ValueError(
+                        "XTUNER_MOE_NO_RECOMPUTE_SP_GATHER=1 (selective-ckpt) "
+                        "requires XTUNER_MOE_REENTRANT=0: torch's context_fn is "
+                        "only supported with use_reentrant=False."
+                    )
+                _ckpt_kwargs: dict = {}
+                if _save_sp_gather:
+                    from xtuner.v1.ops.comm.selective_ckpt_sp import (
+                        sp_gather_selective_context_fn,
+                    )
+
+                    _ckpt_kwargs["context_fn"] = sp_gather_selective_context_fn
+                _ckpt_kwargs["determinism_check"] = "none"
+                layer = checkpoint_wrapper(
+                    layer,
+                    checkpoint_impl=CheckpointImpl.REENTRANT
+                    if _use_reentrant
+                    else CheckpointImpl.NO_REENTRANT,
+                    **_ckpt_kwargs,
+                )
 
             self.layers[str(layer_idx)] = layer
             if layer_idx >= len(self.layers) - 1 and self.mtp_block is None:
