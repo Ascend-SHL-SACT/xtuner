@@ -63,7 +63,12 @@ class ChunkLoss(torch.autograd.Function):
     def backward(ctx, *grad_output):
         grad_input, grad_weight = ctx.saved_tensors
         if torch.ne(grad_output[0], torch.tensor(1.0, device=grad_output[0].device)):
-            grad_input = grad_input * grad_output[0]
-            grad_weight = grad_weight * grad_output[0]
+            # In-place mul avoids allocating a head_weight-sized grad temp.
+            # Use a python scalar (.item()): torch_npu mul_(0-dim tensor) goes
+            # through the tensor-operand dispatch and allocates a temp, while
+            # mul_(python float) is a truly in-place element-wise scale.
+            scale = grad_output[0].item()
+            grad_input.mul_(scale)
+            grad_weight.mul_(scale)
 
         return grad_input, grad_weight, None, None, None, None
