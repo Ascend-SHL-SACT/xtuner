@@ -1,3 +1,4 @@
+import os
 from collections.abc import Iterable
 
 import torch
@@ -61,6 +62,10 @@ class SwapAdamW(torch.optim.AdamW):
         return tensor
 
     def _init_swap_states(self) -> None:
+        # XTUNER_SWAP_BF16_STATE=1: keep m/v as bf16 on CPU to halve PCIe transfer.
+        # Dispatches to step_overlap, which upcasts to fp32 for adam.
+        self._swap_bf16_state = int(os.environ.get("XTUNER_SWAP_BF16_STATE", "0")) == 1
+        _state_dtype = torch.bfloat16 if self._swap_bf16_state else None
         for group in self.param_groups:
             for param in group["params"]:
                 self._param_to_group_map[param] = group
@@ -86,7 +91,9 @@ class SwapAdamW(torch.optim.AdamW):
                         cpu_state_dtensor[key] = None
                         cpu_state[key] = None
                     else:
-                        cpu_tensor = torch.zeros_like(local_param, memory_format=torch.preserve_format)
+                        cpu_tensor = torch.zeros_like(
+                            local_param, dtype=_state_dtype, memory_format=torch.preserve_format
+                        )
                         cpu_tensor = cpu_tensor.to(device="cpu", non_blocking=True)
                         cpu_tensor = cpu_tensor.pin_memory()
                         cpu_state_dtensor[key] = cpu_tensor
@@ -101,6 +108,17 @@ class SwapAdamW(torch.optim.AdamW):
 
     @torch.no_grad()
     def step(self, closure=None):
+        # Dispatch to step_overlap when any overlap/bf16 knob is set; each is
+        # independent (XTUNER_SWAP_BF16_STATE / D2H_OVERLAP / H2D_OVERLAP) and
+        # they may be combined or used alone. All off -> stock serial path.
+        if (
+            int(os.environ.get("XTUNER_SWAP_D2H_OVERLAP", "0"))
+            or int(os.environ.get("XTUNER_SWAP_H2D_OVERLAP", "0"))
+            or int(os.environ.get("XTUNER_SWAP_BF16_STATE", "0"))
+        ):
+            from .swap_adamw_overlap import step_overlap
+
+            return step_overlap(self, closure)
         loss = None
         if closure is not None:
             with torch.enable_grad():
