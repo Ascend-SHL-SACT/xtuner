@@ -382,7 +382,10 @@ class LMHeadLossContext(BaseLossContext):
             if self._liger_is_npu:  # NPU: reduction='none' -> per-token; sum to scalar
                 loss = loss.sum()
             mask = loss_weight != 0
-            w = loss_weight.sum() / mask.sum()  # w equals to 1/global_denominator
+            # w equals to 1/global_denominator on normal shards. clamp(min=1)
+            # guards the all-padding SP-shard where mask.sum()==0 would give
+            # 0/0=nan (loss is finite 0 there -> w=0 -> loss*0=0). no-op n_valid>0.
+            w = loss_weight.sum() / mask.sum().clamp(min=1)
             loss = loss * w
             return loss, (None, {})
 
