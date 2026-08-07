@@ -1,10 +1,11 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import array
 import datetime
 import multiprocessing
 import os
 import random
 import tempfile
-from collections.abc import Sequence
+from collections.abc import MutableSequence, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from functools import cached_property, partial
 from multiprocessing import shared_memory
@@ -14,7 +15,6 @@ from typing import Sized, cast
 import numpy as np
 import torch
 import xxhash
-from datasets import Dataset, concatenate_datasets
 from torch import distributed as dist
 from torch.utils.data import ConcatDataset
 from torch.utils.data import Dataset as TorchDataset
@@ -91,11 +91,93 @@ class _LegacySoftPackDataset(torch.utils.data.Dataset):
         self.global_pack = global_pack
         self.pack_max_length = pack_max_length
 
-        pack_infos = []
-        for i, dataset in enumerate(self.datasets):
-            _infos = self.get_pack_infos(dataset, i, num_tokens[i], proxy_attn_flops[i])
-            pack_infos.append(_infos)
-        self.pack_infos = concatenate_datasets(pack_infos)
+        if os.environ.get("XTUNER_PACK_CACHE_DIR"):
+            self.pack_infos = self._build_soft_pack_infos_cached(num_tokens, proxy_attn_flops)
+        else:
+            # Old flow: every rank computes independently (verbatim, unchanged).
+            pack_infos = []
+            for i, dataset in enumerate(self.datasets):
+                _infos = self.get_pack_infos(dataset, i, num_tokens[i], proxy_attn_flops[i])
+                pack_infos.append(_infos)
+            self.pack_infos = _merge_soft_pack_infos(pack_infos)
+
+    def _build_soft_pack_infos_cached(
+        self, num_tokens: list[np.ndarray], proxy_attn_flops: list[np.ndarray]
+    ) -> dict[str, np.ndarray]:
+        # Env-gated (XTUNER_PACK_CACHE_DIR set) VLM/soft-pack analogue of
+        # HardPackDataset._build_pack_infos.  Without this, every rank on a node
+        # independently runs get_pack_infos -> get_pack_infos_by_expand_soft_split,
+        # spawning ProcessPoolExecutor(max_workers=8, fork) per rank:
+        # 16 ranks x 8 workers = 128 forked processes/node, whose copy-on-write
+        # materialisation + 16x per-rank pack_infos drove the packing-stage
+        # host-RAM OOM (debug-33: anon 1.83 TB, nprocs=145 = 16+128+1).
+        #
+        # Here only one rank PER NODE (is_local_rank0) computes and writes the
+        # result to a content-addressed dir; every other rank on the node mmap-
+        # loads it -> 128 fork/node -> 8 fork/node, one pack_infos copy per node.
+        # The dir lives under _get_mmap_dir(), which honours XTUNER_PACK_CACHE_DIR
+        # (persistent shared fs) so the cache also HITs across runs (run 2+ skips
+        # the packing compute).  On shared storage every node's local rank-0
+        # races to create the same pack_dir; the loser's dir-rename is tolerated
+        # below.  Behaviour-preserving: get_pack_infos is deterministic given
+        # seed=42 (torch.randperm(generator=manual_seed(42)), CPU generator), so
+        # rank-0's output already equals what every rank produces independently.
+        pack_pg = dist.new_group(timeout=datetime.timedelta(seconds=7200)) if dist.is_initialized() else None
+
+        h = xxhash.xxh128()
+        h.update(f"{self.seed}_{self.pack_max_length}_{self.global_pack}".encode())
+        for nt in num_tokens:
+            h.update(np.ascontiguousarray(nt).data.tobytes())
+        pack_dir = _get_mmap_dir() / "xtuner_soft_pack_cache" / h.hexdigest()
+
+        if is_local_rank0() and not pack_dir.exists():
+            pack_infos = []
+            for i, dataset in enumerate(self.datasets):
+                _infos = self.get_pack_infos(dataset, i, num_tokens[i], proxy_attn_flops[i])
+                pack_infos.append(_infos)
+            merged = _merge_soft_pack_infos(pack_infos)
+            # Atomic write (temp dir + rename): other ranks never observe a
+            # partial pack_dir if rank-0 is killed mid-write.
+            pack_dir.parent.mkdir(parents=True, exist_ok=True)
+            tmp_dir = Path(tempfile.mkdtemp(dir=pack_dir.parent))
+            try:
+                for field in ("dataset_id", "indices", "indices_cu_len", "longest"):
+                    np.save(str(tmp_dir / f"{field}.npy"), merged[field])
+                os.rename(str(tmp_dir), str(pack_dir))
+            except Exception:
+                import shutil
+
+                shutil.rmtree(str(tmp_dir), ignore_errors=True)
+                # Shared (persistent) cache dir: every node's local rank-0 races
+                # to create the same pack_dir.  The loser's os.rename fails
+                # (ENOTEMPTY) because the winner already populated pack_dir;
+                # content is deterministic-identical, so fall through to the
+                # barrier + mmap load below (which reads the winner's pack_dir).
+                # Do NOT `return` here: returning skips the global barrier at
+                # line ~167 (breaking the collective for ranks waiting at it)
+                # and leaves self.pack_infos unset (None), crashing __len__
+                # ('NoneType' not subscriptable) -- both seen in debug-35.
+                # HardPack is immune because its save is a separate helper whose
+                # caller always continues to barrier + load.
+                if not pack_dir.exists():
+                    raise
+
+        # Dedicated group, 2 h timeout: non-rank-0 ranks wait here for rank-0's
+        # multi-minute packing compute; the default NCCL watchdog (~10 min) would
+        # otherwise fire.
+        if dist.is_initialized():
+            dist.barrier(group=pack_pg)
+            if pack_pg is not None:
+                dist.destroy_process_group(pack_pg)
+
+        # mmap_mode="r": every rank on the node maps the same on-disk file
+        # read-only; the OS backs all mappings with one set of physical pages
+        # (page cache, one copy per node regardless of N ranks).
+        return {
+            field: np.load(str(pack_dir / f"{field}.npy"), mmap_mode="r")
+            for field in ("dataset_id", "indices", "indices_cu_len", "longest")
+            if (pack_dir / f"{field}.npy").exists()
+        }
 
     @property
     def longest(self):
@@ -109,16 +191,16 @@ class _LegacySoftPackDataset(torch.utils.data.Dataset):
 
         pack_infos = get_pack_infos_by_soft_split(inds, dataset_id, num_tokens, self.pack_max_length)
 
-        pack_infos = Dataset.from_list(pack_infos)
-
-        return pack_infos
+        return _soft_pack_infos_to_arrays(pack_infos)
 
     def __len__(self):
-        return len(self.pack_infos)
+        return self.pack_infos["dataset_id"].shape[0]
 
     def __getitem__(self, item):
-        indices = self.pack_infos[item]["indices"]
-        dataset_id = self.pack_infos[item]["dataset_id"]
+        dataset_id = int(self.pack_infos["dataset_id"][item])
+        indices_start = 0 if item == 0 else int(self.pack_infos["indices_cu_len"][item - 1])
+        indices_end = int(self.pack_infos["indices_cu_len"][item])
+        indices = self.pack_infos["indices"][indices_start:indices_end].tolist()
         return [self.datasets[dataset_id][i] for i in indices]
 
     def load_state_dict(self, state_dict):
@@ -248,7 +330,7 @@ def get_pack_chunk_infos(
 
 
 def get_pack_infos_by_expand_soft_split(
-    inds: list[int],
+    inds: MutableSequence[int],
     dataset_id: int,
     num_tokens: np.ndarray,
     proxy_attn_flops: np.ndarray,
@@ -340,7 +422,12 @@ class ExpandSoftPackDataset(_LegacySoftPackDataset):
     def get_pack_infos(
         self, dataset: Sized, dataset_id: int, num_tokens: np.ndarray, proxy_attn_flops: np.ndarray | None = None
     ):
-        inds = torch.randperm(len(dataset), generator=self.torch_random_generator).tolist()
+        # Use array.array("q") (int64) instead of a Python list to hold the shuffled indices: the packing
+        # algorithm treats these as a mutable stack (.pop()), which numpy arrays cannot do, but a list costs
+        # ~36 B per element vs 8 B here. Built directly from the tensor buffer to avoid a transient list.
+        perm = torch.randperm(len(dataset), generator=self.torch_random_generator)
+        inds = array.array("q")
+        inds.frombytes(perm.numpy().tobytes())
         pack_infos = get_pack_infos_by_expand_soft_split(
             inds,
             dataset_id,
@@ -351,13 +438,12 @@ class ExpandSoftPackDataset(_LegacySoftPackDataset):
             pack_chunk_size=self.pack_chunk_size,
             pack_extra_buffer_size=self.pack_extra_buffer_size,
         )
-        total_index = []
-        for infos in pack_infos:
-            total_index.extend(infos["indices"])
-        assert len(dataset) == len(total_index) == len(set(total_index))
+        # total_index = []
+        # for infos in pack_infos:
+        #     total_index.extend(infos["indices"])
+        # assert len(dataset) == len(total_index) == len(set(total_index))
 
-        pack_infos = Dataset.from_list(pack_infos)
-        return pack_infos
+        return _soft_pack_infos_to_arrays(pack_infos)
 
 
 def _hard_pack_chunk_core(
@@ -420,6 +506,67 @@ def _merge_pack_infos(infos: list[dict[str, np.ndarray]]) -> dict[str, np.ndarra
         "indices_cu_len": np.concatenate(cu_parts),
         "start_offset": np.concatenate([r["start_offset"] for r in infos]),
         "end_offset": np.concatenate([r["end_offset"] for r in infos]),
+        "longest": np.concatenate([r["longest"] for r in infos]),
+    }
+
+
+def _soft_pack_infos_to_arrays(pack_infos: list[dict]) -> dict[str, np.ndarray]:
+    """Convert soft-pack info dicts into a CSR-style dict of numpy arrays.
+
+    Mirrors the in-memory layout of ``HardPackDataset``: parallel ``dataset_id`` / ``longest`` arrays plus a
+    flat ``indices`` array addressed by the cumulative-length ``indices_cu_len``. This avoids materializing a
+    HuggingFace ``Dataset``, whose fingerprinting dill-pickles the whole table into a large transient buffer.
+
+    Args:
+        pack_infos (list[dict]): Per-pack dicts with ``dataset_id`` (int), ``indices`` (list[int]) and
+            ``longest`` (int) keys, as produced by the soft-split packers.
+
+    Returns:
+        dict[str, np.ndarray]: Dict with ``dataset_id``, flat ``indices``, ``indices_cu_len`` and ``longest``.
+    """
+    n = len(pack_infos)
+    dataset_id = np.empty(n, dtype=np.int64)
+    longest = np.empty(n, dtype=np.int64)
+    lengths = np.empty(n, dtype=np.int64)
+    for i, info in enumerate(pack_infos):
+        dataset_id[i] = info["dataset_id"]
+        longest[i] = info["longest"]
+        lengths[i] = len(info["indices"])
+    if n > 0:
+        indices = np.concatenate([np.asarray(info["indices"], dtype=np.int64) for info in pack_infos])
+    else:
+        indices = np.empty(0, dtype=np.int64)
+    return {
+        "dataset_id": dataset_id,
+        "indices": indices,
+        "indices_cu_len": np.cumsum(lengths, dtype=np.int64),
+        "longest": longest,
+    }
+
+
+def _merge_soft_pack_infos(infos: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    """Concatenate per-dataset soft-pack arrays into a single CSR-style dict.
+
+    The flat ``indices`` arrays hold dataset-local sample indices (disambiguated by ``dataset_id``) and are
+    concatenated as-is; only ``indices_cu_len`` is shifted by the running offset so it stays cumulative across
+    the merged ``indices``.
+
+    Args:
+        infos (list[dict[str, np.ndarray]]): Per-dataset dicts from ``_soft_pack_infos_to_arrays``.
+
+    Returns:
+        dict[str, np.ndarray]: Merged dict with the same keys.
+    """
+    cu_parts: list[np.ndarray] = []
+    offset = np.int64(0)
+    for r in infos:
+        cu_parts.append(r["indices_cu_len"] + offset)
+        if len(r["indices_cu_len"]) > 0:
+            offset += r["indices_cu_len"][-1]
+    return {
+        "dataset_id": np.concatenate([r["dataset_id"] for r in infos]),
+        "indices": np.concatenate([r["indices"] for r in infos]),
+        "indices_cu_len": np.concatenate(cu_parts) if cu_parts else np.empty(0, dtype=np.int64),
         "longest": np.concatenate([r["longest"] for r in infos]),
     }
 
@@ -584,6 +731,13 @@ class HardPackDataset(_LegacySoftPackDataset):
             import shutil
 
             shutil.rmtree(str(tmp_dir), ignore_errors=True)
+            # Shared (persistent) cache dir: every node's local rank-0 races to
+            # create the same pack_dir.  The loser's os.rename fails (ENOTEMPTY)
+            # because the winner already populated pack_dir; content is
+            # deterministic-identical, so the winner's pack_dir is valid for this
+            # rank too -- swallow and let _load read it.
+            if pack_dir.exists():
+                return
             raise
 
     def _load_pack_infos_from_mmap(self, pack_dir: Path) -> dict[str, np.ndarray]:
