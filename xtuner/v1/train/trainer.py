@@ -1535,7 +1535,12 @@ class Trainer:
             if torch.accelerator.current_accelerator().type == "cuda":
                 backend = "cpu:gloo,cuda:nccl"
             elif torch.accelerator.current_accelerator().type == "npu":
-                backend = "npu:hccl"
+                # bare "hccl": torch_npu then reports group backends as "hccl"
+                # (not the composite "npu:hccl"), which mmengine's
+                # get_comm_device recognizes; otherwise it falls back to cpu and
+                # the SP all-gather crashes with "No backend type associated
+                # with device type cpu". Override via XTUNER_DIST_BACKEND.
+                backend = os.environ.get("XTUNER_DIST_BACKEND", "hccl")
             else:
                 raise NotImplementedError
 
