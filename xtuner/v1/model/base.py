@@ -1311,6 +1311,34 @@ class BaseModel(nn.Module):
     def post_micro_batch_forward(self, batch_outputs: Sequence[ModelOutputs]) -> BatchForwardInfo:
         train_engine_extra_info = ModelForwardExtraLogInfo()
 
+        if os.environ.get("XTUNER_LOSS_DEFER_ITEM", "0") == "1":
+            # On-device reduce + defer .item(): keep tensors on-device through
+            # the per-loss sum and all_reduce, and store the device tensor in
+            # logs_info. The host sync (.item()) is deferred to step-end logging
+            # in the trainer, instead of one per loss mid-forward (where the
+            # device is far ahead -> large sync gap). Replaces the per-loss
+            # .item()->host float->torch.tensor round-trip entirely.
+            dev_loss: dict[str, torch.Tensor] = {}
+            for output in batch_outputs:
+                output_copy = output.model_copy()
+                for name in output_copy.model_fields:
+                    obj = getattr(output_copy, name)
+                    if "loss" in name and isinstance(obj, torch.Tensor):
+                        rn = f"reduced_{name}"
+                        t = obj.detach().to(DEVICE).float()
+                        dev_loss[rn] = t if rn not in dev_loss else dev_loss[rn] + t
+                if "extra_info" in output_copy:
+                    train_engine_extra_info.append(output["extra_info"])
+            ws = dist.get_world_size()
+            reduced_dev_losses: dict[str, object] = {}
+            for name, tloss in dev_loss.items():
+                if ws > 1:
+                    dist.all_reduce(tloss.div_(ws), op=dist.ReduceOp.SUM)
+                reduced_dev_losses[name] = tloss
+            if "reduced_loss" in reduced_dev_losses:
+                reduced_dev_losses["reduced_llm_loss"] = reduced_dev_losses.pop("reduced_loss")
+            return BatchForwardInfo(logs_info=reduced_dev_losses, extra_info=train_engine_extra_info)  # type: ignore[typeddict-item]
+
         local_total_loss = torch.tensor(0.0, device=DEVICE)
         reduced_other_losses: dict[str, float] = {}
 
