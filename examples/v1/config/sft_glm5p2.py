@@ -53,7 +53,13 @@ model_cfg.compile_cfg = _get_bool_env("MODEL_COMPILE", False)
 model_cfg.float8_cfg = _get_float8_config()
 model_cfg.lm_loss_cfg = loss_cfg
 if hasattr(model_cfg.attention, "sparse_mla_backend"):
-    model_cfg.attention.sparse_mla_backend = os.environ.get("SPARSE_MLA_BACKEND", "tilelang")
+    # On NPU, default to "npu" backend; on CUDA, keep the env-specified backend.
+    from xtuner.v1.utils.device import get_device
+
+    if get_device() == "npu":
+        model_cfg.attention.sparse_mla_backend = os.environ.get("SPARSE_MLA_BACKEND", "npu")
+    else:
+        model_cfg.attention.sparse_mla_backend = os.environ.get("SPARSE_MLA_BACKEND", "tilelang")
 
 cache_dir = os.path.join(work_dir, "jsonl_cache")
 cache_tag = os.environ.get("CACHE_TAG", f"glm52_{sample_max_length}")

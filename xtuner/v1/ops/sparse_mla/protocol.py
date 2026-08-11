@@ -6,7 +6,7 @@ import torch
 from xtuner.v1.data_proto import SequenceContext
 
 
-SparseMLABackend = Literal["torch", "tilelang", "cudnn_dsa"]
+SparseMLABackend = Literal["torch", "tilelang", "cudnn_dsa", "npu"]
 
 
 class SparseMLAOutputs(NamedTuple):
@@ -31,6 +31,8 @@ class SparseMLAProtocol(Protocol):
         indices: torch.Tensor,
         scaling: float | None,
         value_dim: int | None = None,
+        *,
+        seq_ctx: SequenceContext | None = None,
     ) -> SparseMLAOutputs: ...
 
 

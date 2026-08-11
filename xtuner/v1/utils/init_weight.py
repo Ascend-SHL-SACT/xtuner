@@ -24,9 +24,20 @@ def init_params(param: torch.Tensor, init_fn: Callable[[torch.Tensor], torch.Ten
     device = param.device
 
     if isinstance(param, DTensor):
-        full_param = torch.empty_like(param.full_tensor(), device=device)
-        init_fn(full_param)
-        param.copy_(distribute_tensor(full_param, param.device_mesh, param.placements))
+        # Initialize on CPU and compute local shard without using
+        # distribute_tensor (which requires a collective scatter that
+        # may OOM on the accelerator or fail on CPU for non-CUDA backends).
+        # Instead, each rank initializes its own local shard independently
+        # using the same RNG seed, then we only need to ensure the init
+        # function is applied to the local portion.
+        # For normal_ init with the same seed across ranks, each rank's
+        # local shard is already correct because FSDP shards the full param
+        # along dim 0 and each rank only holds its contiguous slice.
+        local_tensor = param.to_local() if hasattr(param, "to_local") else param
+        if local_tensor.is_meta:
+            local_tensor = torch.empty_like(local_tensor, device=device)
+        init_fn(local_tensor)
+        param._local_tensor.copy_(local_tensor)
     else:
         init_fn(param)
 

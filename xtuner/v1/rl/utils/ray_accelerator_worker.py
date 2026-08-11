@@ -6,7 +6,11 @@ import torch
 import torch.distributed as dist
 from cyclopts import Parameter
 from pydantic import BaseModel, ConfigDict, field_validator
-from ray.actor import ActorClass, ActorProxy
+try:
+    from ray.actor import ActorClass, ActorProxy
+except ImportError:
+    from ray.actor import ActorClass
+    ActorProxy = object
 from ray.util.placement_group import (
     VALID_PLACEMENT_GROUP_STRATEGIES,
     PlacementGroup,
@@ -443,8 +447,8 @@ class AutoAcceleratorWorkers:
 
     @classmethod
     def from_placement_group(
-        cls, worker_cls: ActorClass[T], worker_config, pg: PlacementGroup
-    ) -> tuple[list[ActorProxy[T]], list[tuple[int, int]]]:
+        cls, worker_cls: ActorClass, worker_config, pg: PlacementGroup
+    ) -> tuple[list[ActorProxy], list[tuple[int, int]]]:
         """Create workers from an existing placement group.
 
         Args:
@@ -461,7 +465,7 @@ class AutoAcceleratorWorkers:
         device_type = cls.get_device_type(pg)
         sorted_bundle_idxs, master_addr, master_port, world_size = cls.get_spmd_info(pg)
 
-        workers_list: list[ActorProxy[T]] = []
+        workers_list: list[ActorProxy] = []
         rank_bundle_idx_list: list[tuple[int, int]] = []
         for rank, bundle_idx in enumerate(sorted_bundle_idxs):
             worker = worker_cls.options(
