@@ -285,6 +285,12 @@ def _should_profile_rank(ranks: list[int]) -> bool:
 class Profiler:
     """MindSpeed-ported profiler with a contiguous ``[start, end)`` window.
 
+    Reserved public API: the live trainer / worker path uses
+    :func:`profiling_time` (per-step drop-in), so this class has no call site
+    in the current codebase. It is retained as the complete MindSpeed port for
+    future loop-scoped collection and as the only path that honours
+    ``XTUNER_PROFILE_TYPE=dynamic`` (see :class:`DynamicParam`).
+
     Use this for loop-scoped collection::
 
         prof = Profiler(config, save_path)
@@ -435,6 +441,14 @@ def profiling_time(profile_dir: Path):
     if not _should_profile_rank(cfg.ranks):
         yield
         return
+    if cfg.profile_type == "dynamic" and _rank() == 0:
+        logger.warning(
+            "[profiler_v2] XTUNER_PROFILE_TYPE=dynamic is ignored by the "
+            "per-step profiling_time path: dynamic_profile is a long-lived "
+            "singleton, incompatible with a per-step context manager. "
+            "Falling back to a one-step static trace. Use the Profiler class "
+            "for loop-scoped dynamic collection."
+        )
     import torch_npu  # noqa: PLC0415  lazy
 
     profiler_level = _resolve_profiler_level(sp.level)
