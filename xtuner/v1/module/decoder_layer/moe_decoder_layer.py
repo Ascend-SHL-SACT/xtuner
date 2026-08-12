@@ -13,6 +13,12 @@ from torch.nn import functional as F
 from xtuner.v1.config.generate import GenerateConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8 import Float8Config
+from xtuner.v1.model.moe.expert_submodule_fsdp import (
+    expert_mlp_forward,
+    get_gate_up_proj_weight,
+    init_expert_linears,
+    is_enabled,
+)
 from xtuner.v1.module import (
     AttnOutputs,
     GatedDeltaNet,
@@ -184,8 +190,19 @@ class MoEBlock(nn.Module):
             float8_cfg=float8_cfg,
         )
         self.moe_act = moe_act_fn_cfg.build()
+        init_expert_linears(
+            self,
+            hidden_size=hidden_size,
+            moe_intermediate_size=moe_intermediate_size,
+            n_routed_experts=n_routed_experts,
+            moe_bias=moe_bias,
+            ep_mesh=ep_mesh,
+            float8_cfg=float8_cfg,
+        )
 
     def forward(self, x, tokens_per_expert, decoding):
+        if is_enabled():
+            return expert_mlp_forward(self, x, tokens_per_expert, decoding)
         gate_up_out = self.fused_w1w3(x, tokens_per_expert, decoding)
         out = self.moe_act(gate_up_out, split_dim=-1)
         res = self.fused_w2(out, tokens_per_expert, decoding)
@@ -341,7 +358,7 @@ class MoEDecoderLayer(nn.Module):
     def _hf_expert_forward_for_debug(self, hidden_states: torch.Tensor, router_results: RouterResults, origin_shape):
         # xtuner: num_experts * 2 * expert_dim, hidden_size
         # hf: num_experts, 2 * expert_dim, hidden_size
-        origin_gate_up_proj = self.experts.fused_w1w3.weight
+        origin_gate_up_proj = get_gate_up_proj_weight(self.experts)
         gate_up_proj = origin_gate_up_proj.view(
             self.n_routed_experts, 2 * self.experts.intermediate_size, self.hidden_size
         )
