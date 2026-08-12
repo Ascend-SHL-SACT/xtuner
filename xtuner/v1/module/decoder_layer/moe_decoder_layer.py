@@ -230,6 +230,10 @@ class MoEDecoderLayer(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.hidden_factor = hidden_factor
+        # Overlap the shared-experts GEMM (compute stream) with the dispatch
+        # all-to-all (comm stream): issue the shared forward between dispatch
+        # and dispatch_postprocess (the wait). Env-gated; no-op when off.
+        self.shared_overlap = os.environ.get("XTUNER_MOE_SHARED_OVERLAP", "0") == "1"
 
         self.self_attn: MultiHeadAttention | MultiLatentAttention | GatedDeltaNet = attention_config.build(
             hidden_size=hidden_size,
@@ -529,17 +533,29 @@ class MoEDecoderLayer(nn.Module):
         experts_out_list: list[torch.Tensor] = []
         pre_combined_list: list[PreCombineResult] = []
         combined_list: list[CombineResult] = []
+        # Pre-init so the overlap path can append inside the dispatch loop; the
+        # serial path (shared_overlap off) and the n_shared_experts == 0 case
+        # are both reassigned in the later shared-experts loop.
+        shared_experts_out_list: list[torch.Tensor | None] = []
 
         # dispatch + experts + pre-combine
-        for router_results, pre_dispatched in zip(
-            router_results_list,
-            pre_dispatched_list,
+        for i, (router_results, pre_dispatched) in enumerate(
+            zip(router_results_list, pre_dispatched_list)
         ):
             dispatched = self.dispatcher.dispatch(
                 pre_dispatched=pre_dispatched,
                 topk_weights=router_results["topk_weights"],
                 async_op=True,
             )
+            # Overlap: issue the shared-experts GEMM on the compute stream
+            # while the dispatch all-to-all runs on the comm stream, then
+            # wait for the a2a. Shared input is the attention output
+            # (pre_moe_forward_out), independent of the routed tokens.
+            if self.shared_overlap and self.n_shared_experts > 0:
+                shared_experts_out = self._shared_experts_forward(
+                    hidden_states=pre_moe_forward_out_list[i],
+                )
+                shared_experts_out_list.append(shared_experts_out)
             # wait for pre-dispatch event
             post_dispatched = self.dispatcher.dispatch_postprocess(
                 pre_dispatched=pre_dispatched,
@@ -580,15 +596,18 @@ class MoEDecoderLayer(nn.Module):
             )
             combined_list.append(combined)
 
-        shared_experts_out_list: list[torch.Tensor | None]
-
-        if self.n_shared_experts > 0:
+        if self.n_shared_experts > 0 and not self.shared_overlap:
+            # Serial path: shared-experts GEMM after combine (no overlap).
             shared_experts_out_list = []
             for pre_moe_forward_out in pre_moe_forward_out_list:
                 shared_experts_out = self._shared_experts_forward(
                     hidden_states=pre_moe_forward_out,
                 )
                 shared_experts_out_list.append(shared_experts_out)
+        elif self.n_shared_experts > 0:
+            # shared_overlap: shared forward already issued inside the dispatch
+            # loop above; nothing to do here.
+            pass
         else:
             shared_experts_out_list = [None] * intra_layer_micro_batch
 
