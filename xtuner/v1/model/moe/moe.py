@@ -1172,6 +1172,13 @@ class MoE(BaseModel):
             param_dtype=self.fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype
         )
 
+        # Gate the forward-prefetch chain (set_modules_to_forward_prefetch) on
+        # XTUNER_FSDP_PREFETCH (default 1 = overlap layer-N+1 unshard with
+        # layer-N compute, i.e. the existing behavior); 0 reverts to torch
+        # FSDP2's default 1-layer-in-flight unshard (no double-in-flight
+        # transient, at the cost of un-overlapped per-layer all-gather).
+        fsdp_prefetch = os.environ.get("XTUNER_FSDP_PREFETCH", "1") == "1"
+
         for layer_idx, layer in tqdm(self.layers.items(), desc="[FSDP Sharding]"):
             layer_idx = int(layer_idx)
             if self._should_recompute(
@@ -1227,11 +1234,12 @@ class MoE(BaseModel):
                 module=layer,
             )
 
-        for layer_cur, layer_next in zip(
-            list(self.layers.values())[:-1],
-            list(self.layers.values())[1:],
-        ):
-            layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
+        if fsdp_prefetch:
+            for layer_cur, layer_next in zip(
+                list(self.layers.values())[:-1],
+                list(self.layers.values())[1:],
+            ):
+                layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
 
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
@@ -1307,14 +1315,16 @@ class MoE(BaseModel):
                     module=mtp_layer,
                 )
                 if mtp_idx == 0:
-                    layer_next.set_modules_to_forward_prefetch([mtp_layer])  # type: ignore
+                    if fsdp_prefetch:
+                        layer_next.set_modules_to_forward_prefetch([mtp_layer])  # type: ignore
 
             if self.config.mtp_config is not None and self.config.mtp_config.num_layers > 0:
                 for prev_mtp_layer, next_mtp_layer in zip(
                     list(self.mtp_block.layers)[:-1],
                     list(self.mtp_block.layers)[1:],
                 ):
-                    prev_mtp_layer.set_modules_to_forward_prefetch([next_mtp_layer])  # type: ignore
+                    if fsdp_prefetch:
+                        prev_mtp_layer.set_modules_to_forward_prefetch([next_mtp_layer])  # type: ignore
 
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
@@ -1322,7 +1332,8 @@ class MoE(BaseModel):
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
         )
-        self.set_modules_to_forward_prefetch([self.embed_tokens, self.layers["0"]])  # type: ignore
+        if fsdp_prefetch:
+            self.set_modules_to_forward_prefetch([self.embed_tokens, self.layers["0"]])  # type: ignore
 
         for _, module in self.named_modules():
             if isinstance(module, nn.Embedding):
