@@ -245,6 +245,11 @@ class TrainEngine:
             ProberList.after_micro_iter_forward()
 
         batch_forward_info = self.model.post_micro_batch_forward(micro_batch_results)
+        if os.environ.get("XTUNER_LOSS_DEFER_ITEM", "0") == "1":
+            # Keep total_loss on-device; the .item() is deferred to step-end
+            # logging in the trainer, so the host can launch clip/optim
+            # immediately after backward instead of blocking on a scalar read.
+            return TrainStepInfo(total_loss=total_loss, **data_batch_info, **batch_forward_info)  # type: ignore[typeddict-item]
         return TrainStepInfo(total_loss=total_loss.item(), **data_batch_info, **batch_forward_info)
 
     def from_hf(self, hf_path: str | Path, strict: bool = False):

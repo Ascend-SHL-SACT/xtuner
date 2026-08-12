@@ -467,7 +467,12 @@ class MoE(BaseModel):
         max_load_i, _ = torch.max(tokens_per_expert_global, dim=1)
         maxvio_all_layers = (max_load_i - avg_count_load) / avg_count_load
         maxvio = maxvio_all_layers.mean()
-        logs_info["maxvio"] = maxvio.item()
+        if os.environ.get("XTUNER_LOSS_DEFER_ITEM", "0") == "1":
+            # Defer .item() to step-end logging (trainer) so the host does not
+            # block on a scalar read at the end of the forward path.
+            logs_info["maxvio"] = maxvio  # type: ignore[assignment]
+        else:
+            logs_info["maxvio"] = maxvio.item()
 
         if self.need_update_bias:
             self.update_bias(tokens_per_expert_global, avg_count_load)  # type: ignore

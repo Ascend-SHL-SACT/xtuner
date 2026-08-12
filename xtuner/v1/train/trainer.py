@@ -1725,6 +1725,27 @@ class Trainer:
         train_step_info = train_step_info.copy()
         lr = self._lr_scheduler.get_last_lr()[0]
 
+        if os.environ.get("XTUNER_LOSS_DEFER_ITEM", "0") == "1":
+            # Consolidated deferred .item() pass. With XTUNER_LOSS_DEFER_ITEM the
+            # loss/maxvio values in logs_info and the total_loss were kept
+            # on-device through the forward (base.py + moe.py + train_engine.py)
+            # precisely so the host would NOT sync mid-forward. Convert exactly
+            # those to python floats here, at step-end (after backward+clip+optim),
+            # merging those host-device syncs into this point instead of
+            # serializing forward launches. NOTE: only logs_info + total_loss are
+            # touched; extra_info (a dict subclass holding max_ratio / local_base
+            # loss tensors, some multi-element) is left to its own .get() below,
+            # and the data_batch metrics were already .item()'d at pre-micro-batch.
+            _logs = train_step_info.get("logs_info")
+            if isinstance(_logs, dict):
+                train_step_info["logs_info"] = {
+                    _k: (_v.item() if isinstance(_v, torch.Tensor) else _v)
+                    for _k, _v in _logs.items()
+                }
+            _tl = train_step_info.get("total_loss")
+            if isinstance(_tl, torch.Tensor):
+                train_step_info["total_loss"] = _tl.item()
+
         loss_logs_info = train_step_info.pop("logs_info") | {"local_loss": train_step_info.pop("total_loss")}  # type: ignore[misc]
         loss_log_list = [f"{k}: {v:.8f}" for k, v in loss_logs_info.items()]
         loss_log_str = ", ".join(loss_log_list)
