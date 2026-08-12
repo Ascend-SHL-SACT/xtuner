@@ -12,7 +12,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
-from xtuner.v1.utils import get_logger, log_rank0
+from xtuner.v1.utils import get_logger, get_torch_device_module, log_rank0
 
 
 if TYPE_CHECKING:
@@ -24,6 +24,23 @@ else:
 
 
 logger = get_logger()
+
+
+def _in_autograd_backward() -> bool:
+    """Return True when executing inside the autograd engine's backward pass.
+
+    Used to skip device sync during NO_REENTRANT activation-checkpoint
+    recompute, which runs under ``enable_grad`` in an ``unpack_hook`` (so
+    ``is_grad_enabled`` cannot distinguish it from the real forward).
+    ``torch._C._current_graph_task_id()`` returns -1 outside any backward;
+    this is the same signal ``torch.utils.checkpoint`` itself uses and is
+    thread-aware. Inlined here so the prober has no cross-PR import
+    dependency on ``xtuner.v1.utils.profile``.
+    """
+    try:
+        return torch._C._current_graph_task_id() != -1
+    except Exception:
+        return False
 
 
 class BaseProber(ABC):
@@ -1054,16 +1071,22 @@ class TimeProber(BaseProber):
     def _start_timer(cls, name: str):
         if cls.skip():
             return
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        # Sync the device so perf_counter reads completed-work wall time. The
+        # original ``torch.cuda.is_available()`` guard never fires on an
+        # NPU-only box, so timings silently included in-flight async work. Guard
+        # the sync with ``_in_autograd_backward`` to skip it during NO_REENTRANT
+        # recompute (prevents the >=256-rank
+        # recompute deadlock from a per-rank sync ahead of the EP all-to-all).
+        if not _in_autograd_backward():
+            get_torch_device_module().synchronize()
         cls.start_times[name] = time.perf_counter()
 
     @classmethod
     def _end_timer(cls, name: str):
         if cls.skip():
             return
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if not _in_autograd_backward():
+            get_torch_device_module().synchronize()
 
         if name not in cls.start_times:
             logger.warning(f"[TimeProber] Warning: {name} timer not started")
