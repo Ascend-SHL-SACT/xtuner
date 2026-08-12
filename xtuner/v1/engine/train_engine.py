@@ -547,7 +547,9 @@ class TrainEngine:
 
     def put_optimizer_to_device(self, device: torch.device | str) -> bool:
         """Put the optimizer to the given device."""
-        if getattr(self.optim_cfg, "swap_optimizer", False):
+        if getattr(self.optim_cfg, "swap_optimizer", False) or getattr(
+            self.optimizer, "_swap_momentum", False
+        ):
             return False
         if not self.optimizer.state:
             return False
