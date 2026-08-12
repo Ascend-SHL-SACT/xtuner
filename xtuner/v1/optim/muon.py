@@ -23,6 +23,7 @@
 
 
 import math
+import os
 from collections import defaultdict
 from itertools import chain, product
 from typing import Callable, Generator, Iterator, Literal, Sequence, cast, overload
@@ -36,7 +37,11 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 from torch.optim.optimizer import Optimizer, ParamsT
 
+from xtuner.v1.utils import get_torch_device_module
 from xtuner.v1.utils.dtensor import group_tensors_by_device_mesh_and_placements
+
+
+DEVICE_MODULE = get_torch_device_module()
 
 
 def maybe_to_local(tensor: list[Tensor]) -> list[Tensor]:
@@ -328,6 +333,9 @@ class Muon(Optimizer):
         super().__init__(params, defaults)
         self._enable_all2all = enable_all2all
         self._remainder_strategy = remainder_strategy
+        # XTUNER_MUON_SWAP=1: keep Muon momentum on pinned CPU, H2D/D2H around
+        # muon_update_pre_orthogonalize (see muon_update_batch_async).
+        self._swap_momentum = bool(int(os.environ.get("XTUNER_MUON_SWAP", "0")))
 
         # Pre-compute lr adjustment ratios for each Muon parameter based on global shape.
         # This must happen at init time because DTensor.shape here is guaranteed to be
@@ -421,9 +429,18 @@ class Muon(Optimizer):
         initialize it if it doesn't exist."""
         state = self.state[param]
         if "momentum" not in state:
-            state["momentum"] = torch.zeros_like(param)
-            if algo == "adamw":
-                state["variance"] = torch.zeros_like(param)
+            if self._swap_momentum:
+                # Keep optimizer states on pinned CPU; H2D/D2H around the in-place
+                # updates (see muon_update_batch_async / adamw_update_foreach_async).
+                # to_local() yields the NPU local shard; pin_memory needs a CPU tensor.
+                local = param.to_local() if isinstance(param, DTensor) else param
+                state["momentum"] = torch.zeros_like(local, device="cpu").pin_memory()
+                if algo == "adamw":
+                    state["variance"] = torch.zeros_like(local, device="cpu").pin_memory()
+            else:
+                state["momentum"] = torch.zeros_like(param)
+                if algo == "adamw":
+                    state["variance"] = torch.zeros_like(param)
         return state
 
     @staticmethod
@@ -703,6 +720,7 @@ class Muon(Optimizer):
                                 shard_dim=sharded_tensor_dim,
                                 process_group=group_process_group,
                                 num_experts=ns_num_experts,
+                                swap_momentum=self._swap_momentum,
                             )
                         )
 
@@ -740,6 +758,7 @@ class Muon(Optimizer):
                                 shard_dim=sharded_tensor_dim,
                                 process_group=comm_pg,
                                 num_experts=ns_num_experts,
+                                swap_momentum=self._swap_momentum,
                             )
                         )
 
@@ -784,6 +803,7 @@ class Muon(Optimizer):
                     weight_decay=weight_decay,
                     step=step,
                     epsilon=epsilon,
+                    swap_momentum=self._swap_momentum,
                 )
             )
 
@@ -805,6 +825,7 @@ def muon_update_batch_async(
     process_group: ProcessGroup | None = None,  # Unified process group for communication
     num_experts: int = 1,  # Number of experts for MoE models
     batch_size: int | None = None,  # If set, pad X/G/M to this size with zeros
+    swap_momentum: bool = False,  # H2D/D2H Muon momentum (kept on pinned CPU) around pre_orthogonalize
 ) -> Generator[None, None, None]:
     """Batched version of Muon update.
 
@@ -834,6 +855,13 @@ def muon_update_batch_async(
     else:
         assert len(X) == world_size
 
+    # Muon momentum is kept on pinned CPU; H2D to a fresh device temp for the
+    # in-place momentum update, then D2H back before the device temp is freed.
+    M_cpu = None
+    if swap_momentum:
+        M_cpu = M
+        M = [m.to(device=G[0].device, non_blocking=True) for m in M]
+
     # Update momentum and compute the inputs for orthogonalization
     U = muon_update_pre_orthogonalize(
         G=maybe_to_local(G),
@@ -841,6 +869,11 @@ def muon_update_batch_async(
         momentum=momentum,
         nesterov=nesterov,
     )
+
+    if swap_momentum:
+        for m_dev, m_cpu_t in zip(M, M_cpu):
+            m_cpu_t.copy_(m_dev, non_blocking=True)
+        DEVICE_MODULE.synchronize()
 
     # Orthogonalize — dispatch to the appropriate communication strategy
     if comm_strategy == "agrs":
@@ -1355,8 +1388,17 @@ def adamw_update_foreach_async(
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     step: int,
     epsilon: float,
+    swap_momentum: bool = False,  # H2D/D2H AdamW m,v (kept on pinned CPU)
 ) -> Generator[None, None, None]:
     """Async wrapper around foreach AdamW update."""
+    # AdamW m,v are kept on pinned CPU; H2D to device temps for the in-place
+    # update, then D2H back before the device temps are freed.
+    M_cpu = V_cpu = None
+    if swap_momentum:
+        M_cpu, V_cpu = M, V
+        dev = G[0].device
+        M = [m.to(device=dev, non_blocking=True) for m in M]
+        V = [v.to(device=dev, non_blocking=True) for v in V]
     adamw_update_foreach(
         X,
         G,
@@ -1369,6 +1411,12 @@ def adamw_update_foreach_async(
         step,
         epsilon,
     )
+    if swap_momentum:
+        for m_dev, m_cpu_t in zip(M, M_cpu):
+            m_cpu_t.copy_(m_dev, non_blocking=True)
+        for v_dev, v_cpu_t in zip(V, V_cpu):
+            v_cpu_t.copy_(v_dev, non_blocking=True)
+        DEVICE_MODULE.synchronize()
     yield
 
 
