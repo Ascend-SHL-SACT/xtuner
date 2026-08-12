@@ -1,3 +1,4 @@
+import os
 from typing import Literal, TypeAlias, cast
 
 import torch
@@ -8,6 +9,7 @@ from typing_extensions import override
 from xtuner.v1.ops import permute, unpermute
 from xtuner.v1.ops.comm.all_to_all import all_to_all_single_autograd
 from xtuner.v1.utils import copy_method_signature, get_device, get_logger
+from xtuner.v1.utils.profile import _in_autograd_backward
 
 from . import XTUNER_DISPATCHER_DEBUG
 from .base import (
@@ -75,6 +77,67 @@ class TorchAll2AllPostCombineResult(PostCombineResult): ...
 HiddenStates: TypeAlias = torch.Tensor
 
 
+# --- a2a split-cache: root fix for the S=4096 recompute deadlock ----------
+# ``_dispatch`` runs inside the checkpointed MoE ``_forward`` so it re-runs in
+# backward recompute. Its metadata all-to-all (``dist.all_to_all_single`` below,
+# async_op defaults to False -> HOST-BLOCKING, call-order-matched across ranks)
+# and the ``.to(cpu).tolist()`` D2H syncs are the ONLY host-blocking work in
+# the sync dispatch path. The payload a2a (``all_to_all_single_autograd``) and
+# the combine a2a are autograd functional collectives -> device-async -> they
+# lazily match on the device queue regardless of host-level cross-rank drift,
+# so they are inherently safe under drift.
+#
+# In the forward all ranks progress lockstep (layer N on every rank, each a2a
+# re-syncs -> matching splits). In the BACKWARD recompute ranks drift to
+# different layers (variable expert load -> variable GEMM time, and no per-layer
+# cross-rank barrier between recomputes), so the Nth host-blocking metadata a2a
+# on rank A pairs with a DIFFERENT layer's Nth on rank B -> mismatched
+# send/recv counts -> aicpu event/notify timeout -> deadlock. It is
+# payload-size-gated: S<=2048 stays within drift tolerance, S=4096 (2x payload
+# + 2x GEMM variance) exceeds it -> deterministic deadlock at 256/512 ranks.
+# Raising HCCL_BUFFSIZE cannot help (this is a call-order mismatch, not a
+# buffer-capacity limit).
+#
+# Fix: split sizes are a DETERMINISTIC function of ``topk_ids`` (which the
+# checkpoint saves), so recompute produces splits IDENTICAL to the forward.
+# Cache (tokens_per_expert_group, input_splits, output_splits) from the forward
+# and reuse them in recompute, skipping the metadata a2a + D2H. Recompute then
+# issues ONLY the device-async payload a2a -> zero host-blocking collectives ->
+# no cross-rank desync source -> the device-async a2as lazy-match within window
+# at any S -> deadlock eliminated at the root. This caches split METADATA (a few
+# ints + one tiny int tensor), NOT activations -- all expert I/O still
+# recomputes, so this is not the "retain-activations-to-skip-recompute" path.
+#
+# LIFO stack: autograd recompute is strictly nested (forward pushes layers
+# 0..N-1, backward pops N-1..0), so a stack mirrors the ordering.
+_a2a_split_cache: list[tuple[torch.Tensor, list[int], list[int]]] = []
+_a2a_cache_stats: dict[str, int] = {"hits": 0, "misses": 0}
+
+def _a2a_cache_enabled() -> bool:
+    """Whether the a2a split cache should activate (bool).
+
+    Requires BOTH the env opt-in (``XTUNER_MOE_A2A_CACHE_SPLITS=1``) AND that
+    activation-checkpoint recompute is on (``RECOMPUTE_RATIO > 0``). The launch
+    script exports ``RECOMPUTE_RATIO`` and the example config feeds the same env
+    into ``fsdp_config.recompute_ratio``, which ``moe.py``'s ``_should_recompute``
+    reads to decide whether to wrap layers with ``checkpoint_wrapper`` -- so this
+    env is the canonical recompute-on signal, read live at the push site.
+
+    The cache only helps under recompute (the backward recompute pops the forward
+    push); without recompute the forward pushes are never popped -> unbounded
+    leak, so the recompute ratio gates the push at the source rather than relying
+    on a step-boundary clear. Default ratio 0 when the env is unset -> cache off
+    (safe: no push, no leak) until the launch script opts in.
+    """
+    if os.environ.get("XTUNER_MOE_A2A_CACHE_SPLITS", "0") != "1":
+        return False
+    try:
+        ratio = float(os.environ.get("RECOMPUTE_RATIO", "0"))
+    except (TypeError, ValueError):
+        return False
+    return ratio > 0.0
+
+
 def _dispatch(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -83,6 +146,38 @@ def _dispatch(
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int]]:
     ep_size = process_group.size()
     num_experts_per_rank = n_routed_experts // ep_size
+
+    use_cache = _a2a_cache_enabled()
+    in_bwd = _in_autograd_backward()
+
+    # Backward recompute: reuse the forward's split metadata (LIFO pop) and skip
+    # the host-blocking metadata a2a + D2H -- only the device-async payload a2a
+    # re-issues, so no call-order-matched host collective can mismatch under
+    # cross-rank backward drift.
+    if use_cache and in_bwd and _a2a_split_cache:
+        _a2a_cache_stats["hits"] += 1
+        tokens_per_expert_group, input_splits, output_splits = _a2a_split_cache.pop()
+        if _a2a_cache_stats["hits"] % 100 == 1:
+            logger.info(
+                "[a2a-cache] recompute reuse "
+                f"hits={_a2a_cache_stats['hits']} "
+                f"misses={_a2a_cache_stats['misses']}"
+            )
+        hidden_states = hidden_states.contiguous()
+        out = all_to_all_single_autograd(
+            hidden_states,
+            output_split_sizes=output_splits,
+            input_split_sizes=input_splits,
+            group=process_group,
+        )
+        return out, tokens_per_expert_group, input_splits, output_splits
+
+    # Forward, or cache-empty fallback in recompute: compute splits normally.
+    if use_cache and in_bwd and not _a2a_split_cache:
+        _a2a_cache_stats["misses"] += 1
+        if _a2a_cache_stats["misses"] == 1:
+            logger.warning("[a2a-cache] MISS (empty cache in recompute) -- falling back to recompute")
+
     tokens_per_expert = torch.histc(topk_ids, bins=n_routed_experts, min=0, max=n_routed_experts)
     # self._comm_stream.wait_event(event)
     tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
@@ -101,6 +196,10 @@ def _dispatch(
         tokens_per_expert.reshape(ep_size, num_experts_per_rank).to(device=torch.device("cpu")).sum(dim=1).tolist()
     )
     output_splits = tokens_per_expert_group.to(device=torch.device("cpu")).sum(dim=-1).tolist()
+
+    # Forward: cache the split metadata for the matching backward recompute.
+    if use_cache and not in_bwd:
+        _a2a_split_cache.append((tokens_per_expert_group, input_splits, output_splits))
 
     hidden_states = hidden_states.contiguous()
 

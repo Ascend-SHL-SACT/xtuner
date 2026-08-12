@@ -1,6 +1,8 @@
 import time
 from contextlib import contextmanager
 
+import torch
+
 from xtuner.v1.utils import get_logger, get_torch_device_module
 
 
@@ -49,3 +51,20 @@ def timer_logger(time_dict: dict[str, float]):
     total_duration = sum(time_dict.values())
     report_lines.append(f"  - {'Total':<25}: {total_duration:.2f}s")
     return "\n".join(report_lines)
+
+
+def _in_autograd_backward() -> bool:
+    """Return True when executing inside the autograd engine's backward pass.
+
+    This includes the ``torch.utils.checkpoint`` NO_REENTRANT recompute, which
+    runs under ``enable_grad`` inside an ``unpack_hook`` -- so ``is_grad_enabled``
+    cannot tell it apart from the real forward. ``torch._C.
+    _current_graph_task_id`` returns ``-1`` outside any backward and a valid id
+    inside one, which is the same signal ``torch.utils.checkpoint`` itself uses
+    to gate its unpack path. It is thread-aware, so it works inside the autograd
+    worker threads that run the recompute (unlike a main-thread flag).
+    """
+    try:
+        return torch._C._current_graph_task_id() != -1
+    except Exception:
+        return False
