@@ -111,7 +111,7 @@ class GpuTopKResidency:
 
 class ActivationOffloadedTopKResidency(GpuTopKResidency):
     def __init__(self) -> None:
-        self._streams: dict[int, torch.cuda.Stream] = {}
+        self._streams: dict[int, Any] = {}
         self._prefetched: dict[tuple[int, int], SwapTensor] = {}
 
     def has_cache(self, seq_ctx: SequenceContext, source_layer_idx: int) -> bool:
@@ -148,12 +148,15 @@ class ActivationOffloadedTopKResidency(GpuTopKResidency):
         key = cache.offloaded[source_layer_idx]
         swap_tensor = OffloadManager().get(key)
         stream = self._stream_for_device(swap_tensor.tensor.device)
-        working_stream = torch.cuda.current_stream(swap_tensor.tensor.device)
+        from xtuner.v1.utils.device import get_torch_device_module
+
+        dev_mod = get_torch_device_module()
+        working_stream = dev_mod.current_stream(swap_tensor.tensor.device)
 
         # DSA top-k cache is not captured by saved_tensors_hooks, so this mirrors
         # activation offload's explicit H2D choreography for manual cache state.
         stream.wait_stream(working_stream)
-        with torch.cuda.stream(stream):
+        with dev_mod.stream(stream):
             swap_tensor.launch_h2d(stream, True, stream)
         working_stream.wait_stream(stream)
 
@@ -173,7 +176,7 @@ class ActivationOffloadedTopKResidency(GpuTopKResidency):
     def after_original_forward_last_use(self, seq_ctx: SequenceContext, source_layer_idx: int) -> None:
         cache = seq_ctx.dsa_topk_cache
         topk_indices = cache.indices.pop(source_layer_idx)
-        if not topk_indices.is_cuda:
+        if not topk_indices.is_cuda and not (hasattr(topk_indices, 'device') and topk_indices.device.type == 'npu'):
             cache.indices[source_layer_idx] = topk_indices
             return
 
@@ -190,7 +193,10 @@ class ActivationOffloadedTopKResidency(GpuTopKResidency):
         )
         swap_tensor = SwapTensor(topk_indices, key, tensor_cpu=cpu_buffer)
         stream = self._stream_for_device(topk_indices.device)
-        stream.wait_stream(torch.cuda.current_stream(topk_indices.device))
+        from xtuner.v1.utils.device import get_torch_device_module
+
+        dev_mod = get_torch_device_module()
+        stream.wait_stream(dev_mod.current_stream(topk_indices.device))
         swap_tensor.launch_d2h(stream)
         swap_tensor.wait_d2h_finished(stream, True)
         OffloadManager().put(key, swap_tensor)
@@ -211,13 +217,19 @@ class ActivationOffloadedTopKResidency(GpuTopKResidency):
         if OffloadManager().exist(key):
             OffloadManager().clear(key)
 
-    def _stream_for_current_device(self) -> torch.cuda.Stream:
-        return self._stream_for_device(torch.device("cuda", torch.cuda.current_device()))
+    def _stream_for_current_device(self):
+        from xtuner.v1.utils.device import get_torch_device_module, get_device
 
-    def _stream_for_device(self, device: torch.device) -> torch.cuda.Stream:
-        device_idx = torch.cuda.current_device() if device.index is None else device.index
+        dev_mod = get_torch_device_module()
+        return self._stream_for_device(torch.device(get_device(), dev_mod.current_device()))
+
+    def _stream_for_device(self, device: torch.device):
+        from xtuner.v1.utils.device import get_torch_device_module
+
+        dev_mod = get_torch_device_module()
+        device_idx = dev_mod.current_device() if device.index is None else device.index
         if device_idx not in self._streams:
-            self._streams[device_idx] = torch.cuda.Stream(device=device_idx)
+            self._streams[device_idx] = dev_mod.Stream(device=device_idx)
         return self._streams[device_idx]
 
     def _prefetch_key(self, seq_ctx: SequenceContext, source_layer_idx: int) -> tuple[int, int]:
@@ -312,7 +324,13 @@ class CrossLayerTopKSharingRuntime:
         self._offloaded_residency.prefetch(seq_ctx, source_layer_idx)
 
     def _residency(self) -> GpuTopKResidency:
-        if _dsa_topk_offload_enabled() and torch.cuda.is_available():
+        from xtuner.v1.utils.device import get_device
+
+        dev = get_device()
+        is_accel_available = (dev == "cuda" and torch.cuda.is_available()) or (
+            dev == "npu" and torch.npu.is_available()
+        )
+        if _dsa_topk_offload_enabled() and is_accel_available:
             return self._offloaded_residency
         return self._gpu_residency
 

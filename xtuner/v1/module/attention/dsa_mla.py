@@ -67,7 +67,7 @@ class DSAIndexer(nn.Module):
         index_head_dim: int,
         index_n_heads: int,
         index_topk: int,
-        indexer_backend: Literal["torch", "tilelang", "cudnn_dsa", "torch_npu"] = "torch",
+        indexer_backend: Literal["torch", "tilelang", "cudnn_dsa", "npu"] = "torch",
     ):
         super().__init__()
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -175,7 +175,7 @@ class DSAMLAConfig(MLAConfig):
     index_skip_topk_offset: int = 0
     indexer_rope_interleave: bool = True
     indexer_types: list[str] | None = None
-    sparse_mla_backend: Literal["torch", "tilelang", "cudnn_dsa", "torch_npu"] = "torch"
+    sparse_mla_backend: Literal["torch", "tilelang", "cudnn_dsa", "npu"] = "torch"
 
     def build(
         self,
@@ -186,7 +186,7 @@ class DSAMLAConfig(MLAConfig):
         generate_config: GenerateConfig | None = None,
         float8_cfg: Float8Config | None = None,
     ) -> "DSAMultiLatentAttention":
-        if self.sparse_mla_backend in ("tilelang", "cudnn_dsa", "torch_npu"):
+        if self.sparse_mla_backend in ("tilelang", "cudnn_dsa", "npu"):
             ensure_tilelang_runtime_available()
         if self.sparse_mla_backend == "cudnn_dsa":
             ensure_cudnn_dsa_runtime_available()
@@ -213,7 +213,7 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         index_skip_topk_offset: int = 0,
         indexer_rope_interleave: bool = True,
         indexer_types: list[str] | None = None,
-        sparse_mla_backend: Literal["torch", "tilelang", "cudnn_dsa", "torch_npu"] = "torch",
+        sparse_mla_backend: Literal["torch", "tilelang", "cudnn_dsa", "npu"] = "torch",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -372,6 +372,7 @@ class DSAMultiLatentAttention(MultiLatentAttention):
             topk_indices,
             self.softmax_scale,
             value_dim=self.kv_lora_rank,
+            seq_ctx=seq_ctx,
         )
         # raw_output: [S, N, Rkv]; softmax_lse: [S, N]
         raw_output = sparse_mla_outputs.raw_output

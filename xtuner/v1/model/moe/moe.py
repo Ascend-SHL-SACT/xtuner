@@ -218,7 +218,9 @@ class MoE(BaseModel):
         self._init_load_spec()
         self._maybe_enable_compile(self.compile_cfg)
 
-        self.offload_stream = torch.cuda.Stream()
+        from xtuner.v1.utils.device import get_torch_device_module
+
+        self.offload_stream = get_torch_device_module().Stream()
         self.aux_loss: AuxLossContext = self.config.aux_loss_cfg.build(
             n_routed_experts=self.config.n_routed_experts,
             num_experts_per_tok=self.config.num_experts_per_tok,

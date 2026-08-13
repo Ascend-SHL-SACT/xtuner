@@ -154,14 +154,28 @@ def mla_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
+    # NPU fused rotary embedding for interleaved RoPE.
+    # npu_rotary_mul computes q * cos + rotate_half(q) * sin in one fused kernel.
+    # We first deinterleave the input (view+transpose+reshape) to match the
+    # half-split layout that npu_rotary_mul expects, then apply the fusion.
+    from xtuner.v1.utils.device import get_device
+
+    # Deinterleave to half-split layout, shared by both NPU and CUDA/CPU paths.
     b, h, s, d = q.shape
     q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
 
     b, h, s, d = k.shape
     k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
 
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    if get_device() == "npu":
+        import torch_npu
+
+        q_embed = torch_npu.npu_rotary_mul(q.contiguous(), cos, sin)
+        k_embed = torch_npu.npu_rotary_mul(k.contiguous(), cos, sin)
+    else:
+        # CUDA/CPU path: interleaved RoPE via rotate_half
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 

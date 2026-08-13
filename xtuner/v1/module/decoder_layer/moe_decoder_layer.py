@@ -747,8 +747,8 @@ class _BackwardSync(Function):
     def forward(
         ctx,
         input_tensor: torch.Tensor,
-        previous_backward_event: torch.cuda.Event | None = None,
-        finished_backward_event: torch.cuda.Event | None = None,
+        previous_backward_event=None,
+        finished_backward_event=None,
         name=None,
     ) -> torch.Tensor:
         ctx.previous_backward_event = previous_backward_event
@@ -758,7 +758,9 @@ class _BackwardSync(Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        current_stream = torch.cuda.current_stream()
+        from xtuner.v1.utils.device import get_torch_device_module
+
+        current_stream = get_torch_device_module().current_stream()
 
         if ctx.previous_backward_event is not None:
             current_stream.wait_event(ctx.previous_backward_event)

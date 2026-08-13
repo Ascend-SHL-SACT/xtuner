@@ -14,7 +14,7 @@ def get_sparse_mla(backend: SparseMLABackend) -> SparseMLAProtocol:
         from .tilelang import tilelang_sparse_mla
 
         return tilelang_sparse_mla
-    if backend == "torch_npu":
+    if backend == "npu":
         from .npu_sparse_mla import npu_sparse_mla
 
         return npu_sparse_mla
@@ -22,6 +22,7 @@ def get_sparse_mla(backend: SparseMLABackend) -> SparseMLAProtocol:
         from .cudnn_dsa import cudnn_dsa_sparse_mla
 
         return cudnn_dsa_sparse_mla
+
     raise ValueError(f"Unsupported SparseMLA backend: {backend}")
 
 
@@ -32,8 +33,10 @@ def sparse_mla(
     scaling: float | None,
     value_dim: int | None = None,
     backend: SparseMLABackend = "torch",
+    *,
+    seq_ctx: SequenceContext | None = None,
 ) -> SparseMLAOutputs:
-    return get_sparse_mla(backend)(q, kv, indices, scaling=scaling, value_dim=value_dim)
+    return get_sparse_mla(backend)(q, kv, indices, scaling=scaling, value_dim=value_dim, seq_ctx=seq_ctx)
 
 
 def get_dsa_topk_indices(backend: SparseMLABackend) -> DSATopKIndicesProtocol:
@@ -43,10 +46,10 @@ def get_dsa_topk_indices(backend: SparseMLABackend) -> DSATopKIndicesProtocol:
         from .tilelang import tilelang_dsa_topk_indices
 
         return tilelang_dsa_topk_indices
-    if backend == "torch_npu":
-        from .npu_lightning_indexer import npu_lightning_dsa_topk_indices
+    if backend == "npu":
+        from .npu_indexer import npu_dsa_topk_indices
 
-        return npu_lightning_dsa_topk_indices
+        return npu_dsa_topk_indices
     raise ValueError(f"Unsupported DSA indexer backend: {backend}")
 
 
@@ -71,12 +74,20 @@ def dsa_topk_indices(
 
 
 def ensure_tilelang_runtime_available() -> None:
+    from xtuner.v1.utils.device import get_device
+
+    if get_device() == "npu":
+        return  # NPU backend does not require tilelang
     from .tilelang import ensure_tilelang_runtime_available as _impl
 
     return _impl()
 
 
 def ensure_cudnn_dsa_runtime_available() -> None:
+    from xtuner.v1.utils.device import get_device
+
+    if get_device() == "npu":
+        return  # NPU backend does not require cudnn
     from .cudnn_dsa import ensure_cudnn_dsa_runtime_available as _impl
 
     return _impl()

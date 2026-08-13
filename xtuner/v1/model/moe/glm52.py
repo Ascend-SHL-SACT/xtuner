@@ -331,6 +331,16 @@ class Glm52MoEConfig(MoEConfig):
         if getattr(cfg, "num_nextn_predict_layers", 0) and not cfg.index_share_for_mtp_iteration:
             raise ValueError("GLM-5.2 MTP requires index_share_for_mtp_iteration=True.")
 
+        # Auto-select NPU sparse MLA backend when running on Ascend NPU.
+        from xtuner.v1.utils.device import get_device
+
+        DEVICE = get_device()
+        default_sparse_mla_backend =  "torch"
+        if DEVICE == "npu":
+            default_sparse_mla_backend = "npu"
+        elif DEVICE == "cuda":
+            default_sparse_mla_backend = "cudnn_dsa"
+
         config = cls(
             vocab_size=cfg.vocab_size,
             max_position_embeddings=cfg.max_position_embeddings,
@@ -363,6 +373,7 @@ class Glm52MoEConfig(MoEConfig):
                 index_skip_topk_offset=cfg.index_skip_topk_offset,
                 indexer_rope_interleave=cfg.indexer_rope_interleave,
                 indexer_types=list(cfg.indexer_types) if cfg.indexer_types is not None else None,
+                sparse_mla_backend=default_sparse_mla_backend,
             ),
             hf_head_dim=cfg.head_dim,
             qk_head_dim=cfg.qk_head_dim,
