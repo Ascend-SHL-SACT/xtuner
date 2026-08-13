@@ -173,7 +173,7 @@ class ActivationOffloadedTopKResidency(GpuTopKResidency):
     def after_original_forward_last_use(self, seq_ctx: SequenceContext, source_layer_idx: int) -> None:
         cache = seq_ctx.dsa_topk_cache
         topk_indices = cache.indices.pop(source_layer_idx)
-        if not topk_indices.is_cuda:
+        if not topk_indices.is_cuda and not (hasattr(topk_indices, 'device') and topk_indices.device.type == 'npu'):
             cache.indices[source_layer_idx] = topk_indices
             return
 
@@ -312,7 +312,13 @@ class CrossLayerTopKSharingRuntime:
         self._offloaded_residency.prefetch(seq_ctx, source_layer_idx)
 
     def _residency(self) -> GpuTopKResidency:
-        if _dsa_topk_offload_enabled() and torch.cuda.is_available():
+        from xtuner.v1.utils.device import get_device
+
+        dev = get_device()
+        is_accel_available = (dev == "cuda" and torch.cuda.is_available()) or (
+            dev == "npu" and torch.npu.is_available()
+        )
+        if _dsa_topk_offload_enabled() and is_accel_available:
             return self._offloaded_residency
         return self._gpu_residency
 

@@ -32,8 +32,10 @@ def sparse_mla(
     scaling: float | None,
     value_dim: int | None = None,
     backend: SparseMLABackend = "torch",
+    *,
+    seq_ctx: SequenceContext | None = None,
 ) -> SparseMLAOutputs:
-    return get_sparse_mla(backend)(q, kv, indices, scaling=scaling, value_dim=value_dim)
+    return get_sparse_mla(backend)(q, kv, indices, scaling=scaling, value_dim=value_dim, seq_ctx=seq_ctx)
 
 
 def get_dsa_topk_indices(backend: SparseMLABackend) -> DSATopKIndicesProtocol:
@@ -44,9 +46,9 @@ def get_dsa_topk_indices(backend: SparseMLABackend) -> DSATopKIndicesProtocol:
 
         return tilelang_dsa_topk_indices
     if backend == "torch_npu":
-        from .npu_lightning_indexer import npu_lightning_dsa_topk_indices
+        from .npu_indexer import npu_dsa_topk_indices
 
-        return npu_lightning_dsa_topk_indices
+        return npu_dsa_topk_indices
     raise ValueError(f"Unsupported DSA indexer backend: {backend}")
 
 

@@ -1,199 +1,33 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-"""Ascend NPU sparse MLA: fused C++ forward + autograd backward on compacted
-indices.
+"""NPU SparseMLA backend for GLM-5.2 DSA attention.
 
-Compacts the top-k indices to ``K_eff`` (per-call max valid count) before the
-op, so ``npu_sparse_flash_attention`` and its built-in C++ backward process
-only ~``K_eff`` real KV slots/query instead of the full ``index_topk`` (2048,
-~97% ``-1`` padding). On the full topk the C++ backward is pathologically
-slow; on compacted indices it is fast.
+Wraps ``torch_npu.npu_sparse_flash_attention`` (V1) for fused sparse MLA
+on Ascend NPU (910B/910C).
 
-Two fixes (see ``_compact_indices`` / ``_prepare_bsnd``):
-  * float32 topk -- dispatches AIV TopKV2 instead of AI_CPU Sort.
-  * cycled-pad (``-1`` -> ``S_g + (j % N_PAD)``, env
-    ``XTUNER_NPU_SPARSE_MLA_NPAD``) -- breaks the C++ bwd gather-conflict.
+Three paths:
+  - Single sequence (no packing): BSND layout.
+  - Packed multi-sequence (SP=1): TND layout + global cu_seq_lens.
+  - Packed multi-sequence (SP>1): TND layout + prefix-extended KV slice
+    with asymmetric cu_seq_q / cu_seq_kv (same segment count, different
+    per-segment lengths). KV slice extends before shard_start to include
+    the full segment prefix.
 
-Compaction (reorder + truncate) is exact. Cycled-pad is NOT exact: pad rows
-are zero-value but get softmax weight ``exp(0)=1`` (``sparse_mode=3`` does not
-mask explicitly-indexed positions), diluting the output by ``N/(sum+N)``;
-N_PAD=16 (default) stays under 1%. Measured speedups/dilution and the N_PAD
-sweep are in ``GLM-5p2_xtuner_training.md`` (13B-39/13B-40).
+Key implementation notes:
+  - ``sparse_mode=3`` (RightDownCausal): kernel applies per-segment causal
+    mask internally. Requires valid (non -1) indices at training scale;
+    -1 is rewritten to query's own global position (self-attention).
+  - ``self_pos`` must use GLOBAL position (``arange(S) + shard_start``)
+    for correct global→local conversion. Using local position causes
+    V1 kernel backward to produce NaN (sparse_mode=3 + multi-segment TND).
+  - indices passed to kernel are per-segment local (each segment from 0).
+
+Reference: mindspeed/core/transformer/experimental_attention_variant/dsa_fused.py:426-475
 """
 
-import os
-
 import torch
+import torch_npu
 
 from .protocol import SparseMLAOutputs
-
-# One-shot K_eff/compaction debug print (gated by XTUNER_NPU_SPARSE_MLA_DBG).
-_NPU_SPARSE_MLA_DBG_N = 0
-
-# Above this per-call K_eff, chunk over the query dim so each op call still
-# sees a small K_eff. Production K_eff (~300) is well under it.
-_K_EFF_SINGLE_MAX = 512
-
-# Cycled zero-pad KV rows (``-1`` slot ``j`` -> ``S_g + (j % N_PAD)``) to break
-# the C++ bwd gather-conflict (stock N_PAD=1 routes all pad to one row ->
-# gathered ~240x/query). Default 16 (<1% dilution). Env-overridable; <=1
-# selects the stock same-pad path (zero dilution, slowest bwd).
-_N_PAD_ROWS = int(os.environ.get("XTUNER_NPU_SPARSE_MLA_NPAD", "16"))
-
-
-def _compact_indices(indices: torch.Tensor) -> tuple[torch.Tensor, int]:
-    """Move valid (non -1) indices to the front of each row, truncate to K_eff.
-
-    Args:
-        indices (Tensor): ``(S, 1, topk)`` int64 with ``-1`` padding slots.
-
-    Returns:
-        tuple: ``compact`` ``(S, 1, K_eff)`` int64 (valid slots front, ``-1``
-            tail for rows with fewer valid than ``K_eff``); ``K_eff`` int (max
-            valid count across all rows; 0 if every slot is ``-1``).
-    """
-    idx = indices.squeeze(1)  # [S, topk]  (kv_group == 1)
-    valid = idx != -1  # [S, topk]
-    k_eff = int(valid.sum(-1).max().item())  # host sync (1/call)
-    global _NPU_SPARSE_MLA_DBG_N
-    if int(os.environ.get("XTUNER_NPU_SPARSE_MLA_DBG", "0")) and _NPU_SPARSE_MLA_DBG_N < 6:
-        _NPU_SPARSE_MLA_DBG_N += 1
-        _vsum = valid.sum(-1)
-        _topk = idx.shape[-1]
-        print(
-            f"[NSM-DBG n={_NPU_SPARSE_MLA_DBG_N}] S={idx.shape[0]} topk={_topk} "
-            f"K_eff(max_valid)={k_eff} avg_valid/q={float(_vsum.float().mean()):.1f} "
-            f"min_valid/q={int(_vsum.min())} max_valid/q={int(_vsum.max())} "
-            f"compact_ratio={_topk / max(1, k_eff):.1f}x",
-            flush=True,
-        )
-    if k_eff == 0:
-        return idx[:, :0].unsqueeze(1).contiguous(), 0
-    # float32 topk: int64/int32 dispatches AI_CPU Sort (~26 ms/call), float32
-    # dispatches AIV TopKV2 (~1.2 ms). Result identical (topk over 0/1 values
-    # selects valid slots first; 0-slot tie-breaks gather to -1 padding).
-    _, sel = torch.topk(valid.float(), k_eff, dim=-1)  # [S, K_eff]
-    compact = torch.gather(idx, -1, sel)  # [S, K_eff] valid idx, -1 tail
-    return compact.unsqueeze(1).contiguous(), k_eff
-
-
-def _prepare_bsnd(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    value_dim: int,
-) -> dict[str, torch.Tensor]:
-    """Split absorbed MLA q/kv into (nope, rope), rewrite -1 -> cycled pad rows.
-
-    Operates on the already-compacted indices, so every temp is K_eff-sized.
-    The op's backward faults on ``-1`` in packed inputs, so the pad rewrite is
-    required (not cosmetic). Cycled pad (``-1`` at slot ``j`` -> ``S_g +
-    (j % N_PAD)``) spreads gathers over N_PAD zero rows, breaking the stock
-    same-pad gather-conflict; it dilutes the output by ``N_PAD/(sum+N_PAD)``
-    (N_PAD=16 < 1%, default). See ``GLM-5p2_xtuner_training.md`` 13B-40 for
-    the N_PAD sweep (speed plateau at 32, 64 dominated) and dilution table.
-
-    Args:
-        q (Tensor): ``(S, N, value_dim + rope_dim)`` bf16.
-        kv (Tensor): ``(S_g, 1, value_dim + rope_dim)`` bf16 (kv_group == 1).
-        indices (Tensor): ``(S, 1, K_eff)`` int64 with ``-1`` tail padding.
-        value_dim (int): Absorbed output dim (512 for GLM-5.2).
-
-    Returns:
-        dict[str, Tensor]: BSND-laid-out tensors for the op (B=1): ``q_nope_b``,
-            ``q_rope_b``, ``k_nope_b``, ``k_rope_b``, ``sp``, ``aql``, ``akl``.
-    """
-    seq_len, _heads, dim = q.shape
-    seq_g, kv_group, _ = kv.shape
-    if kv_group != 1:
-        raise ValueError(
-            f"torch_npu sparse MLA expects kv_group == 1 (absorbed MLA), "
-            f"got {kv_group}"
-        )
-    rope_dim = dim - value_dim
-    k_eff = indices.shape[-1]
-    dev = q.device
-
-    q_nope = q[..., :value_dim]  # [S, N, value_dim]
-    q_rope = q[..., value_dim:]  # [S, N, rope_dim]
-    kv_nope = kv[..., :value_dim]  # [S_g, 1, value_dim]
-    kv_rope = kv[..., value_dim:]  # [S_g, 1, rope_dim]
-
-    # Cycled pad: -1 at column j -> position seq_g + (j % N_PAD). N_PAD zero
-    # rows so every cycled pad position indexes a real (zero) row. N_PAD=1
-    # reproduces the stock same-pad path.
-    n_pad = _N_PAD_ROWS
-    if n_pad <= 1:
-        pad_pos = torch.full_like(indices, seq_g)
-        n_pad_actual = 1
-    else:
-        slot = torch.arange(k_eff, device=dev, dtype=indices.dtype)
-        pad_pos = (seq_g + slot % n_pad).view(1, 1, k_eff).expand_as(indices)
-        n_pad_actual = n_pad
-    idx_real = torch.where(indices == -1, pad_pos, indices).to(torch.int32)
-    pad_rows = torch.zeros(n_pad_actual, 1, dim, device=dev, dtype=kv.dtype)
-    kv_nope_p = torch.cat([kv_nope, pad_rows[..., :value_dim]], dim=0)
-    kv_rope_p = torch.cat([kv_rope, pad_rows[..., value_dim:]], dim=0)
-
-    return {
-        "q_nope_b": q_nope.unsqueeze(0).contiguous(),  # [1, S, N, vd]
-        "q_rope_b": q_rope.unsqueeze(0).contiguous(),  # [1, S, N, rope]
-        "k_nope_b": kv_nope_p.unsqueeze(0).contiguous(),  # [1, S_g+N_PAD, 1, vd]
-        "k_rope_b": kv_rope_p.unsqueeze(0).contiguous(),  # [1, S_g+N_PAD, 1, rope]
-        "sp": idx_real.unsqueeze(0).contiguous(),  # [1, S, 1, K_eff]
-        "aql": torch.tensor([seq_len], device=dev, dtype=torch.int32),
-        "akl": torch.tensor([seq_g + n_pad_actual], device=dev, dtype=torch.int32),
-    }
-
-
-def _run_op(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    scale: float,
-    value_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the fused sparse-flash-attn forward (grad-enabled) on compact indices.
-
-    Grad-enabled so autograd registers the op's C++ backward (fast on compact
-    ``K_eff``). Returns the forward output and a detached softmax LSE.
-
-    Args:
-        q (Tensor): ``(S, N, value_dim + rope_dim)`` bf16.
-        kv (Tensor): ``(S_g, 1, value_dim + rope_dim)`` bf16.
-        indices (Tensor): ``(S, 1, K_eff)`` int64 (compacted).
-        scale (float): Resolved softmax scale.
-        value_dim (int): Absorbed output dim.
-
-    Returns:
-        tuple[Tensor, Tensor]: ``raw_output`` ``(S, N, value_dim)``;
-            ``softmax_lse`` ``(S, N)`` (detached).
-    """
-    import torch_npu
-
-    p = _prepare_bsnd(q, kv, indices, value_dim)
-    attn_out, softmax_max, softmax_sum = torch_npu.npu_sparse_flash_attention(
-        p["q_nope_b"],
-        p["k_nope_b"],
-        p["k_nope_b"],  # value = key_nope (absorbed MLA)
-        p["sp"],
-        scale_value=scale,
-        sparse_block_size=1,
-        actual_seq_lengths_query=p["aql"],
-        actual_seq_lengths_kv=p["akl"],
-        query_rope=p["q_rope_b"],
-        key_rope=p["k_rope_b"],
-        layout_query="BSND",
-        layout_kv="BSND",
-        sparse_mode=3,
-        attention_mode=2,
-        return_softmax_lse=True,
-    )
-    raw_output = attn_out.squeeze(0).contiguous()  # [S, N, value_dim]
-    # softmax_max/sum are [1, S, N]; collapse to [S, N]. Detached by the op.
-    lse = softmax_max + torch.log(softmax_sum.clamp(min=1e-30))
-    while lse.dim() > 2 and lse.shape[0] == 1:
-        lse = lse.squeeze(0)
-    return raw_output, lse.contiguous().detach()
 
 
 def npu_sparse_mla(
@@ -202,68 +36,298 @@ def npu_sparse_mla(
     indices: torch.Tensor,
     scaling: float | None,
     value_dim: int | None = None,
+    *,
+    seq_ctx=None,
 ) -> SparseMLAOutputs:
-    """Absorbed sparse MLA on Ascend NPU (fused C++ fwd + bwd).
-
-    Compacts the top-k indices to ``K_eff`` then runs
-    ``npu_sparse_flash_attention`` grad-enabled, so the forward and the
-    autograd C++ backward process only ~``K_eff`` real KV slots/query instead
-    of the full ``index_topk`` (2048). See the module docstring and
-    ``GLM-5p2_xtuner_training.md`` (13B-39/13B-40) for measured speedups, the
-    exactness/dilution analysis, and the N_PAD sweep.
+    """NPU fused sparse MLA attention.
 
     Args:
-        q (Tensor): ``(seq_len, num_heads, kv_lora + rope)`` bf16.
-        kv (Tensor): ``(seq_len_gathered, kv_group, kv_lora + rope)`` bf16.
-            ``kv_group`` must be 1 (GLM-5.2 absorbed MLA).
-        indices (Tensor): ``(seq_len, kv_group, topk)`` int64 with ``-1``
-            padding for invalid slots.
-        scaling (float | None): Softmax scale.
-        value_dim (int | None): Absorbed output dim (``kv_lora_rank``). Must be
-            512 for GLM-5.2.
+        q: Absorbed query ``[S, N, Rkv + Dr]``.
+        kv: Absorbed key-value ``[S_g, 1, Rkv + Dr]``.
+        indices: Top-k sparse indices ``[S, 1, K]``. ``-1`` marks invalid slots.
+        scaling: Softmax scale (typically ``qk_head_dim ** -0.5``).
+        value_dim: Value dimension (equals ``Rkv`` for absorbed MLA).
+        seq_ctx: SequenceContext for packed causal masking.
 
     Returns:
-        SparseMLAOutputs: ``raw_output`` ``(seq_len, num_heads, value_dim)``;
-            ``softmax_lse`` ``(seq_len, num_heads)`` (detached).
+        SparseMLAOutputs with ``raw_output`` ``[S, N, value_dim]`` and
+        ``softmax_lse`` ``[S, N]``.
     """
-    _, _, dim = q.shape
-    value_dim = value_dim if value_dim is not None else dim
-    if value_dim != 512:
-        raise ValueError(
-            f"torch_npu MLA op requires the absorbed (nope) dim to be 512, "
-            f"got {value_dim}"
+    seq_len, num_heads, q_dim = q.shape
+    kv_len = kv.shape[0]
+
+    if value_dim is None:
+        value_dim = q_dim
+        rope_dim = 0
+    else:
+        rope_dim = q_dim - value_dim
+
+    q_nope = q[..., :value_dim]       # [S, N, Rkv]
+    q_rope = q[..., value_dim:]       # [S, N, Dr]
+    kv_compressed = kv[..., :value_dim]  # [S_g, 1, Rkv]
+    k_rope = kv[..., value_dim:]      # [S_g, 1, Dr]
+
+    scale_value = float(scaling) if scaling is not None else (value_dim + rope_dim) ** -0.5
+
+    use_tnd = (
+        seq_ctx is not None
+        and getattr(seq_ctx, "cu_seq_lens_q", None) is not None
+        and seq_ctx.cu_seq_lens_q.numel() > 2
+    )
+
+    if use_tnd:
+        return _sparse_mla_tnd_packed(
+            q_nope, q_rope, kv_compressed, k_rope,
+            indices, seq_ctx, seq_len, kv_len, num_heads, scale_value,
         )
-    scale = float(scaling) if scaling is not None else dim**-0.5
+    return _sparse_mla_bsnd_single(
+        q_nope, q_rope, kv_compressed, k_rope,
+        indices, seq_len, kv_len, num_heads, scale_value,
+    )
 
-    compact, k_eff = _compact_indices(indices)
-    if k_eff == 0:
-        # Degenerate (all-padding) chunk: zero output, -inf LSE.
-        seq_len, num_heads, _ = q.shape
-        raw = q.new_zeros(seq_len, num_heads, value_dim)
-        lse = q.new_full((seq_len, num_heads), float("-inf"))
-        return SparseMLAOutputs(raw_output=raw, softmax_lse=lse)
 
-    if k_eff <= _K_EFF_SINGLE_MAX:
-        raw, lse = _run_op(q, kv, compact, scale, value_dim)
-        return SparseMLAOutputs(raw_output=raw, softmax_lse=lse)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    # Fat-tail fallback: chunk over the query dim so each op call sees a small
-    # per-chunk K_eff. Shared kv gradient accumulates across chunks via autograd.
-    seq_len = q.shape[0]
-    chunk = max(1, min(seq_len, 1024))
-    outs: list[torch.Tensor] = []
-    lses: list[torch.Tensor] = []
-    for c in range(0, seq_len, chunk):
-        q_c = q[c : c + chunk]
-        idx_c = indices[c : c + chunk]
-        compact_c, k_eff_c = _compact_indices(idx_c)
-        if k_eff_c == 0:
-            outs.append(q_c.new_zeros(q_c.shape[0], q_c.shape[1], value_dim))
-            lses.append(q_c.new_full((q_c.shape[0], q_c.shape[1]), float("-inf")))
+def _compute_prefix_extended_kv_slice(
+    cu_seq_q_global: torch.Tensor,
+    shard_start: int,
+    shard_end: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Compute prefix-extended KV slice range and local cu_seq_lens.
+
+    For each segment overlapping ``[shard_start, shard_end)``:
+      - Q overlap is clipped to ``[max(seg, shard_start), min(seg, shard_end)]``
+      - KV overlap starts from ``seg_start`` (includes prefix before shard_start)
+      - When ``seg_start < shard_start``, ``kv_start`` extends backward
+
+    Returns ``(cu_seq_q_local, cu_seq_k_local, kv_start, kv_end)``.
+    The two cu_seq tensors have the same segment count but possibly
+    different per-segment lengths (KV segments may be longer due to prefix).
+    """
+    seg_boundaries = cu_seq_q_global.tolist()
+    kv_start = shard_start
+    rank_cu_q = [0]
+    rank_cu_kv = [0]
+    cur_q = 0
+    cur_kv = 0
+
+    for i in range(1, len(seg_boundaries)):
+        seg_start = seg_boundaries[i - 1]
+        seg_end = seg_boundaries[i]
+        if seg_end <= shard_start:
             continue
-        raw_c, lse_c = _run_op(q_c, kv, compact_c, scale, value_dim)
-        outs.append(raw_c)
-        lses.append(lse_c)
-    raw_output = torch.cat(outs, dim=0).contiguous()
-    softmax_lse = torch.cat(lses, dim=0).contiguous()
+        if seg_start >= shard_end:
+            break
+
+        q_len = min(seg_end, shard_end) - max(seg_start, shard_start)
+        if q_len > 0:
+            cur_q += q_len
+            rank_cu_q.append(cur_q)
+
+        kv_len_seg = min(seg_end, shard_end) - seg_start
+        if kv_len_seg > 0:
+            cur_kv += kv_len_seg
+            rank_cu_kv.append(cur_kv)
+
+        if seg_start < shard_start:
+            kv_start = seg_start
+
+    kv_end = shard_end
+    cu_q = torch.tensor(rank_cu_q, dtype=torch.int32, device=device)
+    cu_kv = torch.tensor(rank_cu_kv, dtype=torch.int32, device=device)
+    return cu_q, cu_kv, kv_start, kv_end
+
+
+def _rewrite_invalid_indices(
+    indices: torch.Tensor,
+    shard_start: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Rewrite -1 (invalid) indices to query's own GLOBAL position.
+
+    ``sparse_mode=3`` kernel requires valid indices at training scale;
+    -1 causes aicore exception. The rewritten self-attention position
+    is always within causal range and segment boundaries.
+
+    ``self_pos`` must be GLOBAL (``arange(S) + shard_start``) for correct
+    global→local conversion downstream. Using local position causes V1
+    kernel backward NaN (sparse_mode=3 + multi-segment TND).
+    """
+    S = indices.shape[0]
+    self_pos = torch.arange(S, device=device, dtype=indices.dtype) + shard_start
+    return torch.where(
+        indices == -1,
+        self_pos.unsqueeze(1).unsqueeze(2).expand_as(indices),
+        indices,
+    ).to(torch.int32)
+
+
+def _global_to_local_indices(
+    sparse_indices: torch.Tensor,
+    cu_seq_q_local: torch.Tensor,
+    cu_seq_k_local: torch.Tensor,
+    kv_slice_offset: int,
+    seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Convert global indices to per-segment local indices for TND kernel.
+
+    ``sparse_flash_attention`` expects per-segment local indices (each
+    segment from 0). The reverse of ``_local_to_global_indices`` in
+    the indexer::
+
+        local = global - kv_seg_start - kv_slice_offset
+
+    ``kv_seg_start`` comes from ``cu_seq_k_local[:-1]`` (KV segment starts).
+    Segment membership is determined via ``cu_seq_q_local`` boundaries
+    (Q and KV have the same segment count).
+    """
+    kv_seg_starts = cu_seq_k_local[:-1]
+    q_positions = torch.arange(seq_len, device=device, dtype=torch.int32)
+    seg_idx = torch.searchsorted(cu_seq_q_local[1:], q_positions, right=True)
+    global_offsets = kv_seg_starts[seg_idx] + kv_slice_offset
+
+    local_indices = sparse_indices.squeeze(1).clone()
+    local_indices = local_indices - global_offsets.unsqueeze(1)
+    local_indices = local_indices.clamp(min=0)
+    return local_indices.unsqueeze(1).contiguous()
+
+
+# ---------------------------------------------------------------------------
+# Single-sequence path (BSND)
+# ---------------------------------------------------------------------------
+
+def _sparse_mla_bsnd_single(
+    q_nope, q_rope, kv_compressed, k_rope,
+    indices, seq_len, kv_len, num_heads, scale_value,
+) -> SparseMLAOutputs:
+    """Single-sequence: BSND layout, sparse_mode=3."""
+    device = q_nope.device
+
+    # Rewrite -1 to self-attention position
+    safe_indices = _rewrite_invalid_indices(indices, 0, device)
+
+    attn_outs = torch_npu.npu_sparse_flash_attention(
+        q_nope.unsqueeze(0).contiguous(),         # [1, S, N, Rkv]
+        kv_compressed.unsqueeze(0).contiguous(),  # [1, S_g, 1, Rkv]
+        kv_compressed.unsqueeze(0).contiguous(),  # value = key
+        sparse_indices=safe_indices.unsqueeze(0).contiguous(),
+        block_table=None,
+        actual_seq_lengths_query=torch.tensor([seq_len], dtype=torch.int32, device=device),
+        actual_seq_lengths_kv=torch.tensor([kv_len], dtype=torch.int32, device=device),
+        query_rope=q_rope.unsqueeze(0).contiguous(),
+        key_rope=k_rope.unsqueeze(0).contiguous(),
+        scale_value=scale_value,
+        sparse_block_size=1,
+        layout_query="BSND",
+        layout_kv="BSND",
+        sparse_mode=3,
+        attention_mode=2,
+        return_softmax_lse=True,
+    )
+    return _parse_attn_outs(attn_outs, seq_len, num_heads, device)
+
+
+# ---------------------------------------------------------------------------
+# Packed multi-sequence path (TND)
+# ---------------------------------------------------------------------------
+
+def _sparse_mla_tnd_packed(
+    q_nope, q_rope, kv_compressed, k_rope,
+    indices, seq_ctx, seq_len, kv_len, num_heads, scale_value,
+) -> SparseMLAOutputs:
+    """Packed multi-sequence: TND layout + cu_seq_lens.
+
+    SP=1: Full global KV, global cu_seq_lens.
+    SP>1: Prefix-extended KV slice with asymmetric cu_seq_q / cu_seq_kv.
+          KV slice ``[kv_start, kv_end)`` may extend before ``shard_start``
+          to include the full segment prefix (MindSpeed approach).
+    """
+    device = q_nope.device
+    shard_start = getattr(seq_ctx, '_shard_start', 0)
+
+    cu_seq_q_global = seq_ctx.cu_seq_lens_q.to(torch.int32).to(device)
+    is_sp1 = (shard_start == 0 and seq_len == cu_seq_q_global[-1].item())
+
+    if is_sp1:
+        # ── SP=1: full global KV ──
+        key_tnd = kv_compressed.contiguous()          # [T_g, 1, Rkv]
+        value_tnd = key_tnd
+        key_rope_tnd = k_rope.contiguous()            # [T_g, 1, Dr]
+        cu_seq_q_local = cu_seq_q_global
+        cu_seq_k_local = seq_ctx.cu_seq_lens_k.to(torch.int32).to(device)
+        kv_slice_offset = 0
+    else:
+        # ── SP>1: prefix-extended KV slice ──
+        shard_end = shard_start + seq_len
+        cu_seq_q_local, cu_seq_k_local, kv_start, kv_end = _compute_prefix_extended_kv_slice(
+            cu_seq_q_global, shard_start, shard_end, device,
+        )
+        key_tnd = kv_compressed[kv_start:kv_end].contiguous()
+        value_tnd = key_tnd
+        key_rope_tnd = k_rope[kv_start:kv_end].contiguous()
+        kv_slice_offset = kv_start
+
+    # TND tensors (no batch dim)
+    query_tnd = q_nope.contiguous()                   # [S, N, Rkv]
+    query_rope_tnd = q_rope.contiguous()              # [S, N, Dr]
+
+    # Rewrite -1 → global self position (sparse_mode=3 requires valid indices)
+    sparse_indices = _rewrite_invalid_indices(indices, shard_start, device)
+
+    # Convert global indices → per-segment local for TND kernel
+    sparse_indices_tnd = _global_to_local_indices(
+        sparse_indices, cu_seq_q_local, cu_seq_k_local,
+        kv_slice_offset, seq_len, device,
+    )
+
+    attn_outs = torch_npu.npu_sparse_flash_attention(
+        query_tnd, key_tnd, value_tnd,
+        sparse_indices=sparse_indices_tnd,
+        block_table=None,
+        actual_seq_lengths_query=cu_seq_q_local,
+        actual_seq_lengths_kv=cu_seq_k_local,
+        query_rope=query_rope_tnd,
+        key_rope=key_rope_tnd,
+        scale_value=scale_value,
+        sparse_block_size=1,
+        layout_query="TND",
+        layout_kv="TND",
+        sparse_mode=3,
+        attention_mode=2,
+        return_softmax_lse=True,
+    )
+    return _parse_attn_outs(attn_outs, seq_len, num_heads, device)
+
+
+# ---------------------------------------------------------------------------
+# Output parsing
+# ---------------------------------------------------------------------------
+
+def _parse_attn_outs(attn_outs, seq_len: int, num_heads: int, device: torch.device) -> SparseMLAOutputs:
+    """Parse ``npu_sparse_flash_attention`` outputs into SparseMLAOutputs."""
+    if isinstance(attn_outs, torch.Tensor):
+        attn_output = attn_outs.contiguous()
+        softmax_lse = None
+    else:
+        attn_output = attn_outs[0].contiguous()
+        softmax_max = attn_outs[1] if len(attn_outs) > 1 else None
+        softmax_sum = attn_outs[2] if len(attn_outs) > 2 else None
+        if softmax_sum is not None and softmax_max is not None:
+            lse = softmax_max.float() + torch.log(softmax_sum.float() + 1e-30)
+            while lse.dim() > 2:
+                lse = lse.squeeze(0)
+            softmax_lse = lse[:seq_len, :num_heads].contiguous()
+        else:
+            softmax_lse = None
+
+    # [1, S, N, Rkv] (BSND) or [S, N, Rkv] (TND)
+    raw_output = attn_output.squeeze(0) if attn_output.dim() == 4 else attn_output
+
+    if softmax_lse is None:
+        softmax_lse = torch.zeros(seq_len, num_heads, device=device, dtype=torch.float32)
+
     return SparseMLAOutputs(raw_output=raw_output, softmax_lse=softmax_lse)

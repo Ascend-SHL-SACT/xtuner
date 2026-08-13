@@ -186,7 +186,7 @@ class DSAMLAConfig(MLAConfig):
         generate_config: GenerateConfig | None = None,
         float8_cfg: Float8Config | None = None,
     ) -> "DSAMultiLatentAttention":
-        if self.sparse_mla_backend in ("tilelang", "cudnn_dsa", "torch_npu"):
+        if self.sparse_mla_backend in ("tilelang", "cudnn_dsa"):
             ensure_tilelang_runtime_available()
         if self.sparse_mla_backend == "cudnn_dsa":
             ensure_cudnn_dsa_runtime_available()
@@ -372,6 +372,7 @@ class DSAMultiLatentAttention(MultiLatentAttention):
             topk_indices,
             self.softmax_scale,
             value_dim=self.kv_lora_rank,
+            seq_ctx=seq_ctx,
         )
         # raw_output: [S, N, Rkv]; softmax_lse: [S, N]
         raw_output = sparse_mla_outputs.raw_output

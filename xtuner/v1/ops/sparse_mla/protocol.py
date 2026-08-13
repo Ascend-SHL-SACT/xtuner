@@ -31,6 +31,8 @@ class SparseMLAProtocol(Protocol):
         indices: torch.Tensor,
         scaling: float | None,
         value_dim: int | None = None,
+        *,
+        seq_ctx: SequenceContext | None = None,
     ) -> SparseMLAOutputs: ...
 
 
