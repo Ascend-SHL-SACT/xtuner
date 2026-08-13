@@ -29,7 +29,7 @@ import pytest
 import torch
 import torch_npu
 
-sys.path.insert(0, "/weight/jschen/code/xtuner")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "1")
 
 from xtuner.v1.data_proto import SequenceContext
@@ -214,9 +214,9 @@ class TestNPUDSATopKIndices:
         q, k, weights, seq_ctx = _make_inputs(seq_lens, num_index_heads=4, head_dim=INDEX_HEAD_DIM, device=DEVICE)
 
         ref = dsa_topk_indices(q, k, weights, seq_ctx,
-                               index_head_dim=INDEX_HEAD_DIM, index_topk=topk, backend="torch")
+                               index_head_dim=INDEX_HEAD_DIM, index_topk=topk, backend="torch").to(torch.int64)
         npu = dsa_topk_indices(q, k, weights, seq_ctx,
-                               index_head_dim=INDEX_HEAD_DIM, index_topk=topk, backend="npu")
+                               index_head_dim=INDEX_HEAD_DIM, index_topk=topk, backend="npu").to(torch.int64)
 
         assert ref.shape == npu.shape, f"shape mismatch: {ref.shape} vs {npu.shape}"
         assert ref.dtype == npu.dtype, f"dtype mismatch: {ref.dtype} vs {npu.dtype}"

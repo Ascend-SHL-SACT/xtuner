@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch_npu
 
-sys.path.insert(0, "/weight/jschen/code/xtuner")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "1")
 
 from xtuner.v1.data_proto import SequenceContext
@@ -137,11 +137,19 @@ class TestIndexerGradientFinite:
         assert torch.isfinite(indices).all(), "indices contain NaN/Inf"
 
     def test_indexer_backward_finite_packed_sp1(self):
-        """packed 多序列 + SP=1: indexer 端到端反向梯度有限。
+        """packed 多序列 + SP=1: indexer 端到端反向梯度有限 + 与 torch 基线对比。
 
         dsa_topk_indices 返回 int64 indices (不可微), 但 q/k/weights
         在真实模型中通过共享参数参与反向。这里通过 sparse_mla 的反向
         间接验证 indexer 选出的 indices 不会导致梯度爆炸。
+
+        对比方式: 使用 NPU indexer 产生的 indices, 分别跑 NPU 和 torch
+        sparse_mla backward, 只对比 sparse_mla 的精度差异 (排除 indexer
+        indices 选择差异的干扰)。
+
+        阈值对齐 tilelang 后端测试 (test_dsa_mla.py):
+          - q_grad:  BF16_ATOL=1e-2, BF16_RTOL=1.6e-2
+          - kv_grad: DKV_ATOL=5e-2,  DKV_RTOL=5e-2
         """
         seq_lens = [128, 128]
         topk = 128
@@ -153,6 +161,7 @@ class TestIndexerGradientFinite:
         w_idx = torch.randn(1, total, 4, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
         seq_ctx = _make_seq_ctx(seq_lens, DEVICE)
 
+        # 使用 NPU indexer 产生的 indices (两后端共用, 排除 indexer 差异)
         indices = dsa_topk_indices(q_idx, k_idx, w_idx, seq_ctx,
                                    index_head_dim=INDEX_HEAD_DIM, index_topk=topk, backend="npu")
         _sync()
@@ -160,19 +169,29 @@ class TestIndexerGradientFinite:
         # sparse_mla: q=[S,N,D], kv=[S_g,1,D], indices=[S,1,K]
         q = torch.randn(total, 8, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
         kv = torch.randn(total, 1, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
+        q_ref = q.detach().clone().requires_grad_(True)
+        kv_ref = kv.detach().clone().requires_grad_(True)
 
-        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu")
+        # NPU backward
+        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
         out.raw_output.sum().backward()
         _sync()
 
         assert torch.isfinite(q.grad).all(), "q.grad has NaN/Inf"
         assert torch.isfinite(kv.grad).all(), "kv.grad has NaN/Inf"
-        print(f"  q_grad max={q.grad.abs().max().item():.4f}", flush=True)
-        assert q.grad.abs().max().item() < GRAD_MAX_THRESHOLD, \
-            f"q.grad too large: {q.grad.abs().max().item()}"
-        print(f"  kv_grad max={kv.grad.abs().max().item():.4f}", flush=True)
-        assert kv.grad.abs().max().item() < GRAD_MAX_THRESHOLD, \
-            f"kv.grad too large: {kv.grad.abs().max().item()}"
+
+        # torch 基线: 相同 q/kv 和相同 indices, torch 后端
+        out_ref = sparse_mla(q_ref, kv_ref, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
+        out_ref.raw_output.sum().backward()
+
+        print(f"  q_grad max={q.grad.abs().max().item():.4f} (ref={q_ref.grad.abs().max().item():.4f})", flush=True)
+        print(f"  kv_grad max={kv.grad.abs().max().item():.4f} (ref={kv_ref.grad.abs().max().item():.4f})", flush=True)
+
+        # 梯度精度: 对齐 tilelang 后端阈值 (test_dsa_mla.py)
+        #   q_grad:  BF16_ATOL=1e-2, BF16_RTOL=1.6e-2
+        #   kv_grad: DKV_ATOL=5e-2,  DKV_RTOL=5e-2
+        torch.testing.assert_close(q.grad, q_ref.grad, atol=BF16_ATOL, rtol=BF16_RTOL)
+        torch.testing.assert_close(kv.grad, kv_ref.grad, atol=DKV_ATOL, rtol=DKV_RTOL)
 
 
 # ── 2. sparse_mla 反向梯度有限性 ──────────────────────────────────────────
@@ -203,7 +222,7 @@ class TestSparseMLAGradientFinite:
         q = torch.randn(total, 8, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
         kv = torch.randn(total, 1, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
 
-        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu")
+        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
         out.raw_output.sum().backward()
         _sync()
 
@@ -237,7 +256,7 @@ class TestSparseMLAGradientFinite:
         q = torch.randn(total, 8, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
         kv = torch.randn(total, 1, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
 
-        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu")
+        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
         out.raw_output.sum().backward()
         _sync()
 
@@ -269,7 +288,7 @@ class TestSparseMLAGradientFinite:
         q = torch.randn(shard_size, 8, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
         kv = torch.randn(total, 1, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
 
-        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu")
+        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
         out.raw_output.sum().backward()
         _sync()
 
@@ -305,7 +324,7 @@ class TestSparseMLAGradientFinite:
         q = torch.randn(shard_size, 8, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
         kv = torch.randn(total, 1, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
 
-        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu")
+        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
         out.raw_output.sum().backward()
         _sync()
 
@@ -335,7 +354,7 @@ class TestSparseMLAGradientFinite:
         q = torch.randn(total, 8, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
         kv = torch.randn(total, 1, DIM, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
 
-        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu")
+        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
         out.raw_output.sum().backward()
         _sync()
 
@@ -359,8 +378,13 @@ class TestEndToEndGradientConsistency:
         """packed 多序列 + SP=1: NPU 端到端梯度有限 (不爆炸)。
 
         CANN 9.0 的 aclnnSparseFlashAttentionGrad 在 packed 场景下
-        与 torch 基线有量级差异 (非爆炸), 检查有限性和量级上限。
-        同时与 torch 基线对比 relative error 和 cosine similarity。
+        与 torch 基线有量级差异 (非爆炸), 检查有限性。
+        使用 NPU indexer 产生的 indices, 分别跑 NPU 和 torch sparse_mla backward,
+        只对比 sparse_mla 的精度差异 (排除 indexer indices 选择差异的干扰)。
+
+        阈值对齐 tilelang 后端测试 (test_dsa_mla.py):
+          - q_grad:  BF16_ATOL=1e-2, BF16_RTOL=1.6e-2
+          - kv_grad: DKV_ATOL=5e-2,  DKV_RTOL=5e-2
         """
         seq_lens = [128, 128]
         topk = 128
@@ -373,41 +397,34 @@ class TestEndToEndGradientConsistency:
         w_idx = torch.randn(1, total, 4, dtype=dtype, device=DEVICE)
         seq_ctx = _make_seq_ctx(seq_lens, DEVICE)
 
-        # torch 基线
-        q_ref = torch.randn(total, 8, DIM, dtype=dtype, device=DEVICE, requires_grad=True)
-        kv_ref = torch.randn(total, 1, DIM, dtype=dtype, device=DEVICE, requires_grad=True)
-        indices_ref = dsa_topk_indices(q_idx, k_idx, w_idx, seq_ctx,
-                                       index_head_dim=INDEX_HEAD_DIM, index_topk=topk, backend="torch")
-        out_ref = sparse_mla(q_ref, kv_ref, indices_ref, scaling=SCALING, value_dim=VALUE_DIM, backend="torch")
+        # 使用 NPU indexer 产生的 indices (两后端共用, 排除 indexer 差异)
+        indices = dsa_topk_indices(q_idx, k_idx, w_idx, seq_ctx,
+                                   index_head_dim=INDEX_HEAD_DIM, index_topk=topk, backend="npu")
+        _sync()
+
+        q = torch.randn(total, 8, DIM, dtype=dtype, device=DEVICE, requires_grad=True)
+        kv = torch.randn(total, 1, DIM, dtype=dtype, device=DEVICE, requires_grad=True)
+
+        # NPU backward
+        out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
+        out.raw_output.sum().backward()
+        _sync()
+
+        assert torch.isfinite(q.grad).all(), "q.grad has NaN/Inf"
+        assert torch.isfinite(kv.grad).all(), "kv.grad has NaN/Inf"
+
+        # torch 基线: 相同 q/kv 和相同 indices
+        q_ref = q.detach().clone().requires_grad_(True)
+        kv_ref = kv.detach().clone().requires_grad_(True)
+        out_ref = sparse_mla(q_ref, kv_ref, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
         out_ref.raw_output.sum().backward()
-        _sync()
 
-        # NPU
-        q_npu = torch.randn(total, 8, DIM, dtype=dtype, device=DEVICE, requires_grad=True)
-        kv_npu = torch.randn(total, 1, DIM, dtype=dtype, device=DEVICE, requires_grad=True)
-        indices_npu = dsa_topk_indices(q_idx, k_idx, w_idx, seq_ctx,
-                                       index_head_dim=INDEX_HEAD_DIM, index_topk=topk, backend="npu")
-        out_npu = sparse_mla(q_npu, kv_npu, indices_npu, scaling=SCALING, value_dim=VALUE_DIM, backend="npu")
-        out_npu.raw_output.sum().backward()
-        _sync()
+        print(f"  q_grad max={q.grad.abs().max().item():.4f} (ref={q_ref.grad.abs().max().item():.4f})", flush=True)
+        print(f"  kv_grad max={kv.grad.abs().max().item():.4f} (ref={kv_ref.grad.abs().max().item():.4f})", flush=True)
 
-        assert torch.isfinite(q_npu.grad).all(), "q.grad has NaN/Inf"
-        assert torch.isfinite(kv_npu.grad).all(), "kv.grad has NaN/Inf"
-        assert q_npu.grad.abs().max().item() < GRAD_MAX_THRESHOLD, \
-            f"q.grad too large: {q_npu.grad.abs().max().item()}"
-        assert kv_npu.grad.abs().max().item() < GRAD_MAX_KV_THRESHOLD, \
-            f"kv.grad too large: {kv_npu.grad.abs().max().item()}"
-        # 与 torch 基线对比
-        _kv_rel = (kv_npu.grad.float() - kv_ref.grad.float()).norm() / kv_ref.grad.float().norm().clamp_min(1e-12)
-        _kv_cos = torch.nn.functional.cosine_similarity(
-            kv_npu.grad.float().flatten(), kv_ref.grad.float().flatten(), dim=0)
-        print(f"  e2e: q_grad_max={q_npu.grad.abs().max().item():.4f} (ref={q_ref.grad.abs().max().item():.4f}), "
-              f"kv_grad_max={kv_npu.grad.abs().max().item():.4f} (ref={kv_ref.grad.abs().max().item():.4f}), "
-              f"kv_rel_err={_kv_rel.item():.4f}, kv_cos={_kv_cos.item():.6f}", flush=True)
-        assert _kv_rel.item() < GRAD_RELATIVE_ERROR_THRESHOLD, \
-            f"kv_grad relative error too large: {_kv_rel.item():.4f} (CANN known issue check)"
-        assert _kv_cos.item() > GRAD_COSINE_SIM_THRESHOLD, \
-            f"kv_grad cosine similarity too low: {_kv_cos.item():.6f}"
+        # 梯度精度: 对齐 tilelang 后端阈值
+        torch.testing.assert_close(q.grad, q_ref.grad, atol=BF16_ATOL, rtol=BF16_RTOL)
+        torch.testing.assert_close(kv.grad, kv_ref.grad, atol=DKV_ATOL, rtol=DKV_RTOL)
 
 
 # ── 4. SP8 梯度测试 (复现训练配置 EP8SP8PACK16K) ──────────────────────────
@@ -447,7 +464,7 @@ class TestSP8GradientConsistency:
             q_idx, k_idx, w_idx, seq_ctx, q, kv, ss, sz, total = self._make_sp8_inputs(rank)
             indices = dsa_topk_indices(q_idx, k_idx, w_idx, seq_ctx,
                                        index_head_dim=INDEX_HEAD_DIM, index_topk=self.TOPK, backend="npu")
-            out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu")
+            out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
             out.raw_output.sum().backward()
             _sync()
 
@@ -465,41 +482,34 @@ class TestSP8GradientConsistency:
         for rank in [0, 3, 7]:
             q_idx, k_idx, w_idx, seq_ctx, q, kv, ss, sz, total = self._make_sp8_inputs(rank)
 
-            # torch 基线
-            indices_ref = dsa_topk_indices(q_idx, k_idx, w_idx, seq_ctx,
-                                           index_head_dim=INDEX_HEAD_DIM, index_topk=self.TOPK, backend="torch")
-            q_ref = q.detach().clone().requires_grad_(True)
-            kv_ref = kv.detach().clone().requires_grad_(True)
-            out_ref = sparse_mla(q_ref, kv_ref, indices_ref, scaling=SCALING, value_dim=VALUE_DIM, backend="torch")
-            out_ref.raw_output.sum().backward()
+            # 使用 NPU indexer 产生的 indices (两后端共用, 排除 indexer 差异)
+            indices = dsa_topk_indices(q_idx, k_idx, w_idx, seq_ctx,
+                                       index_head_dim=INDEX_HEAD_DIM, index_topk=self.TOPK, backend="npu")
             _sync()
 
-            # NPU
-            indices_npu = dsa_topk_indices(q_idx, k_idx, w_idx, seq_ctx,
-                                           index_head_dim=INDEX_HEAD_DIM, index_topk=self.TOPK, backend="npu")
+            # NPU backward
             q_npu = q.detach().clone().requires_grad_(True)
             kv_npu = kv.detach().clone().requires_grad_(True)
-            out_npu = sparse_mla(q_npu, kv_npu, indices_npu, scaling=SCALING, value_dim=VALUE_DIM, backend="npu")
+            out_npu = sparse_mla(q_npu, kv_npu, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
             out_npu.raw_output.sum().backward()
             _sync()
 
-            _q_rel = (q_npu.grad.float() - q_ref.grad.float()).norm() / q_ref.grad.float().norm().clamp_min(1e-12)
-            _q_cos = torch.nn.functional.cosine_similarity(
-                q_npu.grad.float().flatten(), q_ref.grad.float().flatten(), dim=0)
-            _kv_rel = (kv_npu.grad.float() - kv_ref.grad.float()).norm() / kv_ref.grad.float().norm().clamp_min(1e-12)
-            _kv_cos = torch.nn.functional.cosine_similarity(
-                kv_npu.grad.float().flatten(), kv_ref.grad.float().flatten(), dim=0)
-            print(f"  [SP8 rank{rank}] q_grad: rel_err={_q_rel.item():.4f}, cos={_q_cos.item():.6f} | "
-                  f"kv_grad: rel_err={_kv_rel.item():.4f}, cos={_kv_cos.item():.6f}", flush=True)
+            assert torch.isfinite(q_npu.grad).all(), f"SP8 rank{rank}: q.grad has NaN/Inf"
+            assert torch.isfinite(kv_npu.grad).all(), f"SP8 rank{rank}: kv.grad has NaN/Inf"
 
-            assert _q_rel.item() < GRAD_RELATIVE_ERROR_THRESHOLD, \
-                f"SP8 rank{rank}: q_grad rel_err={_q_rel.item():.4f}"
-            assert _q_cos.item() > GRAD_COSINE_SIM_THRESHOLD, \
-                f"SP8 rank{rank}: q_grad cos={_q_cos.item():.6f}"
-            assert _kv_rel.item() < GRAD_RELATIVE_ERROR_THRESHOLD, \
-                f"SP8 rank{rank}: kv_grad rel_err={_kv_rel.item():.4f}"
-            assert _kv_cos.item() > GRAD_COSINE_SIM_THRESHOLD, \
-                f"SP8 rank{rank}: kv_grad cos={_kv_cos.item():.6f}"
+            # torch 基线: 相同 q/kv 和相同 indices
+            q_ref = q.detach().clone().requires_grad_(True)
+            kv_ref = kv.detach().clone().requires_grad_(True)
+            out_ref = sparse_mla(q_ref, kv_ref, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
+            out_ref.raw_output.sum().backward()
+            _sync()
+
+            print(f"  [SP8 rank{rank}] q_grad max={q_npu.grad.abs().max().item():.4f} (ref={q_ref.grad.abs().max().item():.4f}) | "
+                  f"kv_grad max={kv_npu.grad.abs().max().item():.4f} (ref={kv_ref.grad.abs().max().item():.4f})", flush=True)
+
+            # 梯度精度: 对齐 tilelang 后端阈值
+            torch.testing.assert_close(q_npu.grad, q_ref.grad, atol=BF16_ATOL, rtol=BF16_RTOL)
+            torch.testing.assert_close(kv_npu.grad, kv_ref.grad, atol=DKV_ATOL, rtol=DKV_RTOL)
 
     @pytest.mark.slow
     def test_sp8_large_grad_finite(self):
@@ -511,7 +521,7 @@ class TestSP8GradientConsistency:
                 rank, seq_lens=seq_lens, topk=topk)
             indices = dsa_topk_indices(q_idx, k_idx, w_idx, seq_ctx,
                                        index_head_dim=INDEX_HEAD_DIM, index_topk=topk, backend="npu")
-            out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu")
+            out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
             out.raw_output.sum().backward()
             _sync()
 
@@ -621,8 +631,14 @@ class TestSP8TrainScaleRepro:
 
             # 训练规模下, torch 应该能选到 shard 之外的 KV (全局 topk)
             # NPU 如果只能选 shard 内的, 说明 BUG-A 仍然存在
-            assert ref_out_shard > 0, \
-                f"rank{rank}: torch baseline should select KV outside shard, got 0"
+            # rank0 的 shard_start=0, causal 范围全在 shard 内, out_shard 必为 0
+            if rank > 0:
+                assert ref_out_shard > 0, \
+                    f"rank{rank}: torch baseline should select KV outside shard, got 0"
+            assert npu_out_shard == ref_out_shard, \
+                f"rank{rank}: npu out_shard={npu_out_shard} != ref out_shard={ref_out_shard}"
+            assert match_rate >= 99.0, \
+                f"rank{rank}: match_rate={match_rate:.1f}% < 99%"
 
     def test_sp8_trainscale_grad_explosion(self):
         """训练规模: 复现梯度爆炸 (grad_norm >> torch 基线)."""
@@ -636,7 +652,7 @@ class TestSP8TrainScaleRepro:
             q_ref = q.detach().clone().requires_grad_(True)
             kv_ref = kv.detach().clone().requires_grad_(True)
             out_ref = sparse_mla(q_ref, kv_ref, indices_ref, scaling=SCALING,
-                                 value_dim=VALUE_DIM, backend="torch")
+                                 value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
             out_ref.raw_output.sum().backward()
             _sync()
 
@@ -687,7 +703,7 @@ class TestSP8TrainScaleRepro:
                                            index_head_dim=self.TRAIN_INDEX_DIM,
                                            index_topk=self.TRAIN_TOPK, backend="torch")
             ref_out = sparse_mla(q, kv, indices_ref, scaling=SCALING,
-                                 value_dim=VALUE_DIM, backend="torch")
+                                 value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
 
             # NPU
             indices_npu = dsa_topk_indices(q_idx, k_idx, w_idx, seq_ctx,

@@ -359,7 +359,7 @@ class TestNPUSparseMLAPackedTND:
         # torch 基线
         q_ref = q.detach().clone().requires_grad_(True)
         kv_ref = kv.detach().clone().requires_grad_(True)
-        ref_out = sparse_mla(q_ref, kv_ref, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="torch")
+        ref_out = sparse_mla(q_ref, kv_ref, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
         grad_output = torch.randn_like(ref_out.raw_output)
         ref_out.raw_output.backward(grad_output)
         _sync()
@@ -417,7 +417,7 @@ class TestNPUSparseMLAPackedTND:
         q, kv, indices, seq_ctx = _make_packed_inputs(seq_lens, num_heads=8, topk=32)
 
         # torch 基线
-        ref_out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="torch")
+        ref_out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
         # NPU TND
         npu_out = sparse_mla(q, kv, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
         _sync()
@@ -445,7 +445,7 @@ class TestNPUSparseMLAPackedTND:
         # torch 基线
         q_ref = q.detach().clone().requires_grad_(True)
         kv_ref = kv.detach().clone().requires_grad_(True)
-        ref_out = sparse_mla(q_ref, kv_ref, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="torch")
+        ref_out = sparse_mla(q_ref, kv_ref, indices, scaling=SCALING, value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
         grad_output = torch.randn_like(ref_out.raw_output)
         ref_out.raw_output.backward(grad_output)
         _sync()
@@ -552,7 +552,7 @@ class TestNPUDSAAttention:
             torch.randn(1, total, 64, device=device, dtype=torch.bfloat16) * 0.01,
             torch.randn(1, total, 64, device=device, dtype=torch.bfloat16) * 0.01,
         )
-        cu = torch.tensor([0] + list(seq_lens), dtype=torch.int32, device=device)
+        cu = torch.cumsum(torch.tensor([0] + list(seq_lens), dtype=torch.int32, device=device), 0).to(torch.int32)
         seq_ctx = SequenceContext(
             input_ids=torch.arange(total, device=device).unsqueeze(0).long(),
             cu_seq_lens_q=cu, cu_seq_lens_k=cu,
@@ -594,7 +594,7 @@ class TestNPUDSAAttention:
             torch.randn(1, total, 64, device=device, dtype=torch.bfloat16) * 0.01,
             torch.randn(1, total, 64, device=device, dtype=torch.bfloat16) * 0.01,
         )
-        cu = torch.tensor([0] + list(seq_lens), dtype=torch.int32, device=device)
+        cu = torch.cumsum(torch.tensor([0] + list(seq_lens), dtype=torch.int32, device=device), 0).to(torch.int32)
         seq_ctx = SequenceContext(
             input_ids=torch.arange(total, device=device).unsqueeze(0).long(),
             cu_seq_lens_q=cu, cu_seq_lens_k=cu,
@@ -640,7 +640,7 @@ class TestNPUDSAAttention:
         )
         # Source and shared share the same seq_ctx so that shared layer
         # can read source layer's top-k from the cache.
-        cu = torch.tensor([0] + list(seq_lens), dtype=torch.int32, device=device)
+        cu = torch.cumsum(torch.tensor([0] + list(seq_lens), dtype=torch.int32, device=device), 0).to(torch.int32)
         seq_ctx = SequenceContext(
             input_ids=torch.arange(total, device=device).unsqueeze(0).long(),
             cu_seq_lens_q=cu, cu_seq_lens_k=cu,
@@ -706,7 +706,7 @@ class TestNPUDSASequenceParallel:
             torch.randn(total, 1, 64, device=device, dtype=torch.bfloat16) * 0.01,
             torch.randn(total, 1, 64, device=device, dtype=torch.bfloat16) * 0.01,
         )
-        cu = torch.tensor([0] + list(seq_lens), dtype=torch.int32, device=device)
+        cu = torch.cumsum(torch.tensor([0] + list(seq_lens), dtype=torch.int32, device=device), 0).to(torch.int32)
         seq_ctx = SequenceContext(
             input_ids=torch.arange(total, device=device).unsqueeze(0).long(),
             cu_seq_lens_q=cu, cu_seq_lens_k=cu,
@@ -784,7 +784,7 @@ class TestNPUSparseMLASP8PackedTND:
             local_indices = indices[ss:ss+sz]
 
             expected = sparse_mla(local_q, kv, local_indices, scaling=SCALING,
-                                  value_dim=VALUE_DIM, backend="torch")
+                                  value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
             actual = sparse_mla(local_q, kv, local_indices, scaling=SCALING,
                                 value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
             _sync()
@@ -808,7 +808,7 @@ class TestNPUSparseMLASP8PackedTND:
             q_ref = local_q.detach().clone().requires_grad_(True)
             kv_ref = kv.detach().clone().requires_grad_(True)
             ref_out = sparse_mla(q_ref, kv_ref, local_indices, scaling=SCALING,
-                                 value_dim=VALUE_DIM, backend="torch")
+                                 value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
             grad_output = torch.randn_like(ref_out.raw_output)
             ref_out.raw_output.backward(grad_output)
             _sync()
@@ -847,7 +847,7 @@ class TestNPUSparseMLASP8PackedTND:
             local_indices = indices[ss:ss+sz]
 
             ref_out = sparse_mla(local_q, kv, local_indices, scaling=SCALING,
-                                 value_dim=VALUE_DIM, backend="torch")
+                                 value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
             npu_out = sparse_mla(local_q, kv, local_indices, scaling=SCALING,
                                 value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
             _sync()
@@ -869,7 +869,7 @@ class TestNPUSparseMLASP8PackedTND:
             local_indices = indices[ss:ss+sz]
 
             expected = sparse_mla(local_q, kv, local_indices, scaling=SCALING,
-                                  value_dim=VALUE_DIM, backend="torch")
+                                  value_dim=VALUE_DIM, backend="torch", seq_ctx=seq_ctx)
             actual = sparse_mla(local_q, kv, local_indices, scaling=SCALING,
                                 value_dim=VALUE_DIM, backend="npu", seq_ctx=seq_ctx)
             _sync()
