@@ -414,6 +414,13 @@ class MoEDecoderLayer(nn.Module):
             pad_hidden_states = origin_hidden_states[:, pad_indices,:]
         origin_shape = hidden_states.shape
 
+        # With shared_overlap, issue the dispatch all-to-all asynchronously on
+        # the comm stream and overlap the independent shared-experts GEMM
+        # (default stream) with it before waiting for the dispatch result.
+        shared_overlap = self.shared_overlap and self.n_shared_experts > 0
+        async_op = bool(shared_overlap)
+        shared_experts_out: torch.Tensor | None = None
+
         # reshape hidden_states to (batch_size * seq_len, hidden_size)
         # ProberList.before_dispatch(
         #     self.layer_idx, hidden_states, router_results["topk_ids"], router_results["topk_weights"]
@@ -421,15 +428,23 @@ class MoEDecoderLayer(nn.Module):
         pre_dispatched = self.dispatcher.dispatch_preprocess(
             hidden_states=hidden_states.view(-1, hidden_states.shape[-1]),
             topk_ids=router_results["topk_ids"] if not skip_pad_tokens else router_results["topk_ids"][nonpad_indices, :],
+            async_op=async_op,
         )
         dispatched = self.dispatcher.dispatch(
             pre_dispatched=pre_dispatched,
             topk_weights=router_results["topk_weights"] if not skip_pad_tokens else router_results["topk_weights"][nonpad_indices, :],
             decoding=False,
+            async_op=async_op,
         )  # type: ignore[call-overload]
+        if shared_overlap:
+            # Overlap the shared-experts GEMM (default stream) with the dispatch
+            # all-to-all (comm stream). Shared input is the attention output
+            # (hidden_states), independent of the routed tokens.
+            shared_experts_out = self._shared_experts_forward(hidden_states=hidden_states)
         post_dispatched = self.dispatcher.dispatch_postprocess(
             pre_dispatched=pre_dispatched,
             dispatched=dispatched,
+            async_op=async_op,
         )
         # ProberList.after_dispatch(
         #     self.layer_idx,
@@ -479,10 +494,8 @@ class MoEDecoderLayer(nn.Module):
 
         # ProberList.after_combine(self.layer_idx, combined_hidden_states)
 
-        if self.n_shared_experts > 0:
+        if self.n_shared_experts > 0 and not shared_overlap:
             shared_experts_out = self._shared_experts_forward(hidden_states=hidden_states)
-        else:
-            shared_experts_out = None
 
         hidden_states = self._post_moe_forward(
             combined_hidden_states=combined_hidden_states,
