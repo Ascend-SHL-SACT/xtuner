@@ -23,6 +23,7 @@
 
 
 import math
+import os
 from collections import defaultdict
 from itertools import chain, product
 from typing import Callable, Generator, Iterator, Literal, Sequence, cast, overload
@@ -310,6 +311,22 @@ class Muon(Optimizer):
             raise ValueError(f"Invalid remainder_strategy: {remainder_strategy!r}; expected 'agrs' or 'pad_all2all'.")
         if not enable_all2all and remainder_strategy == "pad_all2all":
             raise ValueError("remainder_strategy='pad_all2all' requires enable_all2all=True.")
+
+        # XTUNER_MUON_REMAINDER_STRATEGY: env override for the comm strategy of
+        # remainder batches (param batches smaller than the ortho world size).
+        # "agrs" (default) all-gathers a W*R buffer (fast but memory-heavy);
+        # "pad_all2all" zero-pads the batch to world size and routes it through
+        # the memory-efficient all-to-all path full batches already use. Needed
+        # when the AGRS W*R all-gather exceeds device memory (large params).
+        _rs_env = os.environ.get("XTUNER_MUON_REMAINDER_STRATEGY")
+        if _rs_env is not None:
+            if _rs_env not in ("agrs", "pad_all2all"):
+                raise ValueError(
+                    f"Invalid XTUNER_MUON_REMAINDER_STRATEGY: {_rs_env!r}; expected 'agrs' or 'pad_all2all'."
+                )
+            if _rs_env == "pad_all2all" and not enable_all2all:
+                raise ValueError("XTUNER_MUON_REMAINDER_STRATEGY=pad_all2all requires enable_all2all=True.")
+            remainder_strategy = cast(Literal["agrs", "pad_all2all"], _rs_env)
 
         # Default arguments for each param group
         defaults = dict(
