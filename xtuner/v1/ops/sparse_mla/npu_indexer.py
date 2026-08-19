@@ -164,12 +164,12 @@ def _apply_packed_causal_mask(
     (query at global position ``p`` can only attend to ``[seg_start, p+1)``).
     """
     starts, ends = seq_ctx.packed_causal_query_ranges(query_len, device)
-    cols = torch.arange(kv_len, device=device)[None, :]
-    packed_mask = (cols >= starts[:, None]) & (cols < ends[:, None])
-
     safe = topk_indices.clamp(min=0, max=kv_len - 1)
-    valid = packed_mask[:, None, :].expand(-1, 1, -1).gather(2, safe)
-    return topk_indices.masked_fill(~valid, -1)
+    # Broadcast range check: valid[q,j] = starts[q] <= safe[q,j] < ends[q].
+    # Avoids building a [query_len, kv_len] bool mask and gathering over it.
+    valid = (safe >= starts[:, None, None]) & (safe < ends[:, None, None])
+    # Arithmetic fill (not masked_fill): valid slot -> topk_indices, invalid -> -1.
+    return topk_indices * valid.long() - (~valid).long()
 
 
 def _packed_causal_mask(
