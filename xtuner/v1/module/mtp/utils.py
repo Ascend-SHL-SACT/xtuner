@@ -1,5 +1,7 @@
 """Utility functions for Multi-Token Prediction (MTP)."""
 
+import os
+
 import torch
 
 from xtuner.v1.data_proto import SequenceContext
@@ -50,6 +52,9 @@ def roll_packed_tensor(
     # Normalize dim to a positive index
     dim = dim % tensor.dim()
 
+    if os.environ.get("XTUNER_MTP_ROLL_VECTORIZED", "1") == "1":
+        return _roll_packed_tensor_vec(tensor, cu_seq_lens, shifts, dim, fill_value)
+
     rolled_tensor = tensor.clone()
 
     # Roll each packed sequence independently within its boundaries
@@ -74,6 +79,34 @@ def roll_packed_tensor(
         rolled_tensor.narrow(dim, start_idx, end_idx - start_idx).copy_(rolled_seq)  # type: ignore[arg-type]
 
     return rolled_tensor
+
+
+def _roll_packed_tensor_vec(
+    tensor: torch.Tensor,
+    cu_seq_lens: torch.IntTensor,
+    shifts: int,
+    dim: int,
+    fill_value: float | int,
+) -> torch.Tensor:
+    # Vectorized equivalent of the per-sequence loop: one global torch.roll over
+    # the whole packed axis, then a single index_fill at each sequence's tail.
+    # The global roll only crosses a boundary at each sequence's last |shifts|
+    # positions (which land on the next sequence's head), and those are exactly
+    # the positions index_fill overwrites -- so the result matches the loop for
+    # any negative shift. No Python loop and no .item() host sync, which removes
+    # the per-sequence device-stall that dominated host overhead.
+    k = -shifts
+    # cu_seq_lens lives on host (built with the packed batch); keep all index
+    # bookkeeping on CPU and ship only the final flat index to the device.
+    ends = (cu_seq_lens[1:] - 1).to(torch.long)
+    seq_lens = (cu_seq_lens[1:] - cu_seq_lens[:-1]).to(torch.long)
+    fill_lens = seq_lens.clamp(max=k)
+    offsets = torch.arange(k)
+    idx = ends.unsqueeze(1) - offsets.unsqueeze(0)
+    mask = offsets.unsqueeze(0) < fill_lens.unsqueeze(1)
+    idx = idx[mask].to(torch.long).to(tensor.device)
+    rolled = torch.roll(tensor, shifts=shifts, dims=dim)
+    return torch.index_fill(rolled, dim, idx, fill_value)
 
 
 def roll_sequence_context(
