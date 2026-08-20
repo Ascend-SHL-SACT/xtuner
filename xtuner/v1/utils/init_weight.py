@@ -23,11 +23,18 @@ def init_params(param: torch.Tensor, init_fn: Callable[[torch.Tensor], torch.Ten
     assert not param.is_meta, "Internal Error. Found meta tensor during initialize model weight"
 
     if isinstance(param, DTensor):
-        # Init the local shard in-place. init_fn is element-wise (normal_/zeros_/
-        # ones_), so per-rank shard init is valid without the full-tensor
-        # all-gather. to_local() shares storage with the shard, so in-place
-        # init persists.
-        init_fn(param.to_local())
+        # InterleavedShard cannot go through full_tensor/distribute_tensor because PyTorch has no
+        # redistribute path for that placement chain. Initialize the values owned by this rank directly.
+        from .interleaved_shard import RuntimeLayout
+
+        if RuntimeLayout.from_dtensor(param).is_interleaved:
+            init_fn(param._local_tensor)
+        else:
+            # Init the local shard in-place. init_fn is element-wise (normal_/zeros_/
+            # ones_), so per-rank shard init is valid without the full-tensor
+            # all-gather. to_local() shares storage with the shard, so in-place
+            # init persists.
+            init_fn(param.to_local())
     else:
         init_fn(param)
 

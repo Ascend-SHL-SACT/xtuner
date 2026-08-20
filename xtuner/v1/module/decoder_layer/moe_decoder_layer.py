@@ -163,8 +163,10 @@ class MoEBlock(nn.Module):
         n_routed_experts: int,
         moe_bias: bool = False,
         ep_mesh: DeviceMesh | None = None,
+        expert_tp_mesh: DeviceMesh | None = None,
         float8_cfg: Float8Config | None = None,
         moe_act_fn_cfg: MoEActFnConfig,
+        ep_tp_mesh: DeviceMesh | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -179,7 +181,11 @@ class MoEBlock(nn.Module):
             self.num_routed_experts,
             moe_bias=moe_bias,
             ep_mesh=self.ep_mesh,
+            expert_tp_mesh=expert_tp_mesh,
+            parallel_style="column",
             float8_cfg=float8_cfg,
+            ep_tp_mesh=ep_tp_mesh,
+            num_fused_projections=2,
         )
         self.fused_w2 = build_grouped_linear(
             self.intermediate_size,
@@ -187,7 +193,10 @@ class MoEBlock(nn.Module):
             self.num_routed_experts,
             moe_bias=moe_bias,
             ep_mesh=self.ep_mesh,
+            expert_tp_mesh=expert_tp_mesh,
+            parallel_style="row",
             float8_cfg=float8_cfg,
+            ep_tp_mesh=ep_tp_mesh,
         )
         self.moe_act = moe_act_fn_cfg.build()
         init_expert_linears(
@@ -240,9 +249,12 @@ class MoEDecoderLayer(nn.Module):
         layer_idx: int = 0,
         dispatcher: Literal["deepep", "all2all", "agrs"] | None,
         ep_mesh: DeviceMesh | None = None,
+        expert_tp_mesh: DeviceMesh | None = None,
+        ep_tp_mesh: DeviceMesh | None = None,
     ):
         super().__init__()
         self.ep_mesh = ep_mesh
+        self.ep_tp_mesh = ep_tp_mesh
         self.hidden_size = hidden_size
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
@@ -298,15 +310,21 @@ class MoEDecoderLayer(nn.Module):
             n_routed_experts=n_routed_experts,
             moe_bias=moe_bias,
             ep_mesh=ep_mesh,
+            expert_tp_mesh=expert_tp_mesh,
             float8_cfg=float8_cfg,
             moe_act_fn_cfg=moe_act_fn_cfg,
+            ep_tp_mesh=ep_tp_mesh,
         )
         # TODO: (yehaochen) Maybe should be replaced by build_dispatcher
         process_group = ep_mesh.get_group() if ep_mesh is not None else None
+        tp_group = expert_tp_mesh.get_group() if expert_tp_mesh is not None else None
+        ep_tp_group = ep_tp_mesh._flatten().get_group() if ep_tp_mesh is not None else None
         self.dispatcher = build_dispatcher(
             dispatcher=dispatcher,
             n_routed_experts=n_routed_experts,
             ep_group=process_group,
+            tp_group=tp_group,
+            ep_tp_group=ep_tp_group,
             training_dtype="fp8" if float8_cfg is not None else "bf16",
             generate_dtype=generate_config.dtype if generate_config is not None else "bf16",
         )
@@ -427,7 +445,12 @@ class MoEDecoderLayer(nn.Module):
         # )
         pre_dispatched = self.dispatcher.dispatch_preprocess(
             hidden_states=hidden_states.view(-1, hidden_states.shape[-1]),
-            topk_ids=router_results["topk_ids"] if not skip_pad_tokens else router_results["topk_ids"][nonpad_indices, :],
+            topk_ids=router_results["topk_ids"]
+            if not skip_pad_tokens
+            else router_results["topk_ids"][nonpad_indices, :],
+            topk_weights=router_results["topk_weights"]
+            if not skip_pad_tokens
+            else router_results["topk_weights"][nonpad_indices, :],
             async_op=async_op,
         )
         dispatched = self.dispatcher.dispatch(
@@ -553,6 +576,7 @@ class MoEDecoderLayer(nn.Module):
             pre_dispatched = self.dispatcher.dispatch_preprocess(
                 hidden_states=hidden_states,
                 topk_ids=router_results["topk_ids"],
+                topk_weights=router_results["topk_weights"],
                 async_op=True,
             )
             pre_dispatched_list.append(pre_dispatched)
