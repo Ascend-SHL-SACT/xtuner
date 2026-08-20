@@ -113,7 +113,7 @@ HiddenStates: TypeAlias = torch.Tensor
 # LIFO stack: autograd recompute is strictly nested (forward pushes layers
 # 0..N-1, backward pops N-1..0), so a stack mirrors the ordering.
 _a2a_split_cache: list[tuple[torch.Tensor, list[int], list[int]]] = []
-_a2a_cache_stats: dict[str, int] = {"hits": 0, "misses": 0}
+
 
 def _a2a_cache_enabled() -> bool:
     """Whether the a2a split cache should activate (bool).
@@ -157,14 +157,7 @@ def _dispatch(
     # re-issues, so no call-order-matched host collective can mismatch under
     # cross-rank backward drift.
     if use_cache and in_bwd and _a2a_split_cache:
-        _a2a_cache_stats["hits"] += 1
         tokens_per_expert_group, input_splits, output_splits = _a2a_split_cache.pop()
-        if _a2a_cache_stats["hits"] % 100 == 1:
-            logger.info(
-                "[a2a-cache] recompute reuse "
-                f"hits={_a2a_cache_stats['hits']} "
-                f"misses={_a2a_cache_stats['misses']}"
-            )
         hidden_states = hidden_states.contiguous()
         out = all_to_all_single_autograd(
             hidden_states,
@@ -176,9 +169,7 @@ def _dispatch(
 
     # Forward, or cache-empty fallback in recompute: compute splits normally.
     if use_cache and in_bwd and not _a2a_split_cache:
-        _a2a_cache_stats["misses"] += 1
-        if _a2a_cache_stats["misses"] == 1:
-            logger.warning("[a2a-cache] MISS (empty cache in recompute) -- falling back to recompute")
+        logger.warning("[a2a-cache] MISS (empty cache in recompute) -- falling back to recompute")
 
     tokens_per_expert = torch.histc(topk_ids, bins=n_routed_experts, min=0, max=n_routed_experts)
     # self._comm_stream.wait_event(event)
