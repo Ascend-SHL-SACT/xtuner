@@ -9,6 +9,10 @@ from typing_extensions import override
 from xtuner.v1.ops import permute, unpermute
 from xtuner.v1.ops.comm.all_to_all import all_to_all_single_autograd
 from xtuner.v1.utils import copy_method_signature, get_device, get_logger
+from xtuner.v1.utils.interleaved_ep import (
+    histc_for_dispatch,
+    sort_key_for_dispatch,
+)
 from xtuner.v1.utils.profile import _in_autograd_backward
 
 from . import XTUNER_DISPATCHER_DEBUG
@@ -171,7 +175,7 @@ def _dispatch(
     if use_cache and in_bwd and not _a2a_split_cache:
         logger.warning("[a2a-cache] MISS (empty cache in recompute) -- falling back to recompute")
 
-    tokens_per_expert = torch.histc(topk_ids, bins=n_routed_experts, min=0, max=n_routed_experts)
+    tokens_per_expert = histc_for_dispatch(topk_ids, n_routed_experts, ep_size)
     # self._comm_stream.wait_event(event)
     tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
     dist.all_to_all_single(
@@ -424,7 +428,8 @@ class TorchAll2AllDispatcher(
         topk_weights: torch.Tensor,  # noqa: ARG002 — kept for interface compatibility; not used here
         async_op: bool = False,
     ) -> TorchAll2AllPreDispatchResult:
-        permuted_hidden_states, row_ids_map = permute(hidden_states, topk_ids.to(torch.int32))
+        sort_key = sort_key_for_dispatch(topk_ids, self._n_routed_experts, self._process_group.size())
+        permuted_hidden_states, row_ids_map = permute(hidden_states, sort_key)
 
         if async_op:
             forward_finished_event = cast(torch.cuda.Event, torch.cuda.Event())
