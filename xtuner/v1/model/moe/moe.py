@@ -67,6 +67,7 @@ from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEActFnConfig, MoEBlock, MoEDecoderLayer, MoEGate
 from xtuner.v1.module.mtp import MTPBlock, MTPConfig, MTPLayer
 from xtuner.v1.utils import (
+    device_mesh_custom,
     get_device,
     get_logger,
     log_rank0,
@@ -227,6 +228,17 @@ class MoE(BaseModel):
                 # 2D (ep, etp) sub-mesh used by GroupedLinear for per-expert column-parallel weights.
                 # LoadSpec records both placements so HF plans can load and reconstruct the layout.
                 self.ep_tp_mesh = _init_mesh[f"{self.config.mesh_prefix}.ep", f"{self.config.mesh_prefix}.etp"]
+            elif device_mesh_custom.use_custom_mesh(world_size):
+                _init_mesh = device_mesh_custom.build_custom_expert_mesh(
+                    DEVICE,
+                    fsdp_size,
+                    ep_size,
+                    f"{self.config.mesh_prefix}.dp",
+                    f"{self.config.mesh_prefix}.ep",
+                )
+                self.ep_mesh = _init_mesh[f"{self.config.mesh_prefix}.ep"]
+                self.expert_tp_mesh = None
+                self.ep_tp_mesh = None
             else:
                 _init_mesh = init_device_mesh(
                     DEVICE,
@@ -1558,6 +1570,14 @@ class MoE(BaseModel):
                         f"{self.config.mesh_prefix}.ep",
                         f"{self.config.mesh_prefix}.etp",
                     ),
+                )
+            elif device_mesh_custom.use_custom_mesh(world_size):
+                model_mesh = device_mesh_custom.build_custom_expert_mesh(
+                    device,
+                    experts_fsdp_size,
+                    self.fsdp_config.ep_size,
+                    f"{self.config.mesh_prefix}.fsdp",
+                    f"{self.config.mesh_prefix}.ep",
                 )
             else:
                 model_mesh = init_device_mesh(
