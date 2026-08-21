@@ -60,6 +60,7 @@ from xtuner.v1.utils import (
     XTUNER_DETERMINISTIC,
     ParallelConfigException,
     StrEnum,
+    device_mesh_custom,
     get_logger,
     is_hf_model_path,
     log_format,
@@ -1130,6 +1131,8 @@ class Trainer:
         # TODO: fsdp_config could be None
         device = str(DEVICE) if self._fsdp_config.cpu_offload else "cpu"
 
+        if device_mesh_custom.use_custom_mesh(self.world_size):
+            return device_mesh_custom.build_custom_data_mesh(device, dp_size, sp_size, tp_size)
         data_mesh = init_device_mesh(
             device,
             (dp_size, sp_size, tp_size),
