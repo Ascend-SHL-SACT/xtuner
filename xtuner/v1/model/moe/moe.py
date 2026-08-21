@@ -45,6 +45,7 @@ from xtuner.v1.model.base import (
     TorchCompileOption,
     TransformerConfig,
 )
+from xtuner.v1.model.fsdp_fuse import shard_decoder_layers
 from xtuner.v1.model.moe.expert_submodule_fsdp import shard_expert_submodules
 from xtuner.v1.model.utils import (
     ModelForwardExtraLogInfo,
@@ -1227,6 +1228,11 @@ class MoE(BaseModel):
         # FSDP2's default 1-layer-in-flight unshard (no double-in-flight
         # transient, at the cost of un-overlapped per-layer all-gather).
         fsdp_prefetch = os.environ.get("XTUNER_FSDP_PREFETCH", "1") == "1"
+        # XTUNER_FSDP_FUSE_K (default 1 = per-layer = unchanged): group K
+        # consecutive decoder layers into one FSDP2 unit so the per-layer
+        # all-gather/reduce-scatter collectives collapse into one per group.
+        # See xtuner/v1/model/fsdp_fuse.shard_decoder_layers.
+        fuse_k = int(os.environ.get("XTUNER_FSDP_FUSE_K", "1"))
 
         for layer_idx, layer in tqdm(self.layers.items(), desc="[FSDP Sharding]"):
             layer_idx = int(layer_idx)
@@ -1278,6 +1284,12 @@ class MoE(BaseModel):
                 )
 
             self.layers[str(layer_idx)] = layer
+            if fuse_k > 1:
+                # K>1: defer the per-layer FSDP2 shard to the grouped path below;
+                # the layer is built + expert-submodule-sharded here, the grouped
+                # _fully_shard runs once after the loop (collective fusion).
+                continue
+            # K<=1 (default): per-layer FSDP2 shard, byte-identical to HEAD.
             if layer_idx >= len(self.layers) - 1 and self.mtp_block is None:
                 reshard_after_forward = False
             else:
@@ -1291,7 +1303,22 @@ class MoE(BaseModel):
                 module=layer,
             )
 
-        if fsdp_prefetch:
+        # K>1: group K consecutive decoder layers into one FSDP2 unit (collective
+        # fusion) so the per-layer all-gather/reduce-scatter collapse into one
+        # per group, and chain forward-prefetch across group representatives.
+        # K<=1 (default) keeps the per-layer _fully_shard + prefetch above
+        # (byte-identical to HEAD). See xtuner/v1/model/fsdp_fuse.shard_decoder_layers.
+        if fuse_k > 1:
+            layer_next = shard_decoder_layers(
+                self,
+                list(self.layers.values()),
+                mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+                fsdp_prefetch=fsdp_prefetch,
+                fuse_k=fuse_k,
+            )
+        elif fsdp_prefetch:
             for layer_cur, layer_next in zip(
                 list(self.layers.values())[:-1],
                 list(self.layers.values())[1:],
