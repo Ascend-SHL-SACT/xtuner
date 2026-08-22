@@ -44,6 +44,20 @@ XTUNER_FILE_OPEN_CONCURRENCY = int(os.environ.get("XTUNER_FILE_OPEN_CONCURRENCY"
 
 XTUNER_TOKENIZE_CHUNK_SIZE = int(os.environ.get("XTUNER_TOKENIZE_CHUNK_SIZE", "10"))
 
+# RAM-resident __getitem__: when MAX_MB > 0, load the data file into a bytes
+# blob at init so __getitem__ slices RAM instead of open()+readline() per sample.
+# Removes the per-sample AFS open latency and the per-node AFS-open variance
+# behind the dataloader straggler. Forked workers inherit the immutable blob via
+# copy-on-write (shared physical pages). MAX_MB is both the switch and the
+# size cap: 0 (default) keeps the open()/readline() per-sample path
+# (byte-identical); >0 enables the blob path and also skips files larger than
+# MAX_MB (falls back to open()) to avoid host-RAM blowup. Unit = MiB (1 MiB =
+# 1 << 20 bytes).
+XTUNER_DATASET_BLOB_GETITEM_MAX_MB = int(os.environ.get("XTUNER_DATASET_BLOB_GETITEM_MAX_MB", "0"))
+# Convert the MiB cap to bytes once at import; 0 = OFF (original open()/readline
+# per-sample path, byte-identical HEAD).
+_BLOB_MAX_BYTES = XTUNER_DATASET_BLOB_GETITEM_MAX_MB * 1024 * 1024
+
 
 def _concat_values(values):
     if isinstance(values[0], np.ndarray):
@@ -282,6 +296,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         self.path = str(anno_path)
         self.name = name
         self._shared_memory = None
+        self._blob: bytes | None = None
 
         self.tokenizer_workers = int(os.environ.get("XTUNER_TOKENIZE_WORKERS", 8))
         self.meta_path = os.path.join(cache_dir, CACHE_META) if cache_dir else None
@@ -477,6 +492,18 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
 
         _meta.update(_meta_need_update)
         self._meta = _meta
+
+        if _BLOB_MAX_BYTES > 0:
+            _blob_size = os.path.getsize(self.path)
+            if _blob_size <= _BLOB_MAX_BYTES:
+                self._blob = Path(self.path).read_bytes()
+            elif get_rank() == 0:
+                logger.warning(
+                    f"[Dataset] {self.path} ({_blob_size} bytes) exceeds "
+                    f"XTUNER_DATASET_BLOB_GETITEM_MAX_MB "
+                    f"({XTUNER_DATASET_BLOB_GETITEM_MAX_MB} MiB); keeping the "
+                    "open()/readline() per-sample path."
+                )
 
         if self._shared_memory is not None:
             self._release_shared_memory()
@@ -751,9 +778,14 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         Returns:
             A dict including packed input_ids, labels, and cumulative_len.
         """
-        with open(self.path) as f:
-            f.seek(self.offsets[item])
-            line = f.readline()
+        if self._blob is not None:
+            _start = int(self.offsets[item])
+            _end = int(self.offsets[item + 1]) if item + 1 < len(self.offsets) else len(self._blob)
+            line = self._blob[_start:_end].decode()
+        else:
+            with open(self.path) as f:
+                f.seek(self.offsets[item])
+                line = f.readline()
 
         raw_data = json.loads(line)
 
