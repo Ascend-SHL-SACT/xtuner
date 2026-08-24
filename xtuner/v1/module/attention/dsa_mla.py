@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import os
 from typing import Literal, cast
 
 import torch
@@ -23,6 +24,20 @@ from ..linear import build_linear
 from .attn_outputs import AttnOutputs
 from .dsa_topk_sharing import build_dsa_topk_release_plan, dsa_topk_source_layer, get_dsa_topk_sharing_runtime
 from .mla import MLAConfig, MultiLatentAttention, mla_apply_rotary_pos_emb
+
+
+# Tile MLA projection row dim into N tiles so each aclnnMatmul workspace is
+# ~1/N. 0 = off (byte-identical to linear(x)).
+_MLA_MATMUL_TILES = int(os.environ.get("XTUNER_MLA_MATMUL_TILES", "0") or "0")
+
+
+def _tiled_linear(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    tiles = _MLA_MATMUL_TILES
+    m = x.size(-2)
+    if tiles <= 1 or m <= 1:
+        return linear(x)
+    chunk = (m + tiles - 1) // tiles
+    return torch.cat([linear(x[..., i : i + chunk, :]) for i in range(0, m, chunk)], dim=-2)
 
 
 class LayerNorm(nn.Module):
@@ -323,7 +338,11 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         # q_a_proj.weight: [Rq, hidden_size]; q_resid: [bsz, S, Rq]
         q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states))
         # q_b_proj.weight: [N * Dq, Rq]; q: [bsz, N, S, Dq]
-        q = self.q_b_proj(q_resid).view(bsz, q_len, self.num_attention_heads, self.q_head_dim).transpose(1, 2)
+        q = (
+            _tiled_linear(self.q_b_proj, q_resid)
+            .view(bsz, q_len, self.num_attention_heads, self.q_head_dim)
+            .transpose(1, 2)
+        )
         # q_nope: [bsz, N, S, Dn]; q_pe: [bsz, N, S, Dr]
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -391,7 +410,7 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         raw_output = torch.einsum("shm,hdm->shd", raw_output, w_vc)
         raw_output = raw_output.reshape(bsz, q_len, self.num_attention_heads * self.v_head_dim).contiguous()
         # o_proj.weight: [hidden_size, N * Dv]; projected_output: [bsz, S, hidden_size]
-        projected_output = self.o_proj(raw_output)
+        projected_output = _tiled_linear(self.o_proj, raw_output)
 
         return {
             "raw_output": raw_output,
