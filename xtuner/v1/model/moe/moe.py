@@ -223,6 +223,17 @@ class MoE(BaseModel):
                         f"{self.config.mesh_prefix}.etp",
                     ),
                 )
+                _init_mesh = device_mesh_custom.override_expert_3d_mesh(
+                    _init_mesh,
+                    DEVICE,
+                    fsdp_size,
+                    ep_size,
+                    expert_tp_size,
+                    world_size,
+                    f"{self.config.mesh_prefix}.dp",
+                    f"{self.config.mesh_prefix}.ep",
+                    f"{self.config.mesh_prefix}.etp",
+                )
                 self.ep_mesh = _init_mesh[f"{self.config.mesh_prefix}.ep"]
                 self.expert_tp_mesh = _init_mesh[f"{self.config.mesh_prefix}.etp"]
                 # 2D (ep, etp) sub-mesh used by GroupedLinear for per-expert column-parallel weights.
@@ -1570,6 +1581,17 @@ class MoE(BaseModel):
                         f"{self.config.mesh_prefix}.ep",
                         f"{self.config.mesh_prefix}.etp",
                     ),
+                )
+                model_mesh = device_mesh_custom.override_expert_3d_mesh(
+                    model_mesh,
+                    device,
+                    experts_fsdp_size,
+                    self.fsdp_config.ep_size,
+                    expert_tp_size,
+                    world_size,
+                    f"{self.config.mesh_prefix}.fsdp",
+                    f"{self.config.mesh_prefix}.ep",
+                    f"{self.config.mesh_prefix}.etp",
                 )
             elif device_mesh_custom.use_custom_mesh(world_size):
                 model_mesh = device_mesh_custom.build_custom_expert_mesh(

@@ -854,6 +854,18 @@ class Trainer:
             self._async_save_monitor.start()
 
         train_begin = time.time()
+        # Eagerly init every mesh-dim communicator on an idle device so no dim
+        # is lazily created mid-training (lazy createLink can deadlock at scale).
+        device_mesh_custom.warmup_mesh_communicators(
+            DEVICE,
+            self.data_mesh,
+            getattr(self._engine.model, "_world_mesh", None),
+            getattr(self._engine.model, "fsdp_mesh", None),
+            getattr(self._engine.model, "ep_mesh", None),
+            getattr(self._engine.model, "expert_tp_mesh", None),
+            getattr(self._engine.model, "ep_tp_mesh", None),
+            getattr(self._engine.model, "hsdp_mesh", None),
+        )
         time_before_get_data = time.time()
         for data_batch in self._data_iter():
             time_before_train_step = time.time()
@@ -2040,6 +2052,18 @@ class Trainer:
             case (MoEConfig(), FSDPConfig(ep_size=1)):
                 fsdp_cfg.ep_size = model_cfg.ep_size
                 log_rank0.warning(f"Found fsdp ep_size 1, using fsdp ep_size {fsdp_cfg.ep_size}.")
+
+        # After ep_size reconciliation, fail fast if the custom 3D expert mesh
+        # (expert_tp_size > 1 + XTUNER_DEVICE_MESH=1) cannot keep its fsdp group
+        # equal to the data dp group (FSDP2 gradient coherence); no-op when the
+        # custom 3D path is inactive (env off, single node, expert_tp_size <= 1).
+        device_mesh_custom.validate_expert_3d_alignment(
+            ep_size=fsdp_cfg.ep_size,
+            expert_tp_size=getattr(model_cfg, "expert_tp_size", 1),
+            sp_size=self._sp_size,
+            tp_size=fsdp_cfg.tp_size,
+            world_size=self.world_size,
+        )
 
         match dataloader_cfg, model_cfg:
             case DataloaderConfig(pack_to_max_length=False), XTunerBaseModelConfig(compile_cfg=value) if (
