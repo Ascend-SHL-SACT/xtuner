@@ -16,6 +16,7 @@ Default ``K=1`` = per-layer = byte-identical to the original sharding path
 ``XTUNER_FSDP_FUSE_K > 1`` to take the fused group path.
 """
 
+import os
 import re
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,8 @@ from torch.distributed.fsdp import (
     fully_shard,
 )
 from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
+
+from xtuner.v1.utils.fsdp_backward_prefetch import apply_backward_prefetch_offset
 
 
 if TYPE_CHECKING:
@@ -135,8 +138,10 @@ def shard_layer_groups(
             )
         units.append(grp[0])
     if fsdp_prefetch:
-        for cur, nxt in zip(units[:-1], units[1:]):
-            cur.set_modules_to_forward_prefetch([nxt])  # type: ignore
+        for i, cur in enumerate(units[:-1]):
+            cur.set_modules_to_forward_prefetch([units[i + 1]])  # type: ignore
+    if os.environ.get("XTUNER_FSDP_BACKWARD_PREFETCH_OFFSET", "0") not in ("0", ""):
+        apply_backward_prefetch_offset(units)
 
 
 def _shard_group(
