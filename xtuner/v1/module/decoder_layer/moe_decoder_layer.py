@@ -1,6 +1,6 @@
+import os
 from functools import partial
 from typing import Literal, Protocol, TypeAlias, cast
-import os
 
 import torch
 import torch.nn as nn
@@ -40,9 +40,14 @@ from xtuner.v1.module.dispatcher import (
     PreDispatchResult,
     build_dispatcher,
 )
-from xtuner.v1.module.grouped_linear.moe_group_linear import build_grouped_linear
+from xtuner.v1.module.dispatcher.torch_all2all import TorchAll2AllDispatcher
+from xtuner.v1.module.grouped_linear.moe_group_linear import (
+    GroupedLinear,
+    build_grouped_linear,
+)
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_act_fn
+from xtuner.v1.ops.moe.npu import fused_a2a_gmm
 from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
@@ -453,6 +458,30 @@ class MoEDecoderLayer(nn.Module):
             else router_results["topk_weights"][nonpad_indices, :],
             async_op=async_op,
         )
+        if (
+            fused_a2a_gmm.is_enabled()
+            and not async_op
+            and not skip_pad_tokens
+            and isinstance(self.dispatcher, TorchAll2AllDispatcher)
+            and self.dispatcher._expert_tp is None
+            and isinstance(self.experts.fused_w1w3, GroupedLinear)
+            and isinstance(self.experts.fused_w2, GroupedLinear)
+        ):
+            # Fused dispatch-alltoallv+grouped-matmul path (XTUNER_MOE_FUSED_A2A_GMM): the CANN
+            # kernel npu_alltoallv_gmm pipelines the dispatch/combine a2a behind FC1/FC2 gmm,
+            # bypassing dispatch/dispatch_postprocess/experts/combine_preprocess/combine/
+            # combine_postprocess (the op's built-in permute + this final unpermute replace them).
+            # Weight-prep + dispatch/combine orchestration are in fused_a2a_gmm.fused_forward
+            # (this layer keeps only the gate predicate + the call); byte-identical to the former
+            # inline _fused_a2a_gmm_forward, and runs only when the gate above fires.
+            return fused_a2a_gmm.fused_forward(
+                self,
+                router_results=router_results,
+                pre_dispatched=pre_dispatched,
+                shared_input_hidden=hidden_states,
+                residual=residual,
+                origin_shape=origin_shape,
+            )
         dispatched = self.dispatcher.dispatch(
             pre_dispatched=pre_dispatched,
             topk_weights=router_results["topk_weights"] if not skip_pad_tokens else router_results["topk_weights"][nonpad_indices, :],
