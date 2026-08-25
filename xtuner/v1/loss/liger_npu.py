@@ -302,14 +302,27 @@ def _patch_liger_ascend_fwd() -> None:
                 grad_logits_chunk = grad_logits_chunk * scaling_factors_full[start_idx:end_idx].unsqueeze(-1)
 
             grad_input[start_idx:end_idx] = grad_logits_chunk @ weight
-            # chunk 0: fused GEMM writes directly into grad_weight (no [V,H]
-            # grad_weight_ temp). chunk>0 still needs a temp for add_ (Ascend
-            # has no in-place accumulate GEMM), keeping the original path.
-            if chunk_id == 0:
+            # matmul(out=grad_weight) writes the result directly into the
+            # pre-allocated grad_weight with no [V,H] grad_weight_ temp (~1.9GB
+            # at V=154880), but Ascend's matmul(out=) does NOT auto-cast: the
+            # out dtype must equal the computed dtype. That only holds for the
+            # single-chunk case (num_chunks == 1 -> grad_accum_dtype is None ->
+            # grad_weight is bf16, matching the bf16 operands). Multi-chunk
+            # allocates grad_weight in ctx.accum_dtype (fp32) for stable
+            # large-vocab accumulation; there matmul(out=fp32) from bf16
+            # operands would crash (no bf16->fp32 cast), so fall back to the
+            # grad_weight_ temp + copy_/add_ path -- copy_ and add_ DO auto-cast
+            # bf16->fp32. grad_weight is torch.empty_like (uninitialized), so
+            # chunk 0 must overwrite (copy_), never add_ (which would add into
+            # garbage).
+            if num_chunks == 1:
                 torch.matmul(grad_logits_chunk.t(), input_chunk, out=grad_weight)
             else:
                 grad_weight_ = grad_logits_chunk.t() @ input_chunk
-                grad_weight.add_(grad_weight_)
+                if chunk_id == 0:
+                    grad_weight.copy_(grad_weight_)
+                else:
+                    grad_weight.add_(grad_weight_)
             if grad_bias is not None:
                 grad_bias_ = grad_logits_chunk.sum(dim=0)
                 if chunk_id == 0:
