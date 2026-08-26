@@ -11,6 +11,16 @@ from torch.utils._foreach_utils import (
 )
 
 
+# ``_StridedShard`` (torch >= 2.12) is NOT a ``Shard`` subclass; it backs 2D
+# FSDP2 + TP/SP strided bookkeeping. Without this, the ``Shard``-only
+# isinstance check in ``cal_total_norm`` raises on SP > 1 gradients.
+_StridedShard: type
+try:
+    from torch.distributed.tensor.placement_types import _StridedShard
+except ImportError:  # torch < 2.12 has no 2D-FSDP strided placement
+    _StridedShard = type(None)  # never matches -> Shard-only path
+
+
 def group_tensors_by_device_mesh_and_placements(
     tensors: list[DTensor],
 ) -> dict[tuple[DeviceMesh, tuple[Placement, ...]], list[DTensor]]:
@@ -78,9 +88,11 @@ def cal_total_norm(
     if norm_type == 2:
         local_norm_squared = local_norm**2
         for i, placement in enumerate(placements):
-            if isinstance(placement, Shard):
-                # FSDP's strided bookkeeping placement is a Shard subclass, so
-                # RuntimeLayout owns the only concrete private-type dependency.
+            if isinstance(placement, (Shard, _StridedShard)):
+                # ``Shard`` covers plain sharding; ``_StridedShard`` (torch >= 2.12,
+                # NOT a ``Shard`` subclass) covers 2D FSDP2 + TP/SP strided
+                # bookkeeping. Both hold disjoint per-rank slices, so each rank's
+                # partial norm-squared must be summed across the mesh dimension.
                 dist.all_reduce(local_norm_squared, group=device_mesh.get_group(i))
             elif isinstance(placement, Replicate):
                 pass
