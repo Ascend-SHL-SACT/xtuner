@@ -252,10 +252,11 @@ def _indexer_tnd_packed(
             sparse_count=topk, sparse_mode=3, return_value=True,
         )
     else:
-        # ── SP>1: V2 kernel with prefix-extended KV slice ──
-        from cann_ops_transformer.ops import lightning_indexer as _li_v2
-        from cann_ops_transformer.ops import lightning_indexer_metadata as _li_v2_meta
-
+        # ── SP>1: prefix-extended KV slice (V1 default, V2 opt-in) ──
+        # V2 (aclnnLightningIndexerV2) segfaults in the full 13B forward under
+        # torch 2.13 / CANN 9.2; V1 (aclnnLightningIndexer, a different kernel)
+        # is byte-identical on the real asymmetric prefix-extended case. Set
+        # XTUNER_INDEXER_USE_V2=1 to re-test V2 after a future CANN fix.
         shard_end = shard_start + query_len
         cu_seq_q_local, cu_seq_k_local, kv_start, kv_end = _compute_prefix_extended_kv_slice(
             cu_seq_q_global, shard_start, shard_end, device,
@@ -265,22 +266,36 @@ def _indexer_tnd_packed(
         k_tnd = k.squeeze(0)[kv_start:kv_end].unsqueeze(1).contiguous().to(torch.bfloat16)
         kv_slice_offset = kv_start
 
-        meta = _li_v2_meta(
-            num_heads_q=q.shape[2], num_heads_k=1,
-            head_dim=index_head_dim, topk=topk,
-            cu_seqlens_q=cu_seq_q_local, cu_seqlens_k=cu_seq_k_local,
-            batch_size=cu_seq_q_local.numel() - 1,
-            max_seqlen_q=query_len, max_seqlen_k=kv_end - kv_start,
-            layout_q="TND", layout_k="TND",
-            mask_mode=3, cmp_ratio=1,
-        )
-        topk_indices, _ = _li_v2(
-            q_tnd, k_tnd, w_tnd, topk,
-            cu_seqlens_q=cu_seq_q_local, cu_seqlens_k=cu_seq_k_local,
-            metadata=meta, max_seqlen_q=query_len,
-            layout_q="TND", layout_k="TND",
-            mask_mode=3, cmp_ratio=1, return_value=0,
-        )
+        import os as _os
+
+        if _os.environ.get("XTUNER_INDEXER_USE_V2", "0") == "1":
+            from cann_ops_transformer.ops import lightning_indexer as _li_v2
+            from cann_ops_transformer.ops import lightning_indexer_metadata as _li_v2_meta
+
+            meta = _li_v2_meta(
+                num_heads_q=q.shape[2], num_heads_k=1,
+                head_dim=index_head_dim, topk=topk,
+                cu_seqlens_q=cu_seq_q_local, cu_seqlens_k=cu_seq_k_local,
+                batch_size=cu_seq_q_local.numel() - 1,
+                max_seqlen_q=query_len, max_seqlen_k=kv_end - kv_start,
+                layout_q="TND", layout_k="TND",
+                mask_mode=3, cmp_ratio=1,
+            )
+            topk_indices, _ = _li_v2(
+                q_tnd, k_tnd, w_tnd, topk,
+                cu_seqlens_q=cu_seq_q_local, cu_seqlens_k=cu_seq_k_local,
+                metadata=meta, max_seqlen_q=query_len,
+                layout_q="TND", layout_k="TND",
+                mask_mode=3, cmp_ratio=1, return_value=0,
+            )
+        else:
+            topk_indices, _ = torch_npu.npu_lightning_indexer(
+                q_tnd, k_tnd, w_tnd,
+                actual_seq_lengths_query=cu_seq_q_local,
+                actual_seq_lengths_key=cu_seq_k_local,
+                layout_query="TND", layout_key="TND",
+                sparse_count=topk, sparse_mode=3, return_value=False,
+            )
 
     # ── Common: per-segment local → global indices ──
     topk_indices = topk_indices.to(torch.int64)
