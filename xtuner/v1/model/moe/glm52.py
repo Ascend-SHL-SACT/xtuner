@@ -146,18 +146,6 @@ class Glm52MoE(MoE):
                 w1w3_keys.append(key.replace("fused_w1w3.weight", f"{i}.gate_proj.weight"))
                 w1w3_keys.append(key.replace("fused_w1w3.weight", f"{i}.up_proj.weight"))
             return w1w3_keys
-        elif "fused_w1.weight" in key:
-            # Un-fused gate (XTUNER_MOE_SUBMODULE_FSDP=1): one hf key per expert.
-            return [
-                key.replace("fused_w1.weight", f"{i}.gate_proj.weight")
-                for i in range(self.config.n_routed_experts)
-            ]
-        elif "fused_w3.weight" in key:
-            # Un-fused up (XTUNER_MOE_SUBMODULE_FSDP=1): one hf key per expert.
-            return [
-                key.replace("fused_w3.weight", f"{i}.up_proj.weight")
-                for i in range(self.config.n_routed_experts)
-            ]
         elif "fused_w2.weight" in key:
             return [
                 key.replace("fused_w2.weight", f"{i}.down_proj.weight") for i in range(self.config.n_routed_experts)
@@ -170,12 +158,7 @@ class Glm52MoE(MoE):
             return [key]
 
     def hf_tensor_to_canonical(self, name: str, loaded_tensor: torch.Tensor) -> torch.Tensor:
-        if (
-            "fused_w1w3.weight" in name
-            or "fused_w2.weight" in name
-            or "fused_w1.weight" in name
-            or "fused_w3.weight" in name
-        ) and loaded_tensor.ndim == 3:
+        if ("fused_w1w3.weight" in name or "fused_w2.weight" in name) and loaded_tensor.ndim == 3:
             loaded_tensor = loaded_tensor.flatten(0, 1)
         return loaded_tensor
 
