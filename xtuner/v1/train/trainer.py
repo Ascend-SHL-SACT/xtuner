@@ -1511,6 +1511,22 @@ class Trainer:
         set_random_seed(seed)
 
     def _try_bind_numa(self):
+        # NPU: per-rank CPU pinning via npu_cpu_binder (8-core NUMA-local slice).
+        # Gated by XTUNER_NPU_CPU_BIND (default on).
+        if str(DEVICE).split(":")[0] == "npu":
+            if os.environ.get("XTUNER_NPU_CPU_BIND", "1") == "1":
+                try:
+                    from xtuner.v1.utils import npu_cpu_binder
+
+                    npu_cpu_binder.run(self.rank)
+                    logger.info(
+                        f"Rank: {self.rank} bound to NPU cpu slice "
+                        f"via npu_cpu_binder.")
+                except Exception as e:
+                    logger.info(
+                        f"Rank: {self.rank} npu_cpu_binder failed: {e}")
+            return
+
         if str(DEVICE) != "cuda":
             log_rank0.info("Current device is not cuda, skip numa binding.")
             return
@@ -2115,11 +2131,6 @@ class Trainer:
 
     def _load_checkpoint(self):
         load_checkpoint_cfg: LoadCheckpointConfig = self._load_checkpoint_cfg
-        # 从 xtuner.v1.utils 获取 npu_cpu_binder 模块
-        from xtuner.v1.utils import npu_cpu_binder
-
-        # 执行npu_cpu_binder 细粒度绑核操作
-        npu_cpu_binder.run(self.rank)
         if (resume_from := load_checkpoint_cfg.checkpoint_path) is None:
             log_rank0.info("No checkpoint to resume from.")
             return
