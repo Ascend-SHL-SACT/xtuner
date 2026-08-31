@@ -10,8 +10,7 @@ it reuses only ``dispatch_preprocess``'s sort-permute and a final ``unpermute``.
 
 The torch_npu ops are forward-only (no autograd registration), so the two ``torch.autograd.Function``
 classes hand-write the backward mirroring MindSpeed: dX via the sibling op with counts swapped and
-the weight's in/out dims transposed; dW via a per-expert matmul loop (the same robust pattern as
-``_NpuGroupedGemm.backward`` in ``expert_submodule_fsdp.py``, which writes directly to the native
+the weight's in/out dims transposed; dW via a per-expert matmul loop (writes directly to the native
 ``[E, out, in]`` layout and tolerates empty expert groups).
 
 Under activation-checkpoint recompute (``RECOMPUTE_RATIO > 0``) the whole-MoE-layer reentrant
@@ -181,8 +180,7 @@ def _dw_matmul_loop(
 ) -> torch.Tensor:
     """Compute the expert weight grad as a per-expert matmul loop.
 
-    Mirrors ``_NpuGroupedGemm.backward`` (``expert_submodule_fsdp.py:334-340``): for each local
-    expert ``e``, ``grad_weight[e] = grad_out_e.T @ gmm_input_e`` which writes directly to the native
+    For each local expert ``e``, ``grad_weight[e] = grad_out_e.T @ gmm_input_e`` which writes directly to the native
     ``[E, out, in]`` layout (no transpose). Tolerates empty expert groups (``tokens == 0``) and
     non-contiguous operands, unlike ``npu_gmm_backward``.
 

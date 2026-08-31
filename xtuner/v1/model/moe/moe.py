@@ -46,7 +46,6 @@ from xtuner.v1.model.base import (
     TransformerConfig,
 )
 from xtuner.v1.model.fsdp_fuse import shard_decoder_layers
-from xtuner.v1.model.moe.expert_submodule_fsdp import shard_expert_submodules
 from xtuner.v1.model.utils import (
     ModelForwardExtraLogInfo,
     checkpoint_wrapper,
@@ -1253,14 +1252,6 @@ class MoE(BaseModel):
 
         for layer_idx, layer in tqdm(self.layers.items(), desc="[FSDP Sharding]"):
             layer_idx = int(layer_idx)
-            shard_expert_submodules(
-                self,
-                layer,
-                layer_idx=layer_idx,
-                mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-                mp_policy=mp_policy,
-                offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
-            )
             if self._should_recompute(
                 layer_idx=layer_idx,
                 mtp_idx=None,
@@ -1336,15 +1327,6 @@ class MoE(BaseModel):
         # Shard MTP block if it exists
         if self.mtp_block is not None:
             for mtp_idx, mtp_layer in enumerate(self.mtp_block.layers):
-                shard_expert_submodules(
-                    self,
-                    mtp_layer,
-                    is_mtp=True,
-                    mtp_idx=mtp_idx,
-                    mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-                    mp_policy=mp_policy,
-                    offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
-                )
                 if self._should_recompute(None, mtp_idx=mtp_idx) or (
                     self.config.mtp_config is not None and self.config.mtp_config.share_weights
                 ):  # share mtp head must recompute
