@@ -11,13 +11,13 @@
 #
 # Wiring: ``xtuner.v1.profiler.__init__`` routes the existing
 # ``profiling_time(profile_dir)`` symbol to this module only on NPU when
-# ``XTUNER_PROFILE_ENABLE=1``; on NPU with env=0 the original ``npu_profile``
+# ``XTUNER_NPU_PROFILE_V2_ENABLE=1``; on NPU with env=0 the original ``npu_profile``
 # (HEAD) is used; GPU always uses ``cuda_profile``. No trainer / worker /
 # config edits, no new env vars, no new files.
 """MindSpeed-ported Ascend NPU profiling layer (functionally complete).
 
 This module is wired into the existing framework on NPU through the
-``XTUNER_PROFILE_ENABLE`` environment variable (see
+``XTUNER_NPU_PROFILE_V2_ENABLE`` environment variable (see
 ``xtuner/v1/profiler/__init__.py``); GPU always uses ``cuda_profile``.
 
 Every ``ascend_pytorch_profiler`` capability is exposed (see the user guide at
@@ -115,7 +115,7 @@ class StaticParam(BaseModel):
         default="PipeUtilization",
         description="AI Core metric: one of the 9 documented AiCMetrics names.",
     )
-    analyse_flag: bool = Field(default=True, description="run online analyse on trace finalization -> CSV/DB.")
+    analyse_flag: bool = Field(default=False, description="run online analyse on trace finalization -> CSV/DB.")
     config_path: str | None = Field(
         default=None,
         description="path to profiler_config.json (from XTUNER_PROFILE_DYNAMIC_CONFIG_PATH).",
@@ -300,10 +300,10 @@ def profiling_config_from_env() -> ProfilingConfig | None:
 
     Also loads ``profiler_config.json`` from ``XTUNER_PROFILE_DYNAMIC_CONFIG_PATH``
     (existing env var; no new env introduced) into ``full_config``. Returns
-    ``None`` when ``XTUNER_PROFILE_ENABLE`` is unset / not truthy, so callers
+    ``None`` when ``XTUNER_NPU_PROFILE_V2_ENABLE`` is unset / not truthy, so callers
     can treat a ``None`` result as "profiling disabled".
     """
-    if not _get_bool_env("XTUNER_PROFILE_ENABLE", False):
+    if not _get_bool_env("XTUNER_NPU_PROFILE_V2_ENABLE", False):
         return None
     config_path = os.environ.get("XTUNER_PROFILE_DYNAMIC_CONFIG_PATH") or None
     sp = StaticParam(
@@ -317,7 +317,7 @@ def profiling_config_from_env() -> ProfilingConfig | None:
         end_step=_get_int_env("XTUNER_PROFILE_END_STEP", 11),
         data_simplification=_get_bool_env("XTUNER_PROFILE_DATA_SIMPLIFICATION", False),
         aic_metrics_type=os.environ.get("XTUNER_PROFILE_AIC_METRICS", "PipeUtilization"),
-        analyse_flag=_get_bool_env("XTUNER_PROFILE_ANALYSE_FLAG", True),
+        analyse_flag=_get_bool_env("XTUNER_PROFILE_ANALYSE_FLAG", False),
         config_path=config_path,
     )
     full = _load_full_config(config_path)

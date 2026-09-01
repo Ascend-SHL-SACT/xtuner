@@ -8,7 +8,7 @@ from xtuner.v1.utils import get_device
 if get_device() == "cuda":
     from .cuda_profile import profiling_memory, profiling_time
 elif get_device() == "npu":
-    if os.environ.get("XTUNER_PROFILE_ENABLE", "0") == "1":
+    if os.environ.get("XTUNER_NPU_PROFILE_V2_ENABLE", "0") == "1":
         from .npu_profile import profiling_memory
         from .profiler_v2 import (
             Profiler,
