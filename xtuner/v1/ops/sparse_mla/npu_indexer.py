@@ -42,7 +42,7 @@ def npu_dsa_topk_indices(
         index_topk: Number of top-k tokens to select (2048 for GLM-5.2).
 
     Returns:
-        ``[S, 1, K]`` int64 tensor. Invalid slots padded with -1.
+        ``[S, 1, K]`` int32 tensor. Invalid slots padded with -1.
     """
     query_len = q.shape[1]
     kv_len = k.shape[1]
@@ -52,10 +52,21 @@ def npu_dsa_topk_indices(
     num_segments = cu_seq_lens.numel() - 1
 
     if num_segments > 1:
-        return _indexer_tnd_packed(
+        topk_indices = _indexer_tnd_packed(
             q, k, weights, seq_ctx, cu_seq_lens, query_len, kv_len, topk, index_head_dim,
         )
-    return _indexer_bsnd_single(q, k, weights, seq_ctx, query_len, kv_len, topk)
+    else:
+        topk_indices = _indexer_bsnd_single(q, k, weights, seq_ctx, query_len, kv_len, topk)
+    # Keep the [S, 1, K] top-k cache int32: indices are bounded by the global
+    # kv_len (< 2**31), every consumer (ring remap, _rewrite_invalid_indices,
+    # _global_to_local_indices, npu_sparse_flash_attention[_grad]) is
+    # dtype-following, and the kernel takes int32. Halves the long-lived
+    # per-rank cache residency ([S_local, 1, K] per shared-source layer; e.g.
+    # 2 such layers at the 13B default cadence, 128 MiB per source at
+    # 256K/CP16). Arithmetic transients are only partially affected: the cast
+    # adds one [S, 1, K] copy here, and the packed-causal mask fill stays
+    # int64.
+    return topk_indices.to(torch.int32)
 
 
 # ---------------------------------------------------------------------------
