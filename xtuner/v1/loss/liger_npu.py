@@ -8,6 +8,7 @@ specifics live there.
 """
 
 import importlib
+import os
 import sys
 
 import torch
@@ -59,6 +60,14 @@ def _ensure_liger_npu() -> None:
     _patch_liger_ascend_fwd()
 
 
+# Patch configuration, read once at import. LOSS_CHUNK_SIZE is the same knob
+# that feeds CELossConfig.chunk_size in the config layer.
+# XTUNER_LIGER_CHUNK_FWD_LIMIT is in MiB.
+_CHUNK_FWD_ENABLED = os.environ.get("XTUNER_LIGER_CHUNK_FWD", "1") == "1"
+_CHUNK_FWD_LIMIT_BYTES = int(os.environ.get("XTUNER_LIGER_CHUNK_FWD_LIMIT", "2048")) * 1024**2
+_CE_CHUNK_ROWS = int(os.environ.get("LOSS_CHUNK_SIZE", "1024"))
+
+
 def _patch_liger_ascend_fwd() -> None:
     """Correct liger-ascend's FLCE forward loss via torch CE.
 
@@ -93,6 +102,88 @@ def _patch_liger_ascend_fwd() -> None:
     _orig_fwd = flce.fused_linear_cross_entropy_forward
 
     def _correct_fwd(*args, **kwargs):
+        _input = kwargs.get("_input")
+        weight = kwargs.get("weight")
+        target = kwargs.get("target")
+        if _input is None and args:
+            _input = args[0]
+        if weight is None and len(args) > 1:
+            weight = args[1]
+        if target is None and len(args) > 2:
+            target = args[2]
+        ignore_index = kwargs.get("ignore_index", -100)
+        reduction = kwargs.get("reduction", "mean")
+        bias = kwargs.get("bias")
+        # Chunked lm-head+CE: when the full ``[BT, V]`` logits would be large,
+        # compute the loss in BT-chunks so only a ``[chunk, V]`` slice is live
+        # at once. The upstream Ascend FLCE forward always materializes the
+        # full ``[BT, V]`` (``_input @ weight.t()``); at large local seq (e.g.
+        # 128K/CP16 -> ``[8192, 154880]`` ~= 2.5 GB) that single tensor OOMs
+        # with <2.2 GB free. Return empty ``logits_for_backward`` so backward
+        # recomputes per chunk (``has_saved_logits=False`` ->
+        # ``chunk_size=min(BT, 4096)``). CE is row-independent, so the chunked
+        # ``loss_1d`` is identical to the full path; the no-weight backward
+        # derives ``lse = loss_1d + x[y]`` from the (torch-correct) loss_1d
+        # and the recomputed logits, so grads match. Small BT keeps the fast
+        # saved-logits path (no regression at 64K/local4096). Gate: full logits
+        # bytes > limit (default 2048 MiB -> triggers at BT=8192, not BT=4096).
+        # Trade vs upstream's 4 GiB save limit: in the 2-4 GiB band (BT
+        # ~6965..13930, e.g. 128K/CP16 at BT=8192) HEAD's backward reused the
+        # saved logits while this path recomputes them per chunk (one extra
+        # lm-head GEMM, order tens of ms/step). At 256K (BT=16384, ~4.7 GiB)
+        # upstream would not have saved either, so there is no regression.
+        # The feature gate restricts the fast path to exactly the plain
+        # reduction="none" CE it implements (no ce_weight / smoothing /
+        # softcap / token-scaling extras); anything else falls through to
+        # upstream so its loss semantics stay upstream-correct.
+        _full_bytes = (
+            _input.shape[0] * weight.shape[0] * _input.element_size()
+            if _input is not None and weight is not None
+            else 0
+        )
+        if (
+            _CHUNK_FWD_ENABLED
+            and len(args) <= 3  # any positional beyond _input/weight/target -> unknown config
+            and _input is not None
+            and weight is not None
+            and _input.requires_grad
+            and bias is None
+            and kwargs.get("ce_weight") is None
+            and kwargs.get("softcap") is None
+            and not kwargs.get("label_smoothing", 0.0)
+            and not kwargs.get("lse_square_scale", 0.0)
+            and not kwargs.get("use_token_scaling", False)
+            and not kwargs.get("return_z_loss", False)
+            and not kwargs.get("return_token_accuracy", False)
+            and not kwargs.get("return_predicted_tokens", False)
+            and reduction == "none"
+            and _full_bytes > _CHUNK_FWD_LIMIT_BYTES
+        ):
+            _bt = _input.shape[0]
+            _chunk = _CE_CHUNK_ROWS
+            correct = torch.empty(_bt, dtype=torch.float32, device=_input.device)
+            for _s in range(0, _bt, _chunk):
+                _e = min(_s + _chunk, _bt)
+                _lc = _input[_s:_e] @ weight.t()
+                correct[_s:_e] = F.cross_entropy(
+                    _lc.float(),
+                    target[_s:_e],
+                    reduction="none",
+                    ignore_index=ignore_index,
+                )
+            loss = correct if reduction == "none" else correct.sum()
+            _ce_stats = flce._make_ce_stats_buffer(
+                target,
+                ignore_index,
+                None,
+                reduction,
+                target_mask=(target != ignore_index),
+            )
+            # (loss, None, None, None, loss_1d=correct, ce_stats, None,
+            #  plain_fast_path, logits_for_backward) -- the empty
+            # logits_for_backward makes backward recompute logits per chunk
+            # from _input/weight.
+            return (loss, None, None, None, correct, _ce_stats, None, True, None)
         out = _orig_fwd(*args, **kwargs)
         # out = (loss, None, None, None, loss_1d, ce_stats, None,
         #        plain_fast_path, logits_for_backward)
@@ -100,17 +191,6 @@ def _patch_liger_ascend_fwd() -> None:
             return out
         loss_1d = out[4]
         logits = out[8]
-        _input = kwargs.get("_input")
-        weight = kwargs.get("weight")
-        target = kwargs.get("target")
-        ignore_index = kwargs.get("ignore_index", -100)
-        reduction = kwargs.get("reduction", "mean")
-        if _input is None and args:
-            _input = args[0]
-        if weight is None and len(args) > 1:
-            weight = args[1]
-        if target is None and len(args) > 2:
-            target = args[2]
         if logits is None and _input is not None and weight is not None:
             logits = _input @ weight.t()
         if logits is None or target is None or loss_1d is None:
@@ -123,9 +203,9 @@ def _patch_liger_ascend_fwd() -> None:
         # loss_1d (and the backward grad that derives lse from it) is identical
         # to the full path.
         _bt = logits.shape[0]
-        if _bt > 1024:
+        if _bt > _CE_CHUNK_ROWS:
             correct = torch.empty(_bt, dtype=torch.float32, device=logits.device)
-            _chunk = 1024
+            _chunk = _CE_CHUNK_ROWS
             for _s in range(0, _bt, _chunk):
                 _e = min(_s + _chunk, _bt)
                 correct[_s:_e] = F.cross_entropy(
@@ -191,7 +271,18 @@ def _patch_liger_ascend_fwd() -> None:
         )
         ls_eps = float(ctx.label_smoothing) / float(V) if ctx.label_smoothing else 0.0
 
-        grad_accum_dtype = ctx.accum_dtype if num_chunks > 1 else None
+        # bf16 grad_weight in the multi-chunk (recompute) path too: at large
+        # local seq an fp32 grad_weight is a 3.8 GB persistent allocation
+        # ([154880,6144] x fp32) that leaves <0.5 GB for HCCL's all-reduce
+        # workspace at grad-norm/step_optimizer -> EL0004/207001. Trade: this
+        # ignores the caller's accum_dtype (ctx.accum_dtype is not consulted),
+        # and unlike the single-chunk path -- one fp32-internal GEMM rounded
+        # to bf16 once, i.e. the fp32 result rounded -- each per-chunk fp32
+        # partial here is rounded to bf16 before the bf16 add_ summation,
+        # adding up to ~1% relative per-element error on grad_weight vs fp32
+        # accumulation. grad_input is unaffected (chunks write disjoint rows,
+        # no cross-chunk accumulation). Accepted for the 256K memory floor.
+        grad_accum_dtype = None
         grad_input = torch.empty_like(_input)
         grad_weight = torch.empty_like(weight, dtype=grad_accum_dtype or weight.dtype, device=device)
         grad_bias = (
@@ -306,15 +397,14 @@ def _patch_liger_ascend_fwd() -> None:
             # pre-allocated grad_weight with no [V,H] grad_weight_ temp (~1.9GB
             # at V=154880), but Ascend's matmul(out=) does NOT auto-cast: the
             # out dtype must equal the computed dtype. That only holds for the
-            # single-chunk case (num_chunks == 1 -> grad_accum_dtype is None ->
-            # grad_weight is bf16, matching the bf16 operands). Multi-chunk
-            # allocates grad_weight in ctx.accum_dtype (fp32) for stable
-            # large-vocab accumulation; there matmul(out=fp32) from bf16
-            # operands would crash (no bf16->fp32 cast), so fall back to the
-            # grad_weight_ temp + copy_/add_ path -- copy_ and add_ DO auto-cast
-            # bf16->fp32. grad_weight is torch.empty_like (uninitialized), so
-            # chunk 0 must overwrite (copy_), never add_ (which would add into
-            # garbage).
+            # single-chunk case (num_chunks == 1 -> one matmul, no accumulation
+            # needed). Multi-chunk CANNOT use matmul(out=): it overwrites
+            # (losing earlier partials) instead of accumulating, so it must use
+            # the grad_weight_ temp + copy_/add_ path. grad_accum_dtype is now
+            # always None (bf16 grad_weight; see above), so copy_/add_ are
+            # bf16->bf16 (no cast, no crash). grad_weight is empty_like
+            # (uninitialized), so chunk 0 must overwrite (copy_), never add_
+            # (which would add into garbage).
             if num_chunks == 1:
                 torch.matmul(grad_logits_chunk.t(), input_chunk, out=grad_weight)
             else:
