@@ -315,7 +315,7 @@ class TestNPUDSATopKIndices:
         assert violations == 0, f"causal violations: {violations}"
 
     def test_output_shape_dtype(self):
-        """输出形状 [S, 1, K], dtype int64。"""
+        """输出形状 [S, 1, K], dtype int32。"""
         seq_lens = [256]
         topk = 128
         q, k, weights, seq_ctx = _make_inputs(seq_lens, num_index_heads=4, head_dim=INDEX_HEAD_DIM, device=DEVICE)
@@ -325,7 +325,7 @@ class TestNPUDSATopKIndices:
 
         S = sum(seq_lens)
         assert npu.shape == (S, 1, topk), f"shape mismatch: {npu.shape} != ({S}, 1, {topk})"
-        assert npu.dtype == torch.int64, f"dtype mismatch: {npu.dtype} != int64"
+        assert npu.dtype == torch.int32, f"dtype mismatch: {npu.dtype} != int32"
 
     def test_packed_causal_boundaries(self):
         """打包序列的边界: 序列 0 的 query 不应选到序列 1 的 KV。"""
