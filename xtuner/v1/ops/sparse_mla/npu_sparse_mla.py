@@ -24,6 +24,8 @@ Key implementation notes:
 Reference: mindspeed/core/transformer/experimental_attention_variant/dsa_fused.py:426-475
 """
 
+import os
+
 import torch
 import torch_npu
 
@@ -190,10 +192,167 @@ def _global_to_local_indices(
     seg_idx = torch.searchsorted(cu_seq_q_local[1:], q_positions, right=True)
     global_offsets = kv_seg_starts[seg_idx] + kv_slice_offset
 
-    local_indices = sparse_indices.squeeze(1).clone()
-    local_indices = local_indices - global_offsets.unsqueeze(1)
-    local_indices = local_indices.clamp(min=0)
+    local_indices = sparse_indices.squeeze(1) - global_offsets.unsqueeze(1)
+    # In-place clamp on the fresh subtraction result: the subtraction already
+    # materializes a new [S, K] buffer, so the extra out-of-place clamp (and
+    # the previous defensive clone) each doubled the transient footprint of
+    # the global-width index conversion.
+    local_indices = local_indices.clamp_(min=0)
     return local_indices.unsqueeze(1).contiguous()
+
+
+# ---------------------------------------------------------------------------
+# SP>1 packed path with KV-slice offload (custom autograd)
+# ---------------------------------------------------------------------------
+
+def _sp_mla_offload_enabled() -> bool:
+    """Whether the SP>1 packed path offloads its KV-slice copies to pinned CPU.
+
+    Gated by ``XTUNER_SP_MLA_OFFLOAD`` (default off). When off, the SP>1 path
+    keeps the slice copies on device under stock torch_npu autograd (HEAD
+    behavior), which starves the ``aclnnSparseFlashAttentionGrad`` workspace
+    at 256K (see the :class:`_SpTndSparseMlaFn` docstring).
+    """
+    return os.environ.get("XTUNER_SP_MLA_OFFLOAD", "0") == "1"
+
+
+class _SpTndSparseMlaFn(torch.autograd.Function):
+    """SP>1 TND sparse MLA with the KV-slice copies offloaded to pinned CPU.
+
+    torch_npu's stock autograd keeps the contiguous ``key``/``key_rope`` slice
+    copies on device from forward to backward of every layer; at 256K they
+    reach ~300 MiB per layer on the ranks whose slice spans nearly the whole
+    global sequence and starve the ``aclnnSparseFlashAttentionGrad`` workspace.
+    Forward mirrors the stock TND call, then moves the slice copies to pinned
+    CPU and frees the GPU copies; backward streams them back and runs one
+    ``npu_sparse_flash_attention_grad`` with the CP ring backward's grad
+    mapping (nope = ``dk + dv``, rope = ``dkr``). ``kv``/``k_rope`` are the
+    prefix-extended slice VIEWS, so autograd scatters the returned slice grads
+    into the full-width buffers and the upstream all-gather reduce-scatter is
+    unchanged. ``softmax_lse`` is detached (same contract as the CP path).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv: torch.Tensor,
+        k_rope: torch.Tensor,
+        indices: torch.Tensor,
+        cu_q: torch.Tensor,
+        cu_k: torch.Tensor,
+        kv_start: int,
+        shard_start: int,
+        scale_value: float,
+    ) -> SparseMLAOutputs:
+        device = q_nope.device
+        seq_len, num_heads, _ = q_nope.shape
+
+        query_tnd = q_nope.contiguous()  # [S, N, Rkv]
+        query_rope_tnd = q_rope.contiguous()  # [S, N, Dr]
+        key_tnd = kv.contiguous()  # [L, 1, Rkv]
+        key_rope_tnd = k_rope.contiguous()  # [L, 1, Dr]
+
+        sparse_indices = _rewrite_invalid_indices(indices, shard_start, device)
+        sparse_indices_tnd = _global_to_local_indices(sparse_indices, cu_q, cu_k, kv_start, seq_len, device)
+
+        attn_outs = torch_npu.npu_sparse_flash_attention(
+            query_tnd,
+            key_tnd,
+            key_tnd,  # value = key (absorbed MLA)
+            sparse_indices=sparse_indices_tnd,
+            block_table=None,
+            actual_seq_lengths_query=cu_q,
+            actual_seq_lengths_kv=cu_k,
+            query_rope=query_rope_tnd,
+            key_rope=key_rope_tnd,
+            scale_value=scale_value,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="TND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=True,
+        )
+        outputs = _parse_attn_outs(attn_outs, seq_len, num_heads, device)
+        ctx.mark_non_differentiable(outputs.softmax_lse)
+
+        # Offload only when this invocation builds a graph node whose backward
+        # will consume the slices (kv requires grad). Under no_grad (the
+        # checkpoint's original forward) the ctx — and with it the pinned
+        # buffers — would be dropped the instant apply() returns, freeing them
+        # while the D2H may still be in flight; skipping there also avoids a
+        # wasted ~290 MiB D2H per layer, since the recompute's grad-enabled
+        # forward re-offloads for its own backward. When offloading, the copy
+        # is enqueued on the current stream, the GPU copies are released to
+        # the same stream (so any reuse of their blocks is stream-ordered
+        # after the copy), and the pinned buffers stay alive in ctx until
+        # backward streams them back with async H2D on that same stream.
+        if kv.requires_grad:
+            key_cpu = torch.empty(key_tnd.shape, dtype=key_tnd.dtype, pin_memory=True, device="cpu")
+            rope_cpu = torch.empty(key_rope_tnd.shape, dtype=key_rope_tnd.dtype, pin_memory=True, device="cpu")
+            key_cpu.copy_(key_tnd, non_blocking=True)
+            rope_cpu.copy_(key_rope_tnd, non_blocking=True)
+            del key_tnd, key_rope_tnd
+            key_saved, rope_saved = key_cpu, rope_cpu
+        else:
+            key_saved, rope_saved = key_tnd, key_rope_tnd
+
+        ctx.scale_value = scale_value
+        ctx.save_for_backward(
+            query_tnd,
+            query_rope_tnd,
+            key_saved,
+            rope_saved,
+            sparse_indices_tnd,
+            outputs.raw_output,
+            attn_outs[1].float().contiguous(),
+            attn_outs[2].float().contiguous(),
+            cu_q,
+            cu_k,
+        )
+        return outputs
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: torch.Tensor,
+        _grad_lse: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None, None, None]:
+        query_tnd, query_rope_tnd, key_cpu, rope_cpu, sparse_indices_tnd, raw_output, smax, ssum, cu_q, cu_k = (
+            ctx.saved_tensors
+        )
+        if key_cpu.device.type == "cpu":
+            key_tnd = key_cpu.to(query_tnd.device, non_blocking=True)
+            key_rope_tnd = rope_cpu.to(query_tnd.device, non_blocking=True)
+        else:
+            key_tnd, key_rope_tnd = key_cpu, rope_cpu
+
+        grad_out = grad_output.reshape(query_tnd.shape).contiguous().to(query_tnd.dtype)
+
+        dq, dk, dv, dqr, dkr = torch_npu.npu_sparse_flash_attention_grad(
+            query_tnd,
+            key_tnd,
+            key_tnd,  # value = key
+            sparse_indices_tnd,
+            grad_out,
+            raw_output,
+            smax,
+            ssum,
+            ctx.scale_value,
+            1,  # sparse_block_size
+            query_rope=query_rope_tnd,
+            key_rope=key_rope_tnd,
+            actual_seq_qlen=cu_q,
+            actual_seq_kvlen=cu_k,
+            layout="TND",
+            sparse_mode=3,
+            attention_mode=2,
+        )
+        # Slice grads; autograd scatters them into the full-width buffers and
+        # the upstream all-gather reduce-scatters them unchanged.
+        return dq, dqr, dk + dv, dkr, None, None, None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +403,10 @@ def _sparse_mla_tnd_packed(
     SP=1: Full global KV, global cu_seq_lens.
     SP>1: Prefix-extended KV slice with asymmetric cu_seq_q / cu_seq_kv.
           KV slice ``[kv_start, kv_end)`` may extend before ``shard_start``
-          to include the full segment prefix (MindSpeed approach).
+          to include the full segment prefix (MindSpeed approach). With
+          ``XTUNER_SP_MLA_OFFLOAD=1`` routed through :class:`_SpTndSparseMlaFn`,
+          which owns forward+backward and offloads the slice copies to pinned
+          CPU between the two; otherwise stock autograd (HEAD behavior).
     """
     device = q_nope.device
     shard_start = getattr(seq_ctx, '_shard_start', 0)
@@ -266,6 +428,24 @@ def _sparse_mla_tnd_packed(
         cu_seq_q_local, cu_seq_k_local, kv_start, kv_end = _compute_prefix_extended_kv_slice(
             cu_seq_q_global, shard_start, shard_end, device,
         )
+        if _sp_mla_offload_enabled():
+            # Function.apply flattens namedtuples, so re-wrap into SparseMLAOutputs.
+            return SparseMLAOutputs(
+                *_SpTndSparseMlaFn.apply(
+                    q_nope,
+                    q_rope,
+                    kv_compressed[kv_start:kv_end],
+                    k_rope[kv_start:kv_end],
+                    indices,
+                    cu_seq_q_local,
+                    cu_seq_k_local,
+                    kv_start,
+                    shard_start,
+                    scale_value,
+                )
+            )
+        # Gate off: stock autograd (HEAD behavior) keeps the slice copies on
+        # device from forward to backward.
         key_tnd = kv_compressed[kv_start:kv_end].contiguous()
         value_tnd = key_tnd
         key_rope_tnd = k_rope[kv_start:kv_end].contiguous()
