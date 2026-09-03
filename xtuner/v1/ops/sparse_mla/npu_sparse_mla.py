@@ -192,9 +192,12 @@ def _global_to_local_indices(
     seg_idx = torch.searchsorted(cu_seq_q_local[1:], q_positions, right=True)
     global_offsets = kv_seg_starts[seg_idx] + kv_slice_offset
 
-    local_indices = sparse_indices.squeeze(1).clone()
-    local_indices = local_indices - global_offsets.unsqueeze(1)
-    local_indices = local_indices.clamp(min=0)
+    local_indices = sparse_indices.squeeze(1) - global_offsets.unsqueeze(1)
+    # In-place clamp on the fresh subtraction result: the subtraction already
+    # materializes a new [S, K] buffer, so the extra out-of-place clamp (and
+    # the previous defensive clone) each doubled the transient footprint of
+    # the global-width index conversion.
+    local_indices = local_indices.clamp_(min=0)
     return local_indices.unsqueeze(1).contiguous()
 
 
