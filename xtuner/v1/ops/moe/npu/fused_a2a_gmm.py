@@ -47,42 +47,12 @@ from xtuner.v1.module.dispatcher.torch_all2all import (
 from xtuner.v1.module.grouped_linear.moe_group_linear import GroupedLinear
 from xtuner.v1.ops import unpermute
 from xtuner.v1.utils.interleaved_ep import histc_for_dispatch
-from xtuner.v1.utils.profile import _in_autograd_backward
 
 
 if TYPE_CHECKING:
     from xtuner.v1.module import RouterResults
     from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEDecoderLayer
     from xtuner.v1.module.dispatcher import PreDispatchResult
-
-
-# LIFO cache of (send_counts, recv_counts, group_list) pushed in the forward and popped in the
-# backward recompute, mirroring ``torch_all2all._a2a_split_cache``. Under activation-checkpoint
-# recompute (``RECOMPUTE_RATIO > 0``) the backward re-runs ``fused_dispatch_mlp_combine``; without
-# the cache this re-issues the host-blocking metadata ``all_to_all_single`` per layer, which
-# mismatches across ranks under cross-rank backward drift and yields nan grads. Popping the
-# forward's counts skips that re-issue so only the fused op's device-async payload a2a re-runs.
-_fused_counts_cache: list[tuple[list[int], list[int], list[int]]] = []
-
-
-def _fused_cache_enabled() -> bool:
-    """Whether the fused counts cache should activate.
-
-    Mirrors ``torch_all2all._a2a_cache_enabled``: requires BOTH the env opt-in
-    (``XTUNER_MOE_A2A_CACHE_SPLITS=1``) AND activation-checkpoint recompute on
-    (``RECOMPUTE_RATIO > 0``). Without recompute the forward pushes are never popped (unbounded
-    leak), so the recompute ratio gates the push at the source. Default OFF (no push, no leak).
-
-    Returns:
-        bool: True when the cache should push (forward) / pop (backward recompute).
-    """
-    if os.environ.get("XTUNER_MOE_A2A_CACHE_SPLITS", "0") != "1":
-        return False
-    try:
-        ratio = float(os.environ.get("RECOMPUTE_RATIO", "0"))
-    except (TypeError, ValueError):
-        return False
-    return ratio > 0.0
 
 
 def is_enabled() -> bool:
@@ -127,14 +97,6 @@ def _compute_counts(
     a2a + gmm, not this cheap count exchange). No new all-gather: the ``[ep, e_local]`` recv grid is
     the all-to-all of this rank's per-global-expert counts.
 
-    Under activation-checkpoint recompute (``RECOMPUTE_RATIO > 0``), the backward re-runs the whole
-    MoE forward (including this function). Re-issuing the host-blocking ``all_to_all_single`` per layer
-    in the backward mismatches across ranks under cross-rank backward drift, yielding nan grads. The
-    ``_fused_counts_cache`` (mirroring ``torch_all2all._a2a_split_cache``) pushes the forward's counts
-    (LIFO) and pops them in the backward recompute, skipping the metadata a2a so only the fused op's
-    device-async payload a2a re-runs. The cache is gated by ``_fused_cache_enabled`` (requires the
-    ``XTUNER_MOE_A2A_CACHE_SPLITS=1`` opt-in AND ``RECOMPUTE_RATIO > 0``, default OFF = no push/leak).
-
     Args:
         topk_ids (torch.Tensor): per-token routed expert ids, ``[n_local, topk]``.
         n_routed_experts (int): global expert count (``= ep * e_local``).
@@ -147,13 +109,6 @@ def _compute_counts(
         and ``group_list`` is the per-local-expert received count (length ``e_local``) for the dW
         matmul loop.
     """
-    use_cache = _fused_cache_enabled()
-    in_bwd = _in_autograd_backward()
-    # Backward recompute: reuse the forward's cached counts (LIFO pop) and skip the host-blocking
-    # metadata a2a + D2H -- only the fused op's device-async payload a2a re-issues, so no
-    # call-order-matched host collective can mismatch under cross-rank backward drift.
-    if use_cache and in_bwd and _fused_counts_cache:
-        return _fused_counts_cache.pop()
     ep_size = ep_group.size()
     e_local = n_routed_experts // ep_size
     # send_counts: this rank's per-global-expert counts (length n_routed_experts = ep * e_local).
@@ -166,9 +121,6 @@ def _compute_counts(
     recv_counts = recv_grid.ravel().to("cpu").tolist()
     # group_list: per-local-expert received count = sum over source ranks (for the dW matmul loop).
     group_list = recv_grid.sum(dim=0).to("cpu").tolist()
-    # Forward: cache the counts for the matching backward recompute (LIFO).
-    if use_cache and not in_bwd:
-        _fused_counts_cache.append((send_counts, recv_counts, group_list))
     return send_counts, recv_counts, group_list
 
 
