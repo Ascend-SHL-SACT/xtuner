@@ -46,7 +46,6 @@ from xtuner.v1.module.dispatcher.torch_all2all import (
 )
 from xtuner.v1.module.grouped_linear.moe_group_linear import GroupedLinear
 from xtuner.v1.ops import unpermute
-from xtuner.v1.utils.interleaved_ep import histc_for_dispatch
 
 
 if TYPE_CHECKING:
@@ -112,7 +111,7 @@ def _compute_counts(
     ep_size = ep_group.size()
     e_local = n_routed_experts // ep_size
     # send_counts: this rank's per-global-expert counts (length n_routed_experts = ep * e_local).
-    tokens_per_expert = histc_for_dispatch(topk_ids, n_routed_experts, ep_size)
+    tokens_per_expert = torch.histc(topk_ids, bins=n_routed_experts, min=0, max=n_routed_experts)
     # recv grid: all-to-all of per-global-expert counts -> [ep, e_local] (source-rank-major).
     recv_grid = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
     dist.all_to_all_single(recv_grid, tokens_per_expert, group=ep_group)

@@ -58,7 +58,6 @@ from xtuner.v1.ops.moe.npu.fused_a2a_gmm import (
     fused_dispatch_mlp_combine,
 )
 from xtuner.v1.ops.moe.npu.group_gemm import npu_group_gemm
-from xtuner.v1.utils.interleaved_ep import histc_for_dispatch
 
 
 # GLM-5.2-13B dims (the 744B MoE shapes at 13B scale).
@@ -221,7 +220,7 @@ class TestAlltoallvGmmCounts(DistributedTestBase):
 
         # Baseline: all-gather each rank's per-global-expert counts, then index this rank's local
         # experts out of every source rank's counts (no all-to-all → independent of _compute_counts).
-        local_counts = histc_for_dispatch(topk_ids, N_EXPERTS, ws)
+        local_counts = torch.histc(topk_ids, bins=N_EXPERTS, min=0, max=N_EXPERTS)
         all_counts = [torch.empty_like(local_counts) for _ in range(ws)]
         dist.all_gather(all_counts, local_counts, group=ep_group)
         my_start = e_local * rank
