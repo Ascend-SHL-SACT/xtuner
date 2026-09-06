@@ -3,12 +3,11 @@ from typing import Literal
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.float8.float8_gmm_tile_wise import TileWiseFloat8GroupedLinear
 from xtuner.v1.ops import group_gemm
-from xtuner.v1.utils.interleaved_ep import shard_expert_tensor
 from xtuner.v1.utils.interleaved_shard import InterleavedShard
 
 
@@ -110,7 +109,7 @@ class GroupedLinear(nn.Module):
         else:
             weight = torch.empty(num_routed_experts * out_features, in_features)
             if self.ep_mesh is not None and self.ep_mesh.size() > 1:
-                self.weight = nn.Parameter(shard_expert_tensor(weight, num_routed_experts, self.ep_mesh))
+                self.weight = nn.Parameter(distribute_tensor(weight, ep_mesh, [Shard(0)]))
             else:
                 self.weight = nn.Parameter(weight)
 
@@ -137,7 +136,7 @@ class GroupedLinear(nn.Module):
                 else:
                     bias = torch.zeros(num_routed_experts * out_features)
                     if self.ep_mesh is not None and self.ep_mesh.size() > 1:
-                        self.bias = nn.Parameter(shard_expert_tensor(bias, num_routed_experts, self.ep_mesh))
+                        self.bias = nn.Parameter(distribute_tensor(bias, self.ep_mesh, [Shard(0)]))
                     else:
                         self.bias = nn.Parameter(bias)
             else:
@@ -156,7 +155,7 @@ class GroupedLinear(nn.Module):
                 elif self.tp_enabled:
                     self.bias = nn.Parameter(torch.zeros(self.local_num_routed_experts, out_features))
                 elif self.ep_mesh is not None and self.ep_mesh.size() > 1:
-                    self.bias = nn.Parameter(shard_expert_tensor(bias, num_routed_experts, self.ep_mesh))
+                    self.bias = nn.Parameter(distribute_tensor(bias, ep_mesh, [Shard(0)]))
                 else:
                     self.bias = nn.Parameter(bias)
 
