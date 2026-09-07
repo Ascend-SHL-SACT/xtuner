@@ -10,8 +10,10 @@ from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.comm import gather_for_sequence_parallel
+from xtuner.v1.ops.cp.ring_attention import RingAttentionCP, _cp_ring_enabled
 from xtuner.v1.ops.sparse_mla import (
     DSATopKIndicesProtocol,
+    SparseMLAOutputs,
     SparseMLAProtocol,
     ensure_cudnn_dsa_runtime_available,
     ensure_tilelang_runtime_available,
@@ -362,8 +364,13 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         # Its top-k is also head-independent: every head shard would need the full
         # [global_seq, 1, topk] cache, plus query/output all-to-all. Gathering only
         # the small compressed KV keeps all heads and the large top-k cache local.
-        # key_states: [S_g, 1, Rkv + Dr]
-        key_states = gather_for_sequence_parallel(key_states, dim=0, sp_mesh=seq_ctx.sequence_parallel_mesh)
+        # CP ring rotates the local attention KV instead of all-gathering it;
+        # the (small) indexer key is still all-gathered separately so the DSA
+        # top-k stays global. Gated by XTUNER_CP_RING (see _cp_ring_enabled).
+        cp_ring = _cp_ring_enabled(seq_ctx)
+        if not cp_ring:
+            # key_states: [S_g, 1, Rkv + Dr]
+            key_states = gather_for_sequence_parallel(key_states, dim=0, sp_mesh=seq_ctx.sequence_parallel_mesh)
 
         # topk_indices: [S, 1, K]
         topk_indices = get_dsa_topk_sharing_runtime().get_or_compute(
@@ -376,14 +383,29 @@ class DSAMultiLatentAttention(MultiLatentAttention):
                 seq_ctx,
             ),
         )
-        sparse_mla_outputs = self.sparse_mla_func(
-            query_states,
-            key_states,
-            topk_indices,
-            self.softmax_scale,
-            value_dim=self.kv_lora_rank,
-            seq_ctx=seq_ctx,
-        )
+        if cp_ring:
+            cp_mesh = seq_ctx.sequence_parallel_mesh
+            assert cp_mesh is not None
+            raw_output, softmax_lse = RingAttentionCP.apply(
+                query_states,
+                key_states,
+                topk_indices,
+                self.softmax_scale,
+                cp_mesh.get_group(),
+                cp_mesh.size(),
+                seq_ctx.sp_rank,
+                seq_ctx,
+            )
+            sparse_mla_outputs = SparseMLAOutputs(raw_output=raw_output, softmax_lse=softmax_lse)
+        else:
+            sparse_mla_outputs = self.sparse_mla_func(
+                query_states,
+                key_states,
+                topk_indices,
+                self.softmax_scale,
+                value_dim=self.kv_lora_rank,
+                seq_ctx=seq_ctx,
+            )
         # raw_output: [S, N, Rkv]; softmax_lse: [S, N]
         raw_output = sparse_mla_outputs.raw_output
         softmax_lse = sparse_mla_outputs.softmax_lse
