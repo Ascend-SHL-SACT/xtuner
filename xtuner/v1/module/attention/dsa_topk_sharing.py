@@ -316,7 +316,7 @@ class CrossLayerTopKSharingRuntime:
 
         dev = get_device()
         is_accel_available = (dev == "cuda" and torch.cuda.is_available()) or (
-            dev == "npu" and torch.npu.is_available()
+            dev == "npu" and torch.npu.is_available()  # type: ignore[attr-defined]
         )
         if _dsa_topk_offload_enabled() and is_accel_available:
             return self._offloaded_residency
