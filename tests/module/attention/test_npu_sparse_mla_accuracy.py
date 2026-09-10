@@ -23,8 +23,8 @@ NPU aclnnSparseFlashAttention 硬性要求 qk_head_dim=512，
     test_backward_packed_three_segments
   TestNPUDSAAttention (端到端, 从 dsa_mla.py 构建完整 attention)
     test_packed_inputs_respect_causal_boundaries_and_backward
-    test_shared_layers_reuse_topk_without_cross_context_leak
-    test_reentrant_checkpoint_reuses_and_releases_topk
+    test_shared_layer_consumes_explicit_topk_ids
+    test_checkpoint_reuses_source_topk_storage
   TestNPUDSASequenceParallel (SP2, 需 torchrun)
     test_packed_attention_matches_full_sequence
 
@@ -32,24 +32,23 @@ NPU aclnnSparseFlashAttention 硬性要求 qk_head_dim=512，
   BF16_ATOL = 1e-2, BF16_RTOL = 1.6e-2  (前向 output, lse, q_grad)
   DKV_ATOL  = 5e-2, DKV_RTOL  = 5e-2    (kv_grad)
 """
-import math
 import os
 import sys
 
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "1")
 
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.model.utils import checkpoint_wrapper
-from xtuner.v1.module.attention import DSAMLAConfig
-from xtuner.v1.module.attention.dsa_topk_sharing import register_dsa_topk_decoder_lifecycle_hooks
+from xtuner.v1.model.moe.glm52 import DSAMLAConfig
+from xtuner.v1.model.utils import apply_activation_checkpointing
 from xtuner.v1.ops.sparse_mla import sparse_mla
 from xtuner.v1.utils.test_utils import init_data_mesh
+
 
 # NPU kernel 硬性约束：qk_head_dim 必须为 512
 DIM = 576          # Rkv(512) + Dr(64)
@@ -575,8 +574,8 @@ class TestNPUDSAAttention:
         del attention, out, seq_ctx
         torch.npu.empty_cache()
 
-    def test_shared_layers_reuse_topk_without_cross_context_leak(self):
-        """验证 shared attention 复用同一 SequenceContext 的 source top-k，其他 context 保持独立。"""
+    def test_shared_layer_consumes_explicit_topk_ids(self):
+        """验证 shared attention 复用显式 top-k IDs，并在漏传时立即报错。"""
         torch.manual_seed(0)
         device = "npu" if _npu_available() else "cpu"
         seq_lens = [128, 128]
@@ -587,7 +586,6 @@ class TestNPUDSAAttention:
         shared_attention = _tiny_dsa_attention(
             indexer_types=["full", "shared"], layer_idx=1, sparse_mla_backend="torch_npu",
         ).to(device)
-        shared_attention.indexer = source_attention.indexer
 
         hidden = torch.randn(1, total, 256, device=device, dtype=torch.bfloat16) * 0.02
         position_embeddings = (
@@ -603,43 +601,42 @@ class TestNPUDSAAttention:
         )
 
         out1 = source_attention(hidden, position_embeddings, seq_ctx)
-        out2 = shared_attention(hidden, position_embeddings, seq_ctx)
+        dsa_topk_ids = out1["dsa_topk_ids"]
+        out2 = shared_attention(hidden, position_embeddings, seq_ctx, dsa_topk_ids=dsa_topk_ids)
         _sync()
 
         assert torch.isfinite(out1["projected_output"]).all()
         assert torch.isfinite(out2["projected_output"]).all()
+        assert out2["dsa_topk_ids"] is dsa_topk_ids
+        with pytest.raises(RuntimeError, match="requires dsa_topk_ids"):
+            shared_attention(hidden, position_embeddings, seq_ctx)
+        _sync()
 
-    @pytest.mark.xfail(reason="checkpoint + shared layer top-k cache 在 NO_REENTRANT 模式下后半段 NaN, 需完整 decoder hooks 支持")
-    def test_reentrant_checkpoint_reuses_and_releases_topk(self):
-        """验证真实 source/shared decoder 经 reentrant checkpoint 重算后梯度有限且缓存释放。"""
+    def test_checkpoint_reuses_source_topk_storage(self):
+        """验证显式 top-k IDs 穿过 reentrant checkpoint 且真实 indexer backend 只执行一次。"""
         torch.manual_seed(0)
         device = "npu" if _npu_available() else "cpu"
         seq_lens = [128, 128]
         total = sum(seq_lens)
-        source_block = checkpoint_wrapper(
-            _TinyDsaDecoderBlock(_tiny_dsa_attention(indexer_types=["full", "shared"], layer_idx=0, sparse_mla_backend="torch_npu")).to(device),
-            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        # norm/MLP 参数必须与输入同为 bf16，否则 fp32 会传播进 sparse_mla，
+        # aclnnSparseFlashAttention 仅支持 fp16/bf16。
+        source_block = apply_activation_checkpointing(
+            _TinyDsaDecoderBlock(
+                _tiny_dsa_attention(indexer_types=["full", "shared"], layer_idx=0, sparse_mla_backend="torch_npu")
+            ).to(device=device, dtype=torch.bfloat16)
         )
-        shared_block = checkpoint_wrapper(
-            _TinyDsaDecoderBlock(_tiny_dsa_attention(indexer_types=["full", "shared"], layer_idx=1, sparse_mla_backend="torch_npu")).to(device),
-            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        shared_block = apply_activation_checkpointing(
+            _TinyDsaDecoderBlock(
+                _tiny_dsa_attention(indexer_types=["full", "shared"], layer_idx=1, sparse_mla_backend="torch_npu")
+            ).to(device=device, dtype=torch.bfloat16)
         )
-        # Share the indexer so shared layer reuses source layer's top-k computation.
-        # Full decoder lifecycle hooks require a real decoder module (self_attn +
-        # MLP + norm); _TinyDsaDecoderBlock is a minimal test stub that does not
-        # support the full hook lifecycle, so we rely on direct indexer sharing
-        # instead of register_dsa_topk_decoder_lifecycle_hooks.
-        source_inner = source_block._checkpoint_wrapped_module
-        shared_inner = shared_block._checkpoint_wrapped_module
-        shared_inner.self_attn.indexer = source_inner.self_attn.indexer
 
-        hidden = torch.randn(1, total, 256, device=device, dtype=torch.bfloat16, requires_grad=True) * 0.02
+        # 缩放后再置 requires_grad，保证 hidden 是叶子（.grad 可写入）。
+        hidden = (torch.randn(1, total, 256, device=device, dtype=torch.bfloat16) * 0.02).requires_grad_()
         position_embeddings = (
             torch.randn(1, total, 64, device=device, dtype=torch.bfloat16) * 0.01,
             torch.randn(1, total, 64, device=device, dtype=torch.bfloat16) * 0.01,
         )
-        # Source and shared share the same seq_ctx so that shared layer
-        # can read source layer's top-k from the cache.
         cu = torch.cumsum(torch.tensor([0] + list(seq_lens), dtype=torch.int32, device=device), 0).to(torch.int32)
         seq_ctx = SequenceContext(
             input_ids=torch.arange(total, device=device).unsqueeze(0).long(),
@@ -647,32 +644,62 @@ class TestNPUDSAAttention:
             max_length_q=128, max_length_k=128,
             device=device, shard_start=0, shard_size=total,
         )
+        indexer_calls = 0
 
-        x = source_block(hidden, position_embeddings, seq_ctx)
-        x = shared_block(x, position_embeddings, seq_ctx)
-        _sync()
-        assert torch.isfinite(x).all(), "forward output has NaN/Inf"
-        x.sum().backward()
-        _sync()
+        def count_indexer_call(*_args):
+            nonlocal indexer_calls
+            indexer_calls += 1
+
+        hook = source_block.self_attn.indexer.register_forward_hook(count_indexer_call)
+
+        try:
+            source_out = source_block(hidden, position_embeddings, seq_ctx)
+            source_ids = source_out["dsa_topk_ids"]
+            shared_out = shared_block(
+                source_out["hidden_states"], position_embeddings, seq_ctx, dsa_topk_ids=source_ids
+            )
+            shared_ids = shared_out["dsa_topk_ids"]
+            _sync()
+            assert shared_ids.untyped_storage().data_ptr() == source_ids.untyped_storage().data_ptr()
+            shared_out["hidden_states"].sum().backward()
+            _sync()
+        finally:
+            hook.remove()
 
         assert hidden.grad is not None, "hidden grad is None (gradient not propagated)"
         assert torch.isfinite(hidden.grad).all(), "hidden grad has NaN/Inf"
+        assert source_ids.dtype == torch.int32
+        assert indexer_calls == 1
 
         # Clean up
-        del source_block, shared_block, x, hidden, seq_ctx
+        del source_block, shared_block, source_out, shared_out, hidden, seq_ctx
         torch.npu.empty_cache()
 
 
 class _TinyDsaDecoderBlock(nn.Module):
-    def __init__(self, attention):
+    """最小 decoder block：attention + RMSNorm + MLP，返回 hidden_states 与 dsa_topk_ids。"""
+
+    def __init__(self, attention, hidden_size: int = 256):
         super().__init__()
         self.self_attn = attention
-        hidden = 256
-        self.norm = nn.RMSNorm(hidden)
+        self.norm = nn.RMSNorm(hidden_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.Linear(hidden_size * 2, hidden_size),
+        )
 
-    def forward(self, x: torch.Tensor, position_embeddings: tuple, seq_ctx: object) -> torch.Tensor:
-        attn_out = self.self_attn(self.norm(x), position_embeddings, seq_ctx)["projected_output"]
-        return x + attn_out
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple,
+        seq_ctx: object,
+        dsa_topk_ids: torch.Tensor | None = None,
+    ) -> dict:
+        attn_out = self.self_attn(self.norm(hidden_states), position_embeddings, seq_ctx, dsa_topk_ids=dsa_topk_ids)
+        hidden_states = hidden_states + attn_out["projected_output"]
+        hidden_states = hidden_states + self.mlp(hidden_states)
+        return {"hidden_states": hidden_states, "dsa_topk_ids": attn_out["dsa_topk_ids"]}
 
 
 # ── 序列并行测试 (需 torchrun --nproc_per_node 2) ─────────────────────────
