@@ -29,6 +29,7 @@ import os
 import torch
 import torch_npu
 
+from .npu_indexer import _compute_prefix_extended_kv_slice, get_sp_mode_and_slice
 from .protocol import SparseMLAOutputs
 
 
@@ -91,57 +92,6 @@ def npu_sparse_mla(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _compute_prefix_extended_kv_slice(
-    cu_seq_q_global: torch.Tensor,
-    shard_start: int,
-    shard_end: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-    """Compute prefix-extended KV slice range and local cu_seq_lens.
-
-    For each segment overlapping ``[shard_start, shard_end)``:
-      - Q overlap is clipped to ``[max(seg, shard_start), min(seg, shard_end)]``
-      - KV overlap starts from ``seg_start`` (includes prefix before shard_start)
-      - When ``seg_start < shard_start``, ``kv_start`` extends backward
-
-    Returns ``(cu_seq_q_local, cu_seq_k_local, kv_start, kv_end)``.
-    The two cu_seq tensors have the same segment count but possibly
-    different per-segment lengths (KV segments may be longer due to prefix).
-    """
-    seg_boundaries = cu_seq_q_global.tolist()
-    kv_start = shard_start
-    rank_cu_q = [0]
-    rank_cu_kv = [0]
-    cur_q = 0
-    cur_kv = 0
-
-    for i in range(1, len(seg_boundaries)):
-        seg_start = seg_boundaries[i - 1]
-        seg_end = seg_boundaries[i]
-        if seg_end <= shard_start:
-            continue
-        if seg_start >= shard_end:
-            break
-
-        q_len = min(seg_end, shard_end) - max(seg_start, shard_start)
-        if q_len > 0:
-            cur_q += q_len
-            rank_cu_q.append(cur_q)
-
-        kv_len_seg = min(seg_end, shard_end) - seg_start
-        if kv_len_seg > 0:
-            cur_kv += kv_len_seg
-            rank_cu_kv.append(cur_kv)
-
-        if seg_start < shard_start:
-            kv_start = seg_start
-
-    kv_end = shard_end
-    cu_q = torch.tensor(rank_cu_q, dtype=torch.int32, device=device)
-    cu_kv = torch.tensor(rank_cu_kv, dtype=torch.int32, device=device)
-    return cu_q, cu_kv, kv_start, kv_end
-
 
 def _rewrite_invalid_indices(
     indices: torch.Tensor,
@@ -411,8 +361,9 @@ def _sparse_mla_tnd_packed(
     device = q_nope.device
     shard_start = getattr(seq_ctx, '_shard_start', 0)
 
-    cu_seq_q_global = seq_ctx.cu_seq_lens_q.to(torch.int32).to(device)
-    is_sp1 = (shard_start == 0 and seq_len == cu_seq_q_global[-1].item())
+    is_sp1, cu_seq_q_global, slice_meta = get_sp_mode_and_slice(
+        seq_ctx, shard_start, seq_len, device, _compute_prefix_extended_kv_slice
+    )
 
     if is_sp1:
         # ── SP=1: full global KV ──
@@ -424,10 +375,8 @@ def _sparse_mla_tnd_packed(
         kv_slice_offset = 0
     else:
         # ── SP>1: prefix-extended KV slice ──
-        shard_end = shard_start + seq_len
-        cu_seq_q_local, cu_seq_k_local, kv_start, kv_end = _compute_prefix_extended_kv_slice(
-            cu_seq_q_global, shard_start, shard_end, device,
-        )
+        assert slice_meta is not None
+        cu_seq_q_local, cu_seq_k_local, kv_start, kv_end = slice_meta
         if _sp_mla_offload_enabled():
             # Function.apply flattens namedtuples, so re-wrap into SparseMLAOutputs.
             return SparseMLAOutputs(
