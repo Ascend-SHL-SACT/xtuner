@@ -16,6 +16,9 @@ Reference:
   - CANN 9.1.0: cann_ops_transformer.ops.lightning_indexer (LightningIndexerV2)
 """
 
+import weakref
+from collections.abc import Callable
+
 import torch
 import torch_npu
 
@@ -64,9 +67,82 @@ def npu_dsa_topk_indices(
     # per-rank cache residency ([S_local, 1, K] per shared-source layer; e.g.
     # 2 such layers at the 13B default cadence, 128 MiB per source at
     # 256K/CP16). Arithmetic transients are only partially affected: the cast
-    # adds one [S, 1, K] copy here, and the packed-causal mask fill stays
-    # int64.
+    # adds one [S, 1, K] copy here, while the packed-causal mask fill in the
+    # TND path below stays int32 end to end (the BSND path still fills int64).
     return topk_indices.to(torch.int32)
+
+
+# ---------------------------------------------------------------------------
+# Shared SP-mode / KV-slice cache (also consumed by npu_sparse_mla)
+# ---------------------------------------------------------------------------
+
+# (cu_seq_q_local, cu_seq_k_local, kv_start, kv_end) as produced by the
+# prefix-extended KV-slice helpers in the sparse-MLA and indexer backends.
+SpSliceMeta = tuple[torch.Tensor, torch.Tensor, int, int]
+
+# Entries are keyed by (shard_start, seq_len) and additionally bake in the
+# first caller's device. A context lives on exactly one device per process,
+# so the device is not part of the key.
+_SP_SLICE_CACHE: weakref.WeakKeyDictionary[
+    SequenceContext, dict[tuple[int, int], tuple[bool, torch.Tensor, SpSliceMeta | None]]
+] = weakref.WeakKeyDictionary()
+
+
+def get_sp_mode_and_slice(
+    seq_ctx: SequenceContext,
+    shard_start: int,
+    seq_len: int,
+    device: torch.device,
+    compute_slice: Callable[[torch.Tensor, int, int, torch.device], SpSliceMeta],
+) -> tuple[bool, torch.Tensor, SpSliceMeta | None]:
+    """Per-``SequenceContext`` cache of the SP-mode flag and KV-slice metadata.
+
+    Replaces the per-layer ``.item()`` SP-mode probe and the prefix-extended
+    KV-slice recomputation (``.tolist()`` host sync, Python segment loop and
+    per-call H2D tensor builds) with one computation per (context, shard,
+    length). The cached values are identical to the per-call computation
+    because ``cu_seq_lens_q`` and ``_shard_start`` are immutable for the
+    lifetime of a context; a new batch builds a new context object, and the
+    weak-reference cache drops entries with it.
+
+    Read-only contract: the returned tensors are shared with every later
+    consumer of the same context (all layers, both autograd saves and the
+    backend kernels), so they must never be modified in place, and
+    ``seq_ctx.cu_seq_lens_q`` must be treated as immutable for the lifetime
+    of the context. The backends additionally pass them to kernels as
+    read-only metadata inputs (``actual_seq_lengths_query``/``key`` and the
+    cu-seqlens arguments); a kernel that mutates its metadata arguments in
+    place would corrupt the shared entry for every later layer.
+
+    Args:
+        seq_ctx (SequenceContext): Sequence context of the current forward.
+        shard_start (int): Global start position of this rank's SP shard.
+        seq_len (int): Local query length of this shard.
+        device (torch.device): Device for the cumulative-length tensors.
+        compute_slice (Callable[[torch.Tensor, int, int, torch.device], SpSliceMeta]):
+            The backend-local prefix-extended KV-slice helper, invoked at most
+            once per (context, shard, length) with SP>1.
+
+    Returns:
+        tuple[bool, torch.Tensor, SpSliceMeta | None]: ``(is_sp1,
+        cu_seq_q_global, slice_meta)`` where ``slice_meta`` is ``(cu_seq_q_local,
+        cu_seq_k_local, kv_start, kv_end)`` for SP>1 and ``None`` for SP=1.
+    """
+    key = (shard_start, seq_len)
+    per_ctx = _SP_SLICE_CACHE.get(seq_ctx)
+    if per_ctx is None:
+        per_ctx = {}
+        _SP_SLICE_CACHE[seq_ctx] = per_ctx
+    entry = per_ctx.get(key)
+    if entry is None:
+        cu_seq_q_global = seq_ctx.cu_seq_lens_q.to(torch.int32).to(device)
+        is_sp1 = shard_start == 0 and seq_len == cu_seq_q_global[-1].item()
+        slice_meta: SpSliceMeta | None = None
+        if not is_sp1:
+            slice_meta = compute_slice(cu_seq_q_global, shard_start, shard_start + seq_len, device)
+        entry = (is_sp1, cu_seq_q_global, slice_meta)
+        per_ctx[key] = entry
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +256,10 @@ def _apply_packed_causal_mask(
     # Avoids building a [query_len, kv_len] bool mask and gathering over it.
     valid = (safe >= starts[:, None, None]) & (safe < ends[:, None, None])
     # Arithmetic fill (not masked_fill): valid slot -> topk_indices, invalid -> -1.
-    return topk_indices * valid.long() - (~valid).long()
+    # Keep the fill in the indices' own dtype (int32); index values are
+    # bounded by kv_len so the products stay representable.
+    fill = valid.to(topk_indices.dtype)
+    return topk_indices * fill - (~valid).to(topk_indices.dtype)
 
 
 def _packed_causal_mask(
@@ -244,9 +323,9 @@ def _indexer_tnd_packed(
     # V2 requires float32 weights; V1 also accepts float32
     w_tnd = (weights.squeeze(0) * (index_head_dim ** -0.5)).contiguous().to(torch.float32)
 
-    cu_seq_q_global = cu_seq_lens.to(torch.int32).to(device)
-
-    is_sp1 = (shard_start == 0 and query_len == cu_seq_q_global[-1].item())
+    is_sp1, cu_seq_q_global, slice_meta = get_sp_mode_and_slice(
+        seq_ctx, shard_start, query_len, device, _compute_prefix_extended_kv_slice
+    )
 
     if is_sp1:
         # ── SP=1: V1 kernel with global KV ──
@@ -267,10 +346,8 @@ def _indexer_tnd_packed(
         from cann_ops_transformer.ops import lightning_indexer as _li_v2
         from cann_ops_transformer.ops import lightning_indexer_metadata as _li_v2_meta
 
-        shard_end = shard_start + query_len
-        cu_seq_q_local, cu_seq_k_local, kv_start, kv_end = _compute_prefix_extended_kv_slice(
-            cu_seq_q_global, shard_start, shard_end, device,
-        )
+        assert slice_meta is not None
+        cu_seq_q_local, cu_seq_k_local, kv_start, kv_end = slice_meta
 
         # Slice KV to [kv_start, kv_end] — may be wider than [shard_start, shard_end]
         k_tnd = k.squeeze(0)[kv_start:kv_end].unsqueeze(1).contiguous().to(torch.bfloat16)
@@ -294,7 +371,9 @@ def _indexer_tnd_packed(
         )
 
     # ── Common: per-segment local → global indices ──
-    topk_indices = topk_indices.to(torch.int64)
+    # Stay in the kernel's native int32: every value is bounded by the
+    # global kv_len and the returned cache dtype is int32 anyway.
+    topk_indices = topk_indices.to(torch.int32)
     topk_indices = _local_to_global_indices(
         topk_indices, cu_seq_q_local, cu_seq_k_local,
         kv_slice_offset, query_len, device,
