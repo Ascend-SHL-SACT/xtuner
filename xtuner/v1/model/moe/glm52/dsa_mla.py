@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from collections.abc import Callable
 from typing import Literal, TypedDict, cast
 
 import torch
@@ -17,11 +18,15 @@ from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.comm import gather_for_sequence_parallel
 from xtuner.v1.ops.sparse_mla import (
     DSATopKIndicesProtocol,
-    SparseMLAProtocol,
+    SparseMLAOutputs,
     ensure_cudnn_dsa_runtime_available,
     ensure_tilelang_runtime_available,
     get_dsa_topk_indices,
     get_sparse_mla,
+)
+from xtuner.v1.ops.sparse_mla.npu_sparse_mla import (
+    mla_split_query_enabled,
+    split_query_direct,
 )
 
 from .dsa_topk_sharing import dsa_topk_source_layer
@@ -249,7 +254,14 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         self.indexer_types = indexer_types
         self.sparse_mla_backend = sparse_mla_backend
         self.freeze_dsa_indexer = freeze_dsa_indexer
-        self.sparse_mla_func: SparseMLAProtocol = get_sparse_mla(sparse_mla_backend)
+        # Callable[..., SparseMLAOutputs] (not SparseMLAProtocol): the SPLITQ
+        # pre-split tuple is a legal query form here, and consumer-side
+        # wrappers (the DSA top-k offload refill shim) rebind this attribute
+        # with their own closures.
+        self.sparse_mla_func: Callable[..., SparseMLAOutputs] = get_sparse_mla(sparse_mla_backend)
+        # Direct pre-split query layout is only supported by the torch_npu
+        # backend (it accepts the (q_nope, q_rope) pair natively).
+        self._mla_split_query_direct = mla_split_query_enabled() and sparse_mla_backend == "torch_npu"
 
         if self.q_lora_rank is None:
             raise ValueError("DSA MLA requires q_lora_rank because the indexer consumes q_a_layernorm output.")
@@ -350,8 +362,14 @@ class DSAMultiLatentAttention(MultiLatentAttention):
 
         # q_nope: [bsz, N, S, Rkv]
         q_nope = torch.einsum("bhsd,hdm->bhsm", q_nope, w_kc)
-        # query_states: [S, N, Rkv + Dr]
-        query_states = torch.cat([q_nope, q_pe], dim=-1).squeeze(0).transpose(0, 1).contiguous()
+        query_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+        if self._mla_split_query_direct:
+            # query_states: (q_nope [S, N, Rkv], q_rope [S, N, Dr]); the pair is
+            # byte-identical to the slices of the concatenated TND tensor.
+            query_states = split_query_direct(q_nope, q_pe)
+        else:
+            # query_states: [S, N, Rkv + Dr]
+            query_states = torch.cat([q_nope, q_pe], dim=-1).squeeze(0).transpose(0, 1).contiguous()
         # key_states: [bsz, S, Rkv + Dr] -> [S, 1, Rkv + Dr]
         key_states = torch.cat([kv_compressed, k_pe.transpose(1, 2).squeeze(2)], dim=-1)
         key_states = key_states.squeeze(0).unsqueeze(1).contiguous()
@@ -390,6 +408,12 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         elif dsa_topk_ids.dtype != torch.int32 or not dsa_topk_ids.is_contiguous():
             raise RuntimeError("dsa_topk_ids must be a contiguous torch.int32 tensor.")
 
+        # dsa_topk_ids: [S, 1, K] — same tensor the pre-refactor sharing runtime
+        # handed out; the fusion branch consumes it unchanged. Both query forms
+        # (concatenated and the SPLITQ pre-split tuple) ride the same
+        # self.sparse_mla_func call: consumer-side wrappers installed on this
+        # attribute (the DSA top-k offload refill shim) must cover every
+        # consumption point of dsa_topk_ids.
         sparse_mla_outputs = self.sparse_mla_func(
             query_states,
             key_states,
