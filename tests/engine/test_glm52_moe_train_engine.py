@@ -1,7 +1,7 @@
 """GLM-5.2 TrainEngine 的训练、优化组合与 DCP 持久化行为测试。
 
 TestGlm52OptimizedEngine
-    test_sp2_ep4_micro2_compile_offload_train_step: SP2、EP4、micro2、compile 与双 offload 可联合训练。
+    test_sp2_ep4_micro2_compile_offload_train_step: SP2、EP4、micro2、compile 与三路 offload 可联合训练。
 TestGlm52ParallelHFCheckpoint
     test_fsdp2_ep4_mtp_hf_round_trip_preserves_weights: FSDP2、EP4、MTP 权重可经 HF 无损往返。
 TestGlm52PretrainedEngine
@@ -220,7 +220,11 @@ class TestGlm52OptimizedEngine(DeterministicDDPTestCase):
 
             with mock.patch.dict(
                 os.environ,
-                {"XTUNER_ACTIVATION_OFFLOAD": "1", "XTUNER_DSA_TOPK_OFFLOAD": "1"},
+                {
+                    "XTUNER_ACTIVATION_OFFLOAD": "1",
+                    "XTUNER_ACTIVATION_OFFLOAD_NPU": "1",
+                    "XTUNER_DSA_TOPK_OFFLOAD": "1",
+                },
             ):
                 step_info = engine.train_step(data_batches)
                 grad_norm = engine.clip_grad_norm()
