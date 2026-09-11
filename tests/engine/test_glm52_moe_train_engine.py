@@ -224,6 +224,7 @@ class TestGlm52OptimizedEngine(DeterministicDDPTestCase):
                     "XTUNER_ACTIVATION_OFFLOAD": "1",
                     "XTUNER_ACTIVATION_OFFLOAD_NPU": "1",
                     "XTUNER_DSA_TOPK_OFFLOAD": "1",
+                    "XTUNER_DSA_TOPK_OFFLOAD_NPU": "1",
                 },
             ):
                 step_info = engine.train_step(data_batches)
