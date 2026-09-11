@@ -25,9 +25,12 @@ Reference: mindspeed/core/transformer/experimental_attention_variant/dsa_fused.p
 """
 
 import os
+from functools import lru_cache
 
 import torch
 import torch_npu
+
+from xtuner.v1.data_proto import SequenceContext
 
 from .npu_indexer import _compute_prefix_extended_kv_slice, get_sp_mode_and_slice
 from .protocol import SparseMLAOutputs
@@ -72,11 +75,7 @@ def npu_sparse_mla(
 
     scale_value = float(scaling) if scaling is not None else (value_dim + rope_dim) ** -0.5
 
-    use_tnd = (
-        seq_ctx is not None
-        and getattr(seq_ctx, "cu_seq_lens_q", None) is not None
-        and seq_ctx.cu_seq_lens_q.numel() > 2
-    )
+    use_tnd = _is_tnd_packed(seq_ctx)
 
     if use_tnd:
         return _sparse_mla_tnd_packed(
@@ -89,9 +88,123 @@ def npu_sparse_mla(
     )
 
 
+@lru_cache(maxsize=1)
+def mla_split_query_enabled() -> bool:
+    """Whether the direct TND query layout is enabled.
+
+    Gated by ``XTUNER_MLA_SPLIT_QUERY`` (default off). When on, the caller may
+    hand the backend a pre-split ``(q_nope, q_rope)`` TND pair instead of the
+    concatenated ``[S, N, Rkv + Dr]`` query (see
+    :func:`sparse_mla_split_query`), skipping the cat/transpose/re-slice round
+    trip.
+
+    Returns:
+        bool: True when the gate is on.
+    """
+    return os.environ.get("XTUNER_MLA_SPLIT_QUERY", "0") == "1"
+
+
+def sparse_mla_split_query(
+    query_parts: tuple[torch.Tensor, torch.Tensor],
+    key_states: torch.Tensor,
+    topk_indices: torch.Tensor,
+    scaling: float | None,
+    value_dim: int,
+    seq_ctx: SequenceContext | None,
+) -> SparseMLAOutputs:
+    """Sparse MLA entry for a pre-split TND query pair.
+
+    Equivalent to :func:`npu_sparse_mla` on the re-concatenated query, but the
+    concatenated ``[S, N, Rkv + Dr]`` tensor is never materialized: packed
+    multi-sequence inputs go straight to :func:`_sparse_mla_tnd_packed` with
+    the two parts (the public entry would re-slice them back out of the
+    re-concatenated tensor), and single-sequence inputs fall back to the
+    public entry on the re-concatenated tensor (the cat is exact, so numerics
+    are unchanged).
+
+    Args:
+        query_parts (tuple[torch.Tensor, torch.Tensor]): Contiguous
+            ``(q_nope [S, N, Rkv], q_rope [S, N, Dr])`` from
+            :func:`split_query_direct`.
+        key_states (torch.Tensor): SP-gathered key-value ``[S_g, 1, Rkv + Dr]``.
+        topk_indices (torch.Tensor): Top-k sparse indices ``[S, 1, K]``.
+        scaling (float | None): Softmax scale.
+        value_dim (int): Value dimension (``Rkv`` for absorbed MLA).
+        seq_ctx (SequenceContext | None): Sequence context for packed causal masking.
+
+    Returns:
+        SparseMLAOutputs: Backend outputs, same contract as the concatenated
+        query path.
+    """
+    q_nope, q_rope = query_parts
+    if q_nope.shape[-1] != value_dim:
+        raise ValueError(
+            f"q_nope.shape[-1]={q_nope.shape[-1]} must equal value_dim={value_dim}: "
+            "the pair must be the value/rope split of the concatenated query"
+        )
+    seq_len, num_heads, _ = q_nope.shape
+    kv_len = key_states.shape[0]
+
+    kv_compressed = key_states[..., :value_dim]
+    k_rope = key_states[..., value_dim:]
+
+    scale_value = float(scaling) if scaling is not None else (value_dim + q_rope.shape[-1]) ** -0.5
+
+    use_tnd = _is_tnd_packed(seq_ctx)
+    if not use_tnd:
+        return npu_sparse_mla(
+            torch.cat([q_nope, q_rope], dim=-1),
+            key_states,
+            topk_indices,
+            scaling,
+            value_dim=value_dim,
+            seq_ctx=seq_ctx,
+        )
+    return _sparse_mla_tnd_packed(
+        q_nope, q_rope, kv_compressed, k_rope,
+        topk_indices, seq_ctx, seq_len, kv_len, num_heads, scale_value,
+    )
+
+
+def split_query_direct(
+    q_nope_absorbed: torch.Tensor,
+    q_rope: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the TND sparse-MLA query parts without the cat/re-slice round trip.
+
+    Args:
+        q_nope_absorbed (torch.Tensor): Absorbed nope query ``[1, N, S, Rkv]``,
+            contiguous (natural einsum/bmm output layout).
+        q_rope (torch.Tensor): RoPE-applied rope query ``[1, N, S, Dr]``,
+            contiguous.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: ``(q_nope [S, N, Rkv], q_rope
+        [S, N, Dr])``, both contiguous and byte-identical to the slices
+        :func:`npu_sparse_mla` would extract from the concatenated
+        ``[S, N, Rkv + Dr]`` tensor.
+    """
+    q_nope_tnd = q_nope_absorbed.squeeze(0).transpose(0, 1).contiguous()
+    q_rope_tnd = q_rope.squeeze(0).transpose(0, 1).contiguous()
+    return q_nope_tnd, q_rope_tnd
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _is_tnd_packed(seq_ctx: SequenceContext | None) -> bool:
+    """Whether ``seq_ctx`` describes packed multi-sequence (TND) attention.
+
+    Shared by :func:`npu_sparse_mla` and :func:`sparse_mla_split_query` so the
+    two entries can never drift apart in how they route to the TND kernel.
+    """
+    return (
+        seq_ctx is not None
+        and getattr(seq_ctx, "cu_seq_lens_q", None) is not None
+        and seq_ctx.cu_seq_lens_q.numel() > 2
+    )
+
 
 def _rewrite_invalid_indices(
     indices: torch.Tensor,
