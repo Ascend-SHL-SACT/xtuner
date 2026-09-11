@@ -42,6 +42,7 @@ from xtuner.v1.module.grouped_linear.moe_group_linear import (
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_act_fn
 from xtuner.v1.ops.moe.npu import fused_a2a_gmm
+from xtuner.v1.ops.sparse_mla.attn_fusion import can_fuse_add_rms_norm, fused_add_rms_norm_module
 from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
@@ -829,11 +830,14 @@ class MoEDecoderLayer(nn.Module):
                 seq_ctx=seq_ctx,
                 past_key_values=past_key_values,
             )
-        hidden_states = residual + hidden_states
+        if can_fuse_add_rms_norm(self.post_attention_layernorm):
+            residual, hidden_states = fused_add_rms_norm_module(self.post_attention_layernorm, residual, hidden_states)
+        else:
+            hidden_states = residual + hidden_states
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+            # Fully Connected
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
         if seq_ctx.rollout_routed_experts is not None and self.layer_idx < seq_ctx.rollout_routed_experts.shape[1]:
             rollout_routed_experts = seq_ctx.rollout_routed_experts[:, self.layer_idx, :]  # seq_l, expert
