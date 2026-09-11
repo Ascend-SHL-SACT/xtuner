@@ -28,6 +28,11 @@ from xtuner.v1.module.mtp import MTPConfig
 from xtuner.v1.module.rope import RopeParametersConfig
 from xtuner.v1.module.router.noaux_router import NoAuxRouterConfig
 
+from .activation_offload_npu import (
+    activation_offload_npu_enabled,
+    make_activation_offload_npu_ctx,
+    register_activation_offload_npu_hooks,
+)
 from .decoder_layer import (
     GLM52DenseDecoderLayer,
     GLM52DenseDecoderLayerMicroBatchOutput,
@@ -110,6 +115,21 @@ class Glm52MoE(MoE):
             if layer_idx == self.config.num_hidden_layers - 1
             or self._dsa_topk_source_layers[layer_idx + 1] != source_layer_idx
         )
+
+        # Gate + wiring for the NPU activation offload; all logic lives in
+        # activation_offload_npu.py. Parks each offload-scope layer's input
+        # hidden states after the no_grad original forward, refills them at
+        # the replay entry, and shadows _saved_tensors_offload_ctx on the
+        # instance so the legacy window stops capturing the hidden states this
+        # mechanism owns (integer ids tensors keep flowing through it).
+        if activation_offload_npu_enabled():
+            register_activation_offload_npu_hooks(
+                model_layers=self.layers,
+                first_offload_layer=self.config.first_k_dense_replace,
+            )
+            setattr(
+                self, "_saved_tensors_offload_ctx", make_activation_offload_npu_ctx(self._saved_tensors_offload_ctx)
+            )
 
     @override
     def _call_decoder_layer(
