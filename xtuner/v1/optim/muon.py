@@ -42,6 +42,13 @@ from xtuner.v1.optim import muon_swap
 from xtuner.v1.utils.dtensor import group_tensors_by_device_mesh_and_placements
 
 
+# XTUNER_MUON_NS_CHUNK: tile Newton-Schulz M*M matmuls into N row-tiles to shrink
+# the aclnnMatmul workspace. Needed when the device is near-full at the optimizer
+# step (e.g. expert-TP sharding leaves little HBM headroom for the NS workspace).
+# 0 = off (byte-identical to a @ b). >0 = number of row-tiles per matmul.
+_NS_CHUNK_TILES = int(os.environ.get("XTUNER_MUON_NS_CHUNK", "0") or "0")
+
+
 def maybe_to_local(tensor: list[Tensor]) -> list[Tensor]:
     return [t.to_local() if isinstance(t, DTensor) else t for t in tensor]
 
@@ -1590,6 +1597,21 @@ def _muonsplit_newton_schulz(
     return output
 
 
+def _ns_bmm(a: Tensor, b: Tensor) -> Tensor:
+    # Tiled batched matmul: split the output row dim into _NS_CHUNK_TILES tiles so
+    # each aclnnMatmul workspace is ~1/tiles the size. Byte-identical to a @ b
+    # (each output element sums the same products in the same order).
+    tiles = _NS_CHUNK_TILES
+    m = a.size(-2)
+    if tiles <= 1 or m <= 1:
+        return a @ b
+    chunk = (m + tiles - 1) // tiles
+    out = torch.empty((*a.shape[:-2], m, b.size(-1)), dtype=a.dtype, device=a.device)
+    for i in range(0, m, chunk):
+        out[..., i : i + chunk, :] = a[..., i : i + chunk, :] @ b
+    return out
+
+
 def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7, num_experts: int = 1):
     """Newton-Schulz iteration to approximate the orthogonalization of X.
 
@@ -1647,11 +1669,11 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7, num_experts: i
     # Using batch matrix multiplication (@) to process all experts in parallel
     for a, b, c in ns_consts:
         # A = X @ X^T: compute Gram matrix for each expert
-        A = X @ X.mT  # shape: (num_experts, M, M) or (num_experts, N, N)
+        A = _ns_bmm(X, X.mT)  # shape: (num_experts, M, M) or (num_experts, N, N)
         # B = b * A + c * A @ A: polynomial combination for convergence
-        B = b * A + c * (A @ A)
+        B = b * A + c * _ns_bmm(A, A)
         # X = a * X + B @ X: update step
-        X = a * X + B @ X
+        X = a * X + _ns_bmm(B, X)
 
     # Undo transpose if applied
     if need_transpose:
