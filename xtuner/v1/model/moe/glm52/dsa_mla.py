@@ -16,6 +16,7 @@ from xtuner.v1.module.attention.mla import MLAConfig, MultiLatentAttention, mla_
 from xtuner.v1.module.linear import build_linear
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.comm import gather_for_sequence_parallel
+from xtuner.v1.ops.comm.coc_all_gather import coc_all_gather, coc_wait, dsa_kv_gather_coc_enabled
 from xtuner.v1.ops.sparse_mla import (
     DSATopKIndicesProtocol,
     SparseMLAOutputs,
@@ -381,7 +382,13 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         # [global_seq, 1, topk] cache, plus query/output all-to-all. Gathering only
         # the small compressed KV keeps all heads and the large top-k cache local.
         # key_states: [S_g, 1, Rkv + Dr]
-        key_states = gather_for_sequence_parallel(key_states, dim=0, sp_mesh=seq_ctx.sequence_parallel_mesh)
+        if dsa_kv_gather_coc_enabled():
+            # CoC-style overlap: issue the SP all-gather on the CoC comm stream
+            # and let the indexer chain below run while it is in flight; the
+            # consumer-side wait happens right before sparse_mla_func.
+            key_states = coc_all_gather(key_states, dim=0, mesh=seq_ctx.sequence_parallel_mesh)
+        else:
+            key_states = gather_for_sequence_parallel(key_states, dim=0, sp_mesh=seq_ctx.sequence_parallel_mesh)
 
         # A source layer computes IDs once; shared layers receive the same
         # explicit tensor reference from the GLM decoder stack.
@@ -414,6 +421,7 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         # self.sparse_mla_func call: consumer-side wrappers installed on this
         # attribute (the DSA top-k offload refill shim) must cover every
         # consumption point of dsa_topk_ids.
+        key_states = coc_wait(key_states)
         sparse_mla_outputs = self.sparse_mla_func(
             query_states,
             key_states,
