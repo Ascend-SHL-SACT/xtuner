@@ -42,6 +42,7 @@ from .decoder_layer import (
     GLM52MoEDecoderLayerOutput,
 )
 from .dsa_mla import DSAMLAConfig, DSAMultiLatentAttention
+from .dsa_topk_offload_npu import dsa_topk_offload_npu_enabled, register_dsa_topk_offload_npu_hooks
 from .dsa_topk_sharing import dsa_topk_source_layer, dsa_topk_source_layers
 from .mtp import GLM52MTPBlock, GLM52MTPLayer
 
@@ -129,6 +130,16 @@ class Glm52MoE(MoE):
             )
             setattr(
                 self, "_saved_tensors_offload_ctx", make_activation_offload_npu_ctx(self._saved_tensors_offload_ctx)
+            )
+        # Gate + wiring for the NPU DSA top-k offload; all logic lives in
+        # dsa_topk_offload_npu.py. Registers park hooks on the raw decoder
+        # layers and refill wrappers on their DSA attentions (checkpoint
+        # wrapping later keeps the same module objects).
+        if dsa_topk_offload_npu_enabled():
+            register_dsa_topk_offload_npu_hooks(
+                model_layers=self.layers,
+                source_layers=self._dsa_topk_source_layers,
+                last_consumers=self._dsa_topk_last_consumers,
             )
 
     @override
