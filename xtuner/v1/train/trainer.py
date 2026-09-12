@@ -47,6 +47,7 @@ from xtuner.v1.engine.train_engine import TrainStepInfo
 from xtuner.v1.loss import CELossConfig
 from xtuner.v1.model.base import ModelItem, XTunerBaseModelConfig
 from xtuner.v1.model.moe.moe import MoEConfig
+from xtuner.v1.ops.comm import coc_all_gather
 from xtuner.v1.patch import (
     patch_dcp_async_daemon_port,
     patch_dcp_save_state_dict,
@@ -866,6 +867,11 @@ class Trainer:
             getattr(self._engine.model, "ep_tp_mesh", None),
             getattr(self._engine.model, "hsdp_mesh", None),
         )
+        # The CoC gather builds its own HCCL group over the SP ranks; create it
+        # in the same idle-device warmup phase instead of lazily at the first
+        # DSA layer (same createLink-race rationale as above).
+        if coc_all_gather.dsa_kv_gather_coc_enabled():
+            coc_all_gather.warmup_coc_group(self.data_mesh["sp"])
         time_before_get_data = time.time()
         for data_batch in self._data_iter():
             time_before_train_step = time.time()
