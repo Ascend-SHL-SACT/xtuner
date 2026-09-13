@@ -1,25 +1,21 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Custom DeviceMesh rank layout for intra-node FSDP + inter-node EP/SP.
 
-When ``XTUNER_DEVICE_MESH=1`` and ``world_size > NODE_SIZE`` (16), the data
-mesh ``(dp, sp, tp)`` and the expert mesh ``(fsdp, ep)`` are laid out so the
-FSDP dimension (the ``dp`` / ``fsdp`` allGather/reduceScatter group) is packed
-into the first 16 NPUs of each node, exploiting super-node zero-copy, while the
-``sp`` / ``ep`` (alltoall) dimensions are pushed inter-node.
+When ``XTUNER_DEVICE_MESH=1`` and ``world_size > NODE_SIZE`` (16), the data mesh ``(dp, sp, tp)`` and the expert mesh
+``(fsdp, ep)`` are laid out so the FSDP dimension (the ``dp`` / ``fsdp`` allGather/reduceScatter group) is packed into
+the first 16 NPUs of each node, exploiting super-node zero-copy, while the ``sp`` / ``ep`` (alltoall) dimensions are
+pushed inter-node.
 
-Only the *rank arrangement* changes; every group keeps the same size, so the
-per-rank parameter memory is identical to the default row-major mesh. The
-layout mirrors commit ``be66a4341d9fde069b9226972ba79f0adb6941ff`` of the
-Ascend-ShangHai-LLM fork, ported additively: the default path (feature off) is
-byte-identical to the original ``init_device_mesh``.
+Only the *rank arrangement* changes; every group keeps the same size, so the per-rank parameter memory is identical to
+the default row-major mesh. The layout mirrors commit ``be66a4341d9fde069b9226972ba79f0adb6941ff`` of the Ascend-
+ShangHai-LLM fork, ported additively: the default path (feature off) is byte-identical to the original
+``init_device_mesh``.
 
-Call sites never duplicate the gate or inline diagnostics: they branch on
-:func:`use_custom_mesh` and call :func:`build_custom_data_mesh` /
-:func:`build_custom_expert_mesh`, which own the rank-0 confirmation print. The
-unconditional ``init_device_mesh`` call stays untouched at every call site
-(branching happens *around* it via ``elif`` / early-return, so the eager NCCL
-group creation of the default mesh is skipped entirely when the custom layout
-is active -- no double group construction).
+Call sites never duplicate the gate or inline diagnostics: they branch on :func:`use_custom_mesh` and call
+:func:`build_custom_data_mesh` / :func:`build_custom_expert_mesh`, which own the rank-0 confirmation print. The
+unconditional ``init_device_mesh`` call stays untouched at every call site (branching happens *around* it via ``elif``
+/ early-return, so the eager NCCL group creation of the default mesh is skipped entirely when the custom layout is
+active -- no double group construction).
 """
 
 import os
@@ -273,7 +269,8 @@ def validate_expert_3d_alignment(
 
 
 def warmup_mesh_communicators(device: str, *meshes: DeviceMesh | None) -> None:
-    """Eagerly init every non-trivial mesh-dim HCCL communicator before training.
+    """Eagerly init every non-trivial mesh-dim HCCL communicator before
+    training.
 
     A mesh dim untouched by forward/backward (e.g. data ``sp``, or expert ``ep``
     once ``expert_tp_size > 1`` routes the dispatcher through the ``ep_tp`` 2-D
@@ -314,15 +311,12 @@ def warmup_mesh_communicators(device: str, *meshes: DeviceMesh | None) -> None:
 def _rank_for_data(i: int, j: int, k: int, sp_size: int, tp_size: int, dp_size: int | None = None) -> int:
     """Global rank for data-mesh coord (dp=i, sp=j, tp=k).
 
-    When ``dp_size`` is supplied and ``dp_size <= NODE_SIZE`` (i.e.
-    ``sp_size >= world / NODE_SIZE``, e.g. SP64 on 512 ranks -> dp=8), the dp dim
-    packs ``dp_size`` ranks per intra-node block and the ``(sp, tp)`` plane packs
-    ``NODE_SIZE // dp_size`` groups per node before going inter-node, so every
-    dense FSDP allGather/reduceScatter group stays intra-node (zero-copy). When
-    ``dp_size`` is ``None`` (legacy callers, incl. :func:`_rank_for_expert_3d`)
-    or ``> NODE_SIZE`` (e.g. dp=32 with SP16), the original inter-node dp layout
-    is used. The two branches coincide for ``dp_size == NODE_SIZE`` (SP32 on 512
-    ranks), so SP32 is byte-identical to the original layout.
+    When ``dp_size`` is supplied and ``dp_size <= NODE_SIZE`` (i.e. ``sp_size >= world / NODE_SIZE``, e.g. SP64 on 512
+    ranks -> dp=8), the dp dim packs ``dp_size`` ranks per intra-node block and the ``(sp, tp)`` plane packs
+    ``NODE_SIZE // dp_size`` groups per node before going inter-node, so every dense FSDP allGather/reduceScatter group
+    stays intra-node (zero-copy). When ``dp_size`` is ``None`` (legacy callers, incl. :func:`_rank_for_expert_3d`) or
+    ``> NODE_SIZE`` (e.g. dp=32 with SP16), the original inter-node dp layout is used. The two branches coincide for
+    ``dp_size == NODE_SIZE`` (SP32 on 512 ranks), so SP32 is byte-identical to the original layout.
     """
     if dp_size is not None and dp_size <= NODE_SIZE:
         groups_per_node = NODE_SIZE // dp_size
@@ -334,15 +328,12 @@ def _rank_for_data(i: int, j: int, k: int, sp_size: int, tp_size: int, dp_size: 
 def _rank_for_expert(i: int, j: int, ep_size: int, fsdp_size: int | None = None) -> int:
     """Global rank for expert-mesh coord (fsdp=i, ep=j).
 
-    When ``fsdp_size`` is supplied and ``fsdp_size <= NODE_SIZE`` (i.e.
-    ``ep_size >= world / NODE_SIZE``, e.g. EP64 on 512 ranks -> fsdp=8), the
-    fsdp dim packs ``fsdp_size`` ranks per intra-node block and the ep dim
-    packs ``NODE_SIZE // fsdp_size`` groups per node before going inter-node,
-    so every fsdp allGather/reduceScatter group stays intra-node (zero-copy).
-    When ``fsdp_size`` is ``None`` (legacy 3-arg callers) or ``> NODE_SIZE``
-    (EP < 32 on 512 ranks), the original inter-node fsdp layout is used. The
-    two branches coincide for ``fsdp_size == NODE_SIZE`` (EP32 on 512 ranks),
-    so EP32 is byte-identical to the original layout.
+    When ``fsdp_size`` is supplied and ``fsdp_size <= NODE_SIZE`` (i.e. ``ep_size >= world / NODE_SIZE``, e.g. EP64 on
+    512 ranks -> fsdp=8), the fsdp dim packs ``fsdp_size`` ranks per intra-node block and the ep dim packs ``NODE_SIZE
+    // fsdp_size`` groups per node before going inter-node, so every fsdp allGather/reduceScatter group stays intra-
+    node (zero-copy). When ``fsdp_size`` is ``None`` (legacy 3-arg callers) or ``> NODE_SIZE`` (EP < 32 on 512 ranks),
+    the original inter-node fsdp layout is used. The two branches coincide for ``fsdp_size == NODE_SIZE`` (EP32 on 512
+    ranks), so EP32 is byte-identical to the original layout.
     """
     if fsdp_size is not None and fsdp_size <= NODE_SIZE:
         groups_per_node = NODE_SIZE // fsdp_size
@@ -364,7 +355,8 @@ def _rank_for_expert_3d(i: int, j: int, k: int, ep_size: int, etp_size: int) -> 
 
 
 def _validate_data_layout(dp_size: int, sp_size: int, tp_size: int) -> None:
-    """Raise ``ValueError`` unless the data-mesh rank layout is a valid permutation.
+    """Raise ``ValueError`` unless the data-mesh rank layout is a valid
+    permutation.
 
     Two validity regimes mirror the two branches of :func:`_rank_for_data`:
     when ``dp_size <= NODE_SIZE`` the sub-node block packing needs
@@ -405,7 +397,8 @@ def _validate_data_layout(dp_size: int, sp_size: int, tp_size: int) -> None:
 
 
 def _validate_expert_layout(fsdp_size: int, ep_size: int) -> None:
-    """Raise ``ValueError`` unless the expert-mesh rank layout is a valid permutation.
+    """Raise ``ValueError`` unless the expert-mesh rank layout is a valid
+    permutation.
 
     Two validity regimes mirror the two branches of :func:`_rank_for_expert`:
     when ``fsdp_size <= NODE_SIZE`` the intra-node block packing needs
@@ -438,7 +431,8 @@ def _validate_expert_layout(fsdp_size: int, ep_size: int) -> None:
 
 
 def _validate_expert_3d_layout(fsdp_size: int, ep_size: int, etp_size: int) -> None:
-    """Raise ``ValueError`` unless the 3D expert-mesh rank layout is a valid permutation.
+    """Raise ``ValueError`` unless the 3D expert-mesh rank layout is a valid
+    permutation.
 
     :func:`_rank_for_expert_3d` reuses :func:`_rank_for_data`, whose intra-node
     packing is a valid bijection onto ``0..world-1`` only when ``fsdp_size`` is

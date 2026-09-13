@@ -1,4 +1,5 @@
-"""Copy-stream H2D/D2H overlap for SwapAdamW.step (no persistent device buffer).
+"""Copy-stream H2D/D2H overlap for SwapAdamW.step (no persistent device
+buffer).
 
 Dispatched from swap_adamw.step when any of XTUNER_SWAP_BF16_STATE,
 XTUNER_SWAP_D2H_OVERLAP, or XTUNER_SWAP_H2D_OVERLAP is set. m/v stream between
@@ -73,10 +74,12 @@ def _get_host_scratch(optimizer, e: dict) -> dict:
 
 
 def _d2h_to_scratch(optimizer, entries: list, stream, cast_pairs: list) -> None:
-    """D2H fp32 dev temps to pinned fp32 host scratch on ``stream`` (same-dtype,
-    fast). The fp32 adam temp is record_stream'd to ``stream`` (reclaimable).
-    Collects (cpu_dst, scratch) pairs holding NO device refs so the fp32 temps
-    free at step end (no max_memory rise)."""
+    """D2H fp32 dev temps to pinned fp32 host scratch on ``stream`` (same-
+    dtype, fast).
+
+    The fp32 adam temp is record_stream'd to ``stream`` (reclaimable). Collects (cpu_dst, scratch) pairs holding NO
+    device refs so the fp32 temps free at step end (no max_memory rise).
+    """
     for e in entries:
         sc = _get_host_scratch(optimizer, e)
         sc["m"].copy_(e["exp_avg"], non_blocking=True)
@@ -114,10 +117,10 @@ def _d2h_plain(entries: list, stream) -> None:
 def _submit_host_cast(optimizer, d2h_ev, pairs: list) -> None:
     """Submit the fp32->bf16 host cast to a single daemon worker.
 
-    The worker waits d2h_ev (copy-stream D2H landed), then CPU-casts scratch ->
-    bf16 cpu m/v, masked by device fwd+bwd. Daemonesque: does not block process
-    teardown (the last step's cast may be abandoned at exit, which is fine since
-    the checkpoint path does not read swapped cpu m/v mid-cast)."""
+    The worker waits d2h_ev (copy-stream D2H landed), then CPU-casts scratch -> bf16 cpu m/v, masked by device fwd+bwd.
+    Daemonesque: does not block process teardown (the last step's cast may be abandoned at exit, which is fine since
+    the checkpoint path does not read swapped cpu m/v mid-cast).
+    """
     q = getattr(optimizer, "_swap_cast_q", None)
     if q is None:
         q = queue.Queue()

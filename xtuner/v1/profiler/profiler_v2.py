@@ -90,10 +90,9 @@ logger = get_logger()
 class StaticParam(BaseModel):
     """Static-mode profiler parameters (env-driven, backward compatible).
 
-    Each field mirrors the MindSpeed-MM ``StaticParam`` dataclass and is
-    configurable via ``XTUNER_PROFILE_*`` env through
-    :func:`profiling_config_from_env`. Coarse-grained switches that also appear
-    in ``profiler_config.json`` are overridden by the JSON when present.
+    Each field mirrors the MindSpeed-MM ``StaticParam`` dataclass and is configurable via ``XTUNER_PROFILE_*`` env
+    through :func:`profiling_config_from_env`. Coarse-grained switches that also appear in ``profiler_config.json`` are
+    overridden by the JSON when present.
     """
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
@@ -174,10 +173,9 @@ class ExperimentalConfigJson(BaseModel):
 class FullProfileConfig(BaseModel):
     """Full-capability ``profiler_config.json`` (guide schema + xtuner extras).
 
-    Drives every ``ascend_pytorch_profiler`` capability. In static per-step
-    mode, fields present here override the env-var defaults; absent fields fall
-    back to env defaults. In dynamic mode ``torch_npu`` reads this file
-    natively (so the same file serves both modes).
+    Drives every ``ascend_pytorch_profiler`` capability. In static per-step mode, fields present here override the env-
+    var defaults; absent fields fall back to env defaults. In dynamic mode ``torch_npu`` reads this file natively (so
+    the same file serves both modes).
     """
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
@@ -274,8 +272,8 @@ def _load_full_config(path: str | None) -> FullProfileConfig | None:
     """Load ``profiler_config.json`` from ``path`` into a
     :class:`FullProfileConfig`.
 
-    Returns ``None`` (with a rank-0 warning) when the path is empty, the file is
-    missing, or validation fails, so a malformed config never breaks training.
+    Returns ``None`` (with a rank-0 warning) when the path is empty, the file is missing, or validation fails, so a
+    malformed config never breaks training.
     """
     if not path:
         return None
@@ -298,10 +296,9 @@ def _load_full_config(path: str | None) -> FullProfileConfig | None:
 def profiling_config_from_env() -> ProfilingConfig | None:
     """Build a :class:`ProfilingConfig` from ``XTUNER_PROFILE_*`` env vars.
 
-    Also loads ``profiler_config.json`` from ``XTUNER_PROFILE_DYNAMIC_CONFIG_PATH``
-    (existing env var; no new env introduced) into ``full_config``. Returns
-    ``None`` when ``XTUNER_NPU_PROFILE_V2_ENABLE`` is unset / not truthy, so callers
-    can treat a ``None`` result as "profiling disabled".
+    Also loads ``profiler_config.json`` from ``XTUNER_PROFILE_DYNAMIC_CONFIG_PATH`` (existing env var; no new env
+    introduced) into ``full_config``. Returns ``None`` when ``XTUNER_NPU_PROFILE_V2_ENABLE`` is unset / not truthy, so
+    callers can treat a ``None`` result as "profiling disabled".
     """
     if not _get_bool_env("XTUNER_NPU_PROFILE_V2_ENABLE", False):
         return None
@@ -420,10 +417,9 @@ def _resolve_aic_metrics(aic_metrics_type: str) -> object:
 def _default_export_type() -> list[object] | None:
     """Return ``[ExportType.Text, ExportType.Db]`` if available, else ``None``.
 
-    ``export_type`` is what makes ``analyse_flag=True`` online also emit
-    ``analysis.db`` (without it only text CSVs are produced). Older
-    ``torch_npu`` may lack ``ExportType``; fall back to ``None`` then and rely
-    on the offline :func:`analyse` CLI.
+    ``export_type`` is what makes ``analyse_flag=True`` online also emit ``analysis.db`` (without it only text CSVs are
+    produced). Older ``torch_npu`` may lack ``ExportType``; fall back to ``None`` then and rely on the offline
+    :func:`analyse` CLI.
     """
     try:
         import torch_npu  # noqa: PLC0415  lazy
@@ -441,8 +437,8 @@ def _default_export_type() -> list[object] | None:
 def _resolve_export_type(values: list[str] | None) -> list[object] | None:
     """Resolve a list of ``text``/``db`` strings to ``ExportType`` enums.
 
-    ``None`` (not configured) yields the full ``[Text, Db]`` default so the
-    online analyse emits both CSVs and ``analysis.db``.
+    ``None`` (not configured) yields the full ``[Text, Db]`` default so the online analyse emits both CSVs and
+    ``analysis.db``.
     """
     if values is None:
         return _default_export_type()
@@ -459,9 +455,8 @@ def _resolve_export_type(values: list[str] | None) -> list[object] | None:
 def _resolve_host_sys(values: list[str] | None) -> list[object] | None:
     """Resolve ``CPU/MEM/DISK/NETWORK/OSRT`` strings to ``HostSystem`` enums.
 
-    ``None``/empty -> ``None`` (no host-side collection). Note ``DISK`` requires
-    ``iotop`` and ``OSRT`` requires ``perf`` + ``ltrace``; the launch script
-    only enables the subset whose backing tools are installed.
+    ``None``/empty -> ``None`` (no host-side collection). Note ``DISK`` requires ``iotop`` and ``OSRT`` requires
+    ``perf`` + ``ltrace``; the launch script only enables the subset whose backing tools are installed.
     """
     if not values:
         return None
@@ -495,8 +490,7 @@ def _rank() -> int:
 def _should_profile_rank(ranks: list[int]) -> bool:
     """Return True when the current rank should collect a trace.
 
-    Mirrors MindSpeed ``_enable_profile``: ``[-1]`` means all ranks; otherwise
-    the rank must be in the list.
+    Mirrors MindSpeed ``_enable_profile``: ``[-1]`` means all ranks; otherwise the rank must be in the list.
     """
     if ranks == [-1]:
         return True
@@ -506,9 +500,8 @@ def _should_profile_rank(ranks: list[int]) -> bool:
 def _default_npu_device() -> str:
     """Return the current NPU device id as ``"npu:{id}"`` (best-effort).
 
-    ``torch.npu`` is injected at runtime by ``import torch_npu``, so it is not
-    visible to static analysis; it is read via ``getattr`` (which yields
-    ``Any``) to stay mypy-strict-clean.
+    ``torch.npu`` is injected at runtime by ``import torch_npu``, so it is not visible to static analysis; it is read
+    via ``getattr`` (which yields ``Any``) to stay mypy-strict-clean.
     """
     try:
         import torch  # noqa: PLC0415  lazy
@@ -561,9 +554,8 @@ def _make_trace_handler(
 ) -> Callable[[Any], None]:
     """Build an ``on_trace_ready`` handler.
 
-    Emits ``memory_timeline.html`` first (if enabled) then runs the standard
-    ``tensorboard_trace_handler`` (online analyse + persist). Ordering matters:
-    ``export_memory_timeline`` reads the in-memory trace, so it must run before
+    Emits ``memory_timeline.html`` first (if enabled) then runs the standard ``tensorboard_trace_handler`` (online
+    analyse + persist). Ordering matters: ``export_memory_timeline`` reads the in-memory trace, so it must run before
     the handler persists / analyses it.
     """
     import torch_npu  # noqa: PLC0415  lazy
@@ -596,7 +588,8 @@ def _build_profile_objects(
     active: int,
     skip_first: int,
 ) -> _ProfileBuild:
-    """Single source of truth: merge env defaults + JSON overrides -> torch_npu.
+    """Single source of truth: merge env defaults + JSON overrides ->
+    torch_npu.
 
     Constructs the ``_ExperimentalConfig`` (all 15 fields), the activity list,
     the schedule, the custom ``on_trace_ready`` handler, the ``profile()``

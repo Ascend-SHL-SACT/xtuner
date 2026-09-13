@@ -120,7 +120,8 @@ def register_activation_offload_npu_hooks(
 def make_activation_offload_npu_ctx(
     original_ctx: Callable[[int, list[torch.Tensor]], AbstractContextManager],
 ) -> Callable[[int, list[torch.Tensor]], AbstractContextManager]:
-    """Build the ``_saved_tensors_offload_ctx`` shadow used while the gate is on.
+    """Build the ``_saved_tensors_offload_ctx`` shadow used while the gate is
+    on.
 
     The hook mechanism owns every float (hidden-state) tensor, so the shadow
     filters them out of the legacy window; integer DSA ids tensors listed by
