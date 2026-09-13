@@ -56,7 +56,15 @@ def npu_dsa_topk_indices(
 
     if num_segments > 1:
         topk_indices = _indexer_tnd_packed(
-            q, k, weights, seq_ctx, cu_seq_lens, query_len, kv_len, topk, index_head_dim,
+            q,
+            k,
+            weights,
+            seq_ctx,
+            cu_seq_lens,
+            query_len,
+            kv_len,
+            topk,
+            index_head_dim,
         )
     else:
         topk_indices = _indexer_bsnd_single(q, k, weights, seq_ctx, query_len, kv_len, topk)
@@ -148,6 +156,7 @@ def get_sp_mode_and_slice(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _compute_prefix_extended_kv_slice(
     cu_seq_q_global: torch.Tensor,
@@ -263,7 +272,10 @@ def _apply_packed_causal_mask(
 
 
 def _packed_causal_mask(
-    seq_ctx: SequenceContext, query_len: int, kv_len: int, device: torch.device,
+    seq_ctx: SequenceContext,
+    query_len: int,
+    kv_len: int,
+    device: torch.device,
 ) -> torch.Tensor:
     """Build packed causal mask ``[query_len, kv_len]``."""
     starts, ends = seq_ctx.packed_causal_query_ranges(query_len, device)
@@ -275,9 +287,15 @@ def _packed_causal_mask(
 # Single-sequence path (BSND)
 # ---------------------------------------------------------------------------
 
+
 def _indexer_bsnd_single(
-    q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor,
-    seq_ctx: SequenceContext, query_len: int, kv_len: int, topk: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    seq_ctx: SequenceContext,
+    query_len: int,
+    kv_len: int,
+    topk: int,
 ) -> torch.Tensor:
     """Single-sequence: BSND layout, sparse_mode=3 handles causal."""
     q_bsnd = q.contiguous().to(torch.bfloat16)
@@ -285,16 +303,25 @@ def _indexer_bsnd_single(
     w_bsnd = weights.contiguous().to(torch.bfloat16)
 
     topk_indices, _ = torch_npu.npu_lightning_indexer(
-        q_bsnd, k_bsnd, w_bsnd,
-        layout_query="BSND", layout_key="BSND",
-        sparse_count=topk, sparse_mode=3, return_value=True,
+        q_bsnd,
+        k_bsnd,
+        w_bsnd,
+        layout_query="BSND",
+        layout_key="BSND",
+        sparse_count=topk,
+        sparse_mode=3,
+        return_value=True,
     )
     topk_indices = topk_indices.squeeze(0).to(torch.int64)  # [S, 1, K]
 
     # Safety: apply packed causal mask (no-op for single sequence)
     if hasattr(seq_ctx, "packed_causal_query_ranges"):
         topk_indices = _apply_packed_causal_mask(
-            topk_indices, seq_ctx, query_len, kv_len, q.device,
+            topk_indices,
+            seq_ctx,
+            query_len,
+            kv_len,
+            q.device,
         )
     return topk_indices
 
@@ -303,10 +330,17 @@ def _indexer_bsnd_single(
 # Packed multi-sequence path (TND)
 # ---------------------------------------------------------------------------
 
+
 def _indexer_tnd_packed(
-    q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor,
-    seq_ctx: SequenceContext, cu_seq_lens: torch.Tensor,
-    query_len: int, kv_len: int, topk: int, index_head_dim: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    seq_ctx: SequenceContext,
+    cu_seq_lens: torch.Tensor,
+    query_len: int,
+    kv_len: int,
+    topk: int,
+    index_head_dim: int,
 ) -> torch.Tensor:
     """Packed multi-sequence: TND layout + cu_seq_lens.
 
@@ -316,12 +350,12 @@ def _indexer_tnd_packed(
           different per-segment lengths — V2 supports this natively).
     """
     device = q.device
-    shard_start = getattr(seq_ctx, '_shard_start', 0)
+    shard_start = getattr(seq_ctx, "_shard_start", 0)
 
     # BSND → TND: [1, S, N, D] → [S, N, D]
-    q_tnd = q.squeeze(0).contiguous().to(torch.bfloat16)       # [S, Ni, Di]
+    q_tnd = q.squeeze(0).contiguous().to(torch.bfloat16)  # [S, Ni, Di]
     # V2 requires float32 weights; V1 also accepts float32
-    w_tnd = (weights.squeeze(0) * (index_head_dim ** -0.5)).contiguous().to(torch.float32)
+    w_tnd = (weights.squeeze(0) * (index_head_dim**-0.5)).contiguous().to(torch.float32)
 
     is_sp1, cu_seq_q_global, slice_meta = get_sp_mode_and_slice(
         seq_ctx, shard_start, query_len, device, _compute_prefix_extended_kv_slice
@@ -335,11 +369,16 @@ def _indexer_tnd_packed(
         kv_slice_offset = 0
 
         topk_indices, _ = torch_npu.npu_lightning_indexer(
-            q_tnd, k_tnd, w_tnd,
+            q_tnd,
+            k_tnd,
+            w_tnd,
             actual_seq_lengths_query=cu_seq_q_local,
             actual_seq_lengths_key=cu_seq_k_local,
-            layout_query="TND", layout_key="TND",
-            sparse_count=topk, sparse_mode=3, return_value=True,
+            layout_query="TND",
+            layout_key="TND",
+            sparse_count=topk,
+            sparse_mode=3,
+            return_value=True,
         )
     else:
         # ── SP>1: V2 kernel with prefix-extended KV slice ──
@@ -354,20 +393,34 @@ def _indexer_tnd_packed(
         kv_slice_offset = kv_start
 
         meta = _li_v2_meta(
-            num_heads_q=q.shape[2], num_heads_k=1,
-            head_dim=index_head_dim, topk=topk,
-            cu_seqlens_q=cu_seq_q_local, cu_seqlens_k=cu_seq_k_local,
+            num_heads_q=q.shape[2],
+            num_heads_k=1,
+            head_dim=index_head_dim,
+            topk=topk,
+            cu_seqlens_q=cu_seq_q_local,
+            cu_seqlens_k=cu_seq_k_local,
             batch_size=cu_seq_q_local.numel() - 1,
-            max_seqlen_q=query_len, max_seqlen_k=kv_end - kv_start,
-            layout_q="TND", layout_k="TND",
-            mask_mode=3, cmp_ratio=1,
+            max_seqlen_q=query_len,
+            max_seqlen_k=kv_end - kv_start,
+            layout_q="TND",
+            layout_k="TND",
+            mask_mode=3,
+            cmp_ratio=1,
         )
         topk_indices, _ = _li_v2(
-            q_tnd, k_tnd, w_tnd, topk,
-            cu_seqlens_q=cu_seq_q_local, cu_seqlens_k=cu_seq_k_local,
-            metadata=meta, max_seqlen_q=query_len,
-            layout_q="TND", layout_k="TND",
-            mask_mode=3, cmp_ratio=1, return_value=0,
+            q_tnd,
+            k_tnd,
+            w_tnd,
+            topk,
+            cu_seqlens_q=cu_seq_q_local,
+            cu_seqlens_k=cu_seq_k_local,
+            metadata=meta,
+            max_seqlen_q=query_len,
+            layout_q="TND",
+            layout_k="TND",
+            mask_mode=3,
+            cmp_ratio=1,
+            return_value=0,
         )
 
     # ── Common: per-segment local → global indices ──
@@ -375,11 +428,19 @@ def _indexer_tnd_packed(
     # global kv_len and the returned cache dtype is int32 anyway.
     topk_indices = topk_indices.to(torch.int32)
     topk_indices = _local_to_global_indices(
-        topk_indices, cu_seq_q_local, cu_seq_k_local,
-        kv_slice_offset, query_len, device,
+        topk_indices,
+        cu_seq_q_local,
+        cu_seq_k_local,
+        kv_slice_offset,
+        query_len,
+        device,
     )
 
     # ── Common: packed causal mask filter ──
     return _apply_packed_causal_mask(
-        topk_indices, seq_ctx, query_len, kv_len, device,
+        topk_indices,
+        seq_ctx,
+        query_len,
+        kv_len,
+        device,
     )

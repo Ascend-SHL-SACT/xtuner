@@ -1,10 +1,9 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """NPU liger-ascend FLCE patches and loss memory tooling.
 
-Aggregates the liger-ascend fused-linear-cross-entropy NPU corrections
-together with the forward/backward memory optimization (always enabled).
-``ce_loss.py`` imports these helpers and wires them in; no liger/ascend
-specifics live there.
+Aggregates the liger-ascend fused-linear-cross-entropy NPU corrections together with the forward/backward memory
+optimization (always enabled). ``ce_loss.py`` imports these helpers and wires them in; no liger/ascend specifics live
+there.
 """
 
 import importlib

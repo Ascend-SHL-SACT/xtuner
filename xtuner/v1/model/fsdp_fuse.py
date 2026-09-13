@@ -153,7 +153,8 @@ def _shard_group(
     reshard_after_forward: bool,
     offload_policy: CPUOffloadPolicy | None,
 ) -> None:
-    """Shard a list of sibling modules as a single FSDP2 unit (collective fusion).
+    """Shard a list of sibling modules as a single FSDP2 unit (collective
+    fusion).
 
     Mirrors :meth:`BaseModel._fully_shard` but treats ``modules`` as one FSDP2
     unit: it collects the fp32-keys-pattern ignored params across every module

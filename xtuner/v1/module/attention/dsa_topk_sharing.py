@@ -173,7 +173,7 @@ class ActivationOffloadedTopKResidency(GpuTopKResidency):
     def after_original_forward_last_use(self, seq_ctx: SequenceContext, source_layer_idx: int) -> None:
         cache = seq_ctx.dsa_topk_cache
         topk_indices = cache.indices.pop(source_layer_idx)
-        if not topk_indices.is_cuda and not (hasattr(topk_indices, 'device') and topk_indices.device.type == 'npu'):
+        if not topk_indices.is_cuda and not (hasattr(topk_indices, "device") and topk_indices.device.type == "npu"):
             cache.indices[source_layer_idx] = topk_indices
             return
 

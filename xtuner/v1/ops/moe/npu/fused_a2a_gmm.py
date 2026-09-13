@@ -64,7 +64,8 @@ def is_enabled() -> bool:
 
 
 def _resolve_hcom(ep_group: dist.ProcessGroup) -> tuple[str, int]:
-    """Resolve the HCCL communicator name and EP world size for the default NPU backend.
+    """Resolve the HCCL communicator name and EP world size for the default NPU
+    backend.
 
     ``get_hccl_comm_name`` is indexed by the GLOBAL rank of the process, not the
     group-local rank — mirroring ``fused_comm._hcomm_info`` (verified on 13B/16-NPU with
@@ -156,13 +157,14 @@ def _dw_matmul_loop(
 
 
 class AlltoallvPermuteGmm(torch.autograd.Function):
-    """Fused dispatch alltoallv + src-rank→local-expert permute + FC1 grouped-matmul.
+    """Fused dispatch alltoallv + src-rank→local-expert permute + FC1 grouped-
+    matmul.
 
-    Forward calls ``npu_alltoallv_gmm`` (``permute_out_flag=True``) and saves the permuted a2a output
-    (``permute_out``, reused for dW) and the gmm input; the native weight is read LIVE in backward
-    (see ``ctx.weight_ref``) so it does not pin the FSDP full buffer. Backward computes dX via the
-    sibling ``npu_gmm_alltoallv`` (counts swapped, native ``[E, out, in]`` weight with
-    ``trans_gmm_weight=False`` — the MindSpeed Stack-A convention) and dW via the matmul loop.
+    Forward calls ``npu_alltoallv_gmm`` (``permute_out_flag=True``) and saves the permuted a2a output (``permute_out``,
+    reused for dW) and the gmm input; the native weight is read LIVE in backward (see ``ctx.weight_ref``) so it does
+    not pin the FSDP full buffer. Backward computes dX via the sibling ``npu_gmm_alltoallv`` (counts swapped, native
+    ``[E, out, in]`` weight with ``trans_gmm_weight=False`` — the MindSpeed Stack-A convention) and dW via the matmul
+    loop.
     """
 
     @staticmethod
@@ -245,12 +247,11 @@ class AlltoallvPermuteGmm(torch.autograd.Function):
 class GmmUnpermuteAlltoallv(torch.autograd.Function):
     """Fused FC2 grouped-matmul + combine alltoallv (gmm-then-a2a).
 
-    Forward calls ``npu_gmm_alltoallv`` (counts pre-swapped: combine reverses dispatch) and saves the
-    gmm input; the native weight is read LIVE in backward (``ctx.weight_ref``) so it does not pin the
-    FSDP full buffer. ``npu_gmm_alltoallv`` returns only 2 values, so the backward RE-DERIVES the
-    permuted a2a output via a second ``npu_alltoallv_gmm`` call (counts un-swapped,
-    ``permute_out_flag=True``) that yields BOTH dX and the ``permute_grad`` reused for dW — the
-    verbatim MindSpeed asymmetry (``mc2_fuse_a2a.py:153-185``).
+    Forward calls ``npu_gmm_alltoallv`` (counts pre-swapped: combine reverses dispatch) and saves the gmm input; the
+    native weight is read LIVE in backward (``ctx.weight_ref``) so it does not pin the FSDP full buffer.
+    ``npu_gmm_alltoallv`` returns only 2 values, so the backward RE-DERIVES the permuted a2a output via a second
+    ``npu_alltoallv_gmm`` call (counts un-swapped, ``permute_out_flag=True``) that yields BOTH dX and the
+    ``permute_grad`` reused for dW — the verbatim MindSpeed asymmetry (``mc2_fuse_a2a.py:153-185``).
     """
 
     @staticmethod

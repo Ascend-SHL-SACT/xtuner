@@ -672,9 +672,7 @@ class MoEDecoderLayer(nn.Module):
         shared_experts_out_list: list[torch.Tensor | None] = []
 
         # dispatch + experts + pre-combine
-        for i, (router_results, pre_dispatched) in enumerate(
-            zip(router_results_list, pre_dispatched_list)
-        ):
+        for i, (router_results, pre_dispatched) in enumerate(zip(router_results_list, pre_dispatched_list)):
             dispatched = self.dispatcher.dispatch(
                 pre_dispatched=pre_dispatched,
                 topk_weights=router_results["topk_weights"],
