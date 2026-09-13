@@ -1519,12 +1519,9 @@ class Trainer:
                     from xtuner.v1.utils import npu_cpu_binder
 
                     npu_cpu_binder.run(self.rank)
-                    logger.info(
-                        f"Rank: {self.rank} bound to NPU cpu slice "
-                        f"via npu_cpu_binder.")
+                    logger.info(f"Rank: {self.rank} bound to NPU cpu slice via npu_cpu_binder.")
                 except Exception as e:
-                    logger.info(
-                        f"Rank: {self.rank} npu_cpu_binder failed: {e}")
+                    logger.info(f"Rank: {self.rank} npu_cpu_binder failed: {e}")
             return
 
         if str(DEVICE) != "cuda":
@@ -1775,8 +1772,7 @@ class Trainer:
             _logs = train_step_info.get("logs_info")
             if isinstance(_logs, dict):
                 train_step_info["logs_info"] = {
-                    _k: (_v.item() if isinstance(_v, torch.Tensor) else _v)
-                    for _k, _v in _logs.items()
+                    _k: (_v.item() if isinstance(_v, torch.Tensor) else _v) for _k, _v in _logs.items()
                 }
             _tl = train_step_info.get("total_loss")
             if isinstance(_tl, torch.Tensor):
