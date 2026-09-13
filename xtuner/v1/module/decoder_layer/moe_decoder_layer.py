@@ -43,6 +43,7 @@ from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_act_fn
 from xtuner.v1.ops.moe.npu import fused_a2a_gmm
 from xtuner.v1.utils import ForwardState
+from xtuner.v1.utils.dead_chain import dead_chain_strip_enabled
 
 from ..linear import build_linear
 
@@ -871,6 +872,10 @@ class MoEDecoderLayer(nn.Module):
         if self.n_shared_experts > 0:
             shared_experts_out = cast(torch.Tensor, shared_experts_out)
             combined_hidden_states = combined_hidden_states + shared_experts_out
+        if dead_chain_strip_enabled() and self.hidden_factor == 1.0:
+            # x * 1.0 is a bit-exact identity in IEEE arithmetic; drop the
+            # full-size Mul kernel when the factor is one.
+            return combined_hidden_states + residual
         return combined_hidden_states * self.hidden_factor + residual
 
     def build_kv_cache(
