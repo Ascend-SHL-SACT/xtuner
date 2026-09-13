@@ -69,10 +69,9 @@ def _use_copy_stream() -> bool:
 class _SwapCtx:
     """Lazy copy stream + cross-step event for D2H overlap.
 
-    ``d2h_ev`` is re-recorded on the copy stream at the end of each D2H; the
-    next H2D (default stream) waits it, so a step's D2H lands before the next
-    step reads the same pinned-CPU buffer. It is primed at construction so the
-    first step's wait is a no-op.
+    ``d2h_ev`` is re-recorded on the copy stream at the end of each D2H; the next H2D (default stream) waits it, so a
+    step's D2H lands before the next step reads the same pinned-CPU buffer. It is primed at construction so the first
+    step's wait is a no-op.
     """
 
     __slots__ = ("copy_s", "d2h_ev")

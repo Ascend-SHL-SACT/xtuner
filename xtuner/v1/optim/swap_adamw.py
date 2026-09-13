@@ -53,6 +53,10 @@ class SwapAdamW(torch.optim.AdamW):
         self._swap_optimizer_times = swap_optimizer_times
         self._param_to_group_map: dict[torch.Tensor, dict] = {}
         self._param_to_cpu_states_map: dict[torch.Tensor, dict[str, torch.Tensor | None]] = {}
+        # Created lazily by step_overlap on its first overlapping step; declared
+        # here so type checkers see them (None keeps the lazy-init branch intact).
+        self._swap_copy_stream: "torch.cuda.Stream | None" = None
+        self._swap_d2h_event: "torch.cuda.Event | None" = None
         self._init_swap_states()
 
     @staticmethod

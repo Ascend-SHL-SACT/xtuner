@@ -1,8 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Backward prefetch offset for FSDP2 K-fused groups.
 
-This module isolates the ``XTUNER_FSDP_BACKWARD_PREFETCH_OFFSET`` logic from
-``xtuner.v1.model.fsdp_fuse`` so the core sharding path stays unchanged.
+This module isolates the ``XTUNER_FSDP_BACKWARD_PREFETCH_OFFSET`` logic from ``xtuner.v1.model.fsdp_fuse`` so the core
+sharding path stays unchanged.
 """
 
 import os
@@ -11,7 +11,8 @@ import torch.nn as nn
 
 
 def apply_backward_prefetch_offset(units: list[nn.Module]) -> None:
-    """Shift FSDP2 backward all-gather prefetch target earlier in the reverse pass.
+    """Shift FSDP2 backward all-gather prefetch target earlier in the reverse
+    pass.
 
     FSDP2's default reverse-post-forward prefetch keeps the next unit's
     all-gather in-flight alongside the current unit's reduce-scatter. At large
