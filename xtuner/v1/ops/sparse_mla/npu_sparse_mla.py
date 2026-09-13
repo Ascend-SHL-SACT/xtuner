@@ -163,7 +163,8 @@ def split_query_direct(
     q_nope_absorbed: torch.Tensor,
     q_rope: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the TND sparse-MLA query parts without the cat/re-slice round trip.
+    """Build the TND sparse-MLA query parts without the cat/re-slice round
+    trip.
 
     Args:
         q_nope_absorbed (torch.Tensor): Absorbed nope query ``[1, N, S, Rkv]``,
@@ -190,8 +191,8 @@ def split_query_direct(
 def _is_tnd_packed(seq_ctx: SequenceContext | None) -> bool:
     """Whether ``seq_ctx`` describes packed multi-sequence (TND) attention.
 
-    Shared by :func:`npu_sparse_mla` and :func:`sparse_mla_split_query` so the
-    two entries can never drift apart in how they route to the TND kernel.
+    Shared by :func:`npu_sparse_mla` and :func:`sparse_mla_split_query` so the two entries can never drift apart in how
+    they route to the TND kernel.
     """
     return (
         seq_ctx is not None
@@ -317,10 +318,9 @@ def _global_to_local_indices(
 def _sp_mla_offload_enabled() -> bool:
     """Whether the SP>1 packed path offloads its KV-slice copies to pinned CPU.
 
-    Gated by ``XTUNER_SP_MLA_OFFLOAD`` (default off). When off, the SP>1 path
-    keeps the slice copies on device under stock torch_npu autograd (HEAD
-    behavior), which starves the ``aclnnSparseFlashAttentionGrad`` workspace
-    at 256K (see the :class:`_SpTndSparseMlaFn` docstring).
+    Gated by ``XTUNER_SP_MLA_OFFLOAD`` (default off). When off, the SP>1 path keeps the slice copies on device under
+    stock torch_npu autograd (HEAD behavior), which starves the ``aclnnSparseFlashAttentionGrad`` workspace at 256K
+    (see the :class:`_SpTndSparseMlaFn` docstring).
     """
     return os.environ.get("XTUNER_SP_MLA_OFFLOAD", "0") == "1"
 
@@ -526,13 +526,10 @@ def _sparse_mla_tnd_packed(
 ) -> SparseMLAOutputs:
     """Packed multi-sequence: TND layout + cu_seq_lens.
 
-    SP=1: Full global KV, global cu_seq_lens.
-    SP>1: Prefix-extended KV slice with asymmetric cu_seq_q / cu_seq_kv.
-          KV slice ``[kv_start, kv_end)`` may extend before ``shard_start``
-          to include the full segment prefix (MindSpeed approach). With
-          ``XTUNER_SP_MLA_OFFLOAD=1`` routed through :class:`_SpTndSparseMlaFn`,
-          which owns forward+backward and offloads the slice copies to pinned
-          CPU between the two; otherwise stock autograd (HEAD behavior).
+    SP=1: Full global KV, global cu_seq_lens. SP>1: Prefix-extended KV slice with asymmetric cu_seq_q / cu_seq_kv. KV
+    slice ``[kv_start, kv_end)`` may extend before ``shard_start`` to include the full segment prefix (MindSpeed
+    approach). With ``XTUNER_SP_MLA_OFFLOAD=1`` routed through :class:`_SpTndSparseMlaFn`, which owns forward+backward
+    and offloads the slice copies to pinned CPU between the two; otherwise stock autograd (HEAD behavior).
     """
     device = q_nope.device
     shard_start = getattr(seq_ctx, "_shard_start", 0)
