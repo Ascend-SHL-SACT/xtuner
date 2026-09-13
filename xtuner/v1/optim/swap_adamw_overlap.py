@@ -38,11 +38,16 @@ import os
 import queue
 import threading
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 from torch.optim.adam import adam as torch_adam
 
 from xtuner.v1.utils import get_device, get_torch_device_module
+
+
+if TYPE_CHECKING:
+    from xtuner.v1.optim.swap_adamw import SwapAdamW
 
 DEVICE = get_device()
 DEVICE_MODULE = get_torch_device_module()
@@ -81,12 +86,17 @@ def _d2h_to_scratch(optimizer, entries: list, stream, cast_pairs: list) -> None:
         if e["amsgrad"] and e["max"] is not None:
             sc["max"].copy_(e["max"], non_blocking=True)
             e["max"].record_stream(stream)
-        cast_pairs.append((
-            e["cpu_exp_avg"], sc["m"],
-            e["cpu_exp_avg_sq"], sc["v"],
-            e["cpu_max"], sc.get("max"),
-            e["amsgrad"],
-        ))
+        cast_pairs.append(
+            (
+                e["cpu_exp_avg"],
+                sc["m"],
+                e["cpu_exp_avg_sq"],
+                sc["v"],
+                e["cpu_max"],
+                sc.get("max"),
+                e["amsgrad"],
+            )
+        )
 
 
 def _d2h_plain(entries: list, stream) -> None:
@@ -135,7 +145,7 @@ def _submit_host_cast(optimizer, d2h_ev, pairs: list) -> None:
 
 @torch.no_grad()
 def step_overlap(
-    optimizer: torch.optim.Optimizer,
+    optimizer: "SwapAdamW",
     closure: Callable[[], torch.Tensor] | None = None,
 ) -> torch.Tensor | None:
     """Run the swap step with optional copy-stream H2D/D2H overlap.
@@ -165,6 +175,9 @@ def step_overlap(
             d2h_ev.record()  # prime: first step's wait is a no-op
         optimizer._swap_d2h_event = d2h_ev
     d2h_ev = optimizer._swap_d2h_event
+    # Set together with _swap_copy_stream in the lazy-init block above; every
+    # overlapping step reuses it, so it cannot be None here.
+    assert d2h_ev is not None
 
     default_s = DEVICE_MODULE.current_stream()
     # Prior step's D2H must land before this step reads CPU m/v. With bf16 the
@@ -220,18 +233,20 @@ def step_overlap(
                 if max_exp_avg_sq is not None:
                     max_exp_avg_sq = max_exp_avg_sq.to(torch.float32)
 
-            entries.append({
-                "param": param,
-                "group": group,
-                "amsgrad": amsgrad,
-                "step_tensor": step_tensor,
-                "cpu_exp_avg": cpu_exp_avg,
-                "cpu_exp_avg_sq": cpu_exp_avg_sq,
-                "cpu_max": cpu_max,
-                "exp_avg": exp_avg,
-                "exp_avg_sq": exp_avg_sq,
-                "max": max_exp_avg_sq,
-            })
+            entries.append(
+                {
+                    "param": param,
+                    "group": group,
+                    "amsgrad": amsgrad,
+                    "step_tensor": step_tensor,
+                    "cpu_exp_avg": cpu_exp_avg,
+                    "cpu_exp_avg_sq": cpu_exp_avg_sq,
+                    "cpu_max": cpu_max,
+                    "exp_avg": exp_avg,
+                    "exp_avg_sq": exp_avg_sq,
+                    "max": max_exp_avg_sq,
+                }
+            )
         return entries
 
     def adam_chunk(entries: list) -> None:
@@ -247,9 +262,7 @@ def step_overlap(
             slot[2].append(optimizer._to_local_tensor(e["param"].grad))
             slot[3].append(optimizer._to_local_tensor(e["exp_avg"]))
             slot[4].append(optimizer._to_local_tensor(e["exp_avg_sq"]))
-            slot[5].append(
-                optimizer._to_local_tensor(e["max"]) if e["max"] is not None else None
-            )
+            slot[5].append(optimizer._to_local_tensor(e["max"]) if e["max"] is not None else None)
             slot[6].append(e["step_tensor"])
         for slot in groups.values():
             g = slot[0]
@@ -330,6 +343,10 @@ def step_overlap(
         else:
             entries = h2d_chunk(chunk_slice(ci))
 
+        # With h2d_ov, next_entries is None only for the chunk past the loop end;
+        # every in-loop read hits a chunk produced by the prologue or the previous
+        # iteration, so entries is always a list here.
+        assert entries is not None
         adam_chunk(entries)
         d2h_chunk(entries)
 

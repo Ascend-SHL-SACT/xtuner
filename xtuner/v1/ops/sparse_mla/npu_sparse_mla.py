@@ -73,10 +73,10 @@ def npu_sparse_mla(
     else:
         rope_dim = q_dim - value_dim
 
-    q_nope = q[..., :value_dim]       # [S, N, Rkv]
-    q_rope = q[..., value_dim:]       # [S, N, Dr]
+    q_nope = q[..., :value_dim]  # [S, N, Rkv]
+    q_rope = q[..., value_dim:]  # [S, N, Dr]
     kv_compressed = kv[..., :value_dim]  # [S_g, 1, Rkv]
-    k_rope = kv[..., value_dim:]      # [S_g, 1, Dr]
+    k_rope = kv[..., value_dim:]  # [S_g, 1, Dr]
 
     scale_value = float(scaling) if scaling is not None else (value_dim + rope_dim) ** -0.5
 
@@ -84,12 +84,27 @@ def npu_sparse_mla(
 
     if use_tnd:
         return _sparse_mla_tnd_packed(
-            q_nope, q_rope, kv_compressed, k_rope,
-            indices, seq_ctx, seq_len, kv_len, num_heads, scale_value,
+            q_nope,
+            q_rope,
+            kv_compressed,
+            k_rope,
+            indices,
+            seq_ctx,
+            seq_len,
+            kv_len,
+            num_heads,
+            scale_value,
         )
     return _sparse_mla_bsnd_single(
-        q_nope, q_rope, kv_compressed, k_rope,
-        indices, seq_len, kv_len, num_heads, scale_value,
+        q_nope,
+        q_rope,
+        kv_compressed,
+        k_rope,
+        indices,
+        seq_len,
+        kv_len,
+        num_heads,
+        scale_value,
     )
 
 
@@ -171,6 +186,7 @@ def split_query_direct(
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _is_tnd_packed(seq_ctx: SequenceContext | None) -> bool:
     """Whether ``seq_ctx`` describes packed multi-sequence (TND) attention.
 
@@ -222,8 +238,16 @@ def _sparse_mla_split(
     scale_value = float(scaling) if scaling is not None else (value_dim + q_rope.shape[-1]) ** -0.5
     seq_len, num_heads, _ = q_nope.shape
     return _sparse_mla_tnd_packed(
-        q_nope, q_rope, kv_compressed, k_rope,
-        indices, seq_ctx, seq_len, kv.shape[0], num_heads, scale_value,
+        q_nope,
+        q_rope,
+        kv_compressed,
+        k_rope,
+        indices,
+        seq_ctx,
+        seq_len,
+        kv.shape[0],
+        num_heads,
+        scale_value,
     )
 
 
@@ -288,6 +312,7 @@ def _global_to_local_indices(
 # ---------------------------------------------------------------------------
 # SP>1 packed path with KV-slice offload (custom autograd)
 # ---------------------------------------------------------------------------
+
 
 def _sp_mla_offload_enabled() -> bool:
     """Whether the SP>1 packed path offloads its KV-slice copies to pinned CPU.
@@ -443,9 +468,17 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
 # Single-sequence path (BSND)
 # ---------------------------------------------------------------------------
 
+
 def _sparse_mla_bsnd_single(
-    q_nope, q_rope, kv_compressed, k_rope,
-    indices, seq_len, kv_len, num_heads, scale_value,
+    q_nope,
+    q_rope,
+    kv_compressed,
+    k_rope,
+    indices,
+    seq_len,
+    kv_len,
+    num_heads,
+    scale_value,
 ) -> SparseMLAOutputs:
     """Single-sequence: BSND layout, sparse_mode=3."""
     device = q_nope.device
@@ -454,7 +487,7 @@ def _sparse_mla_bsnd_single(
     safe_indices = _rewrite_invalid_indices(indices, 0, device)
 
     attn_outs = torch_npu.npu_sparse_flash_attention(
-        q_nope.unsqueeze(0).contiguous(),         # [1, S, N, Rkv]
+        q_nope.unsqueeze(0).contiguous(),  # [1, S, N, Rkv]
         kv_compressed.unsqueeze(0).contiguous(),  # [1, S_g, 1, Rkv]
         kv_compressed.unsqueeze(0).contiguous(),  # value = key
         sparse_indices=safe_indices.unsqueeze(0).contiguous(),
@@ -478,9 +511,18 @@ def _sparse_mla_bsnd_single(
 # Packed multi-sequence path (TND)
 # ---------------------------------------------------------------------------
 
+
 def _sparse_mla_tnd_packed(
-    q_nope, q_rope, kv_compressed, k_rope,
-    indices, seq_ctx, seq_len, kv_len, num_heads, scale_value,
+    q_nope,
+    q_rope,
+    kv_compressed,
+    k_rope,
+    indices,
+    seq_ctx,
+    seq_len,
+    kv_len,
+    num_heads,
+    scale_value,
 ) -> SparseMLAOutputs:
     """Packed multi-sequence: TND layout + cu_seq_lens.
 
@@ -493,7 +535,7 @@ def _sparse_mla_tnd_packed(
           CPU between the two; otherwise stock autograd (HEAD behavior).
     """
     device = q_nope.device
-    shard_start = getattr(seq_ctx, '_shard_start', 0)
+    shard_start = getattr(seq_ctx, "_shard_start", 0)
 
     is_sp1, cu_seq_q_global, slice_meta = get_sp_mode_and_slice(
         seq_ctx, shard_start, seq_len, device, _compute_prefix_extended_kv_slice
@@ -501,9 +543,9 @@ def _sparse_mla_tnd_packed(
 
     if is_sp1:
         # ── SP=1: full global KV ──
-        key_tnd = kv_compressed.contiguous()          # [T_g, 1, Rkv]
+        key_tnd = kv_compressed.contiguous()  # [T_g, 1, Rkv]
         value_tnd = key_tnd
-        key_rope_tnd = k_rope.contiguous()            # [T_g, 1, Dr]
+        key_rope_tnd = k_rope.contiguous()  # [T_g, 1, Dr]
         cu_seq_q_local = cu_seq_q_global
         cu_seq_k_local = seq_ctx.cu_seq_lens_k.to(torch.int32).to(device)
         kv_slice_offset = 0
@@ -535,20 +577,26 @@ def _sparse_mla_tnd_packed(
         kv_slice_offset = kv_start
 
     # TND tensors (no batch dim)
-    query_tnd = q_nope.contiguous()                   # [S, N, Rkv]
-    query_rope_tnd = q_rope.contiguous()              # [S, N, Dr]
+    query_tnd = q_nope.contiguous()  # [S, N, Rkv]
+    query_rope_tnd = q_rope.contiguous()  # [S, N, Dr]
 
     # Rewrite -1 → global self position (sparse_mode=3 requires valid indices)
     sparse_indices = _rewrite_invalid_indices(indices, shard_start, device)
 
     # Convert global indices → per-segment local for TND kernel
     sparse_indices_tnd = _global_to_local_indices(
-        sparse_indices, cu_seq_q_local, cu_seq_k_local,
-        kv_slice_offset, seq_len, device,
+        sparse_indices,
+        cu_seq_q_local,
+        cu_seq_k_local,
+        kv_slice_offset,
+        seq_len,
+        device,
     )
 
     attn_outs = torch_npu.npu_sparse_flash_attention(
-        query_tnd, key_tnd, value_tnd,
+        query_tnd,
+        key_tnd,
+        value_tnd,
         sparse_indices=sparse_indices_tnd,
         block_table=None,
         actual_seq_lengths_query=cu_seq_q_local,
@@ -569,6 +617,7 @@ def _sparse_mla_tnd_packed(
 # ---------------------------------------------------------------------------
 # Output parsing
 # ---------------------------------------------------------------------------
+
 
 def _parse_attn_outs(attn_outs, seq_len: int, num_heads: int, device: torch.device) -> SparseMLAOutputs:
     """Parse ``npu_sparse_flash_attention`` outputs into SparseMLAOutputs."""
