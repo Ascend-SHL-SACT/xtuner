@@ -47,6 +47,11 @@ def npu_dsa_topk_indices(
     Returns:
         ``[S, 1, K]`` int32 tensor. Invalid slots padded with -1.
     """
+    # Contract (see DSATopKIndicesProtocol): implementations own the full
+    # Indexer score scaling, including ``Ni**-0.5``; the caller passes the raw
+    # float32 ``weights_proj`` output. The TND/BSND paths below additionally
+    # apply the ``Di**-0.5`` factor their fused kernels expect.
+    weights = weights * (q.shape[2] ** -0.5)
     query_len = q.shape[1]
     kv_len = k.shape[1]
     topk = min(index_topk, kv_len)
