@@ -82,6 +82,7 @@ from xtuner.v1.utils import (
     log_rank0,
 )
 from xtuner.v1.utils.activation_offload import async_save_on_cpu
+from xtuner.v1.utils.dead_chain import accumulate_experts_only, dead_chain_strip_enabled
 from xtuner.v1.utils.router_offload import async_offload_to_cpu
 
 
@@ -217,6 +218,14 @@ class MoE(BaseModel):
             assert config.router.use_grouped_router, "AGRS dispatcher requires grouped router"
             assert config.ep_size == config.router.router_n_groups == 8, (
                 "Currently, AGRS dispatcher requires ep_size and router_n_groups to be 8"
+            )
+        if dead_chain_strip_enabled() and config.balancing_loss_cfg is not None:
+            # The dead-chain strip drops the router score renormalization whose
+            # only consumer is the balancing-loss `selected_router_weights`;
+            # refuse the combination instead of feeding it unnormalized scores.
+            raise ValueError(
+                "XTUNER_DEAD_CHAIN_STRIP is incompatible with a configured balancing_loss_cfg; "
+                "unset the env var or set balancing_loss_cfg=None."
             )
 
         super().__init__(config)
@@ -722,31 +731,40 @@ class MoE(BaseModel):
                 # seq_ctx_list), so the main nonpad indices and token counts apply directly. The
                 # z-loss carrier is hidden_states_list[0], the same main-loss path the per-layer aux
                 # loss already rides on, so backward traverses each MTP aux node exactly once.
-                for mtp_idx in range(self.config.mtp_config.num_layers):
-                    cat_mtp_router_weights = torch.cat(
-                        [mb_outputs[mtp_idx]["router_weights"] for mb_outputs in mtp_outputs_per_mb], dim=0
-                    )
-                    cat_mtp_router_logits = torch.cat(
-                        [mb_outputs[mtp_idx]["router_logits"] for mb_outputs in mtp_outputs_per_mb], dim=0
-                    )
-                    cat_mtp_router_topk_ids = torch.cat(
-                        [mb_outputs[mtp_idx]["router_topk_ids"] for mb_outputs in mtp_outputs_per_mb], dim=0
-                    )
-                    hidden_states_list[0] = self.aux_loss.accumulate(
-                        selected_router_weights=cat_mtp_router_weights.index_select(0, nonpad_indices)
-                        .contiguous()
-                        .float(),
-                        selected_router_logits=cat_mtp_router_logits.index_select(0, nonpad_indices)
-                        .contiguous()
-                        .float(),
-                        selected_experts=cat_mtp_router_topk_ids.index_select(0, nonpad_indices).contiguous(),
-                        hidden_states=hidden_states_list[0],
-                        balancing_ctx=balancing_ctx,
-                        z_ctx=z_ctx,
-                        num_tokens_local=non_pad_token,
-                        num_tokens_global=num_tokens_global,
-                        world_size=z_world_size,
-                    )
+                if dead_chain_strip_enabled() and balancing_ctx is None and z_ctx is None:
+                    for mtp_idx in range(self.config.mtp_config.num_layers):
+                        hidden_states_list[0] = accumulate_experts_only(
+                            self.aux_loss,
+                            [mb_outputs[mtp_idx]["router_topk_ids"] for mb_outputs in mtp_outputs_per_mb],
+                            nonpad_indices,
+                            hidden_states_list[0],
+                        )
+                else:
+                    for mtp_idx in range(self.config.mtp_config.num_layers):
+                        cat_mtp_router_weights = torch.cat(
+                            [mb_outputs[mtp_idx]["router_weights"] for mb_outputs in mtp_outputs_per_mb], dim=0
+                        )
+                        cat_mtp_router_logits = torch.cat(
+                            [mb_outputs[mtp_idx]["router_logits"] for mb_outputs in mtp_outputs_per_mb], dim=0
+                        )
+                        cat_mtp_router_topk_ids = torch.cat(
+                            [mb_outputs[mtp_idx]["router_topk_ids"] for mb_outputs in mtp_outputs_per_mb], dim=0
+                        )
+                        hidden_states_list[0] = self.aux_loss.accumulate(
+                            selected_router_weights=cat_mtp_router_weights.index_select(0, nonpad_indices)
+                            .contiguous()
+                            .float(),
+                            selected_router_logits=cat_mtp_router_logits.index_select(0, nonpad_indices)
+                            .contiguous()
+                            .float(),
+                            selected_experts=cat_mtp_router_topk_ids.index_select(0, nonpad_indices).contiguous(),
+                            hidden_states=hidden_states_list[0],
+                            balancing_ctx=balancing_ctx,
+                            z_ctx=z_ctx,
+                            num_tokens_local=non_pad_token,
+                            num_tokens_global=num_tokens_global,
+                            world_size=z_world_size,
+                        )
 
                 if skip_all_reduce:
                     scaled_mtp_loss = mtp_losses * self.config.mtp_config.loss_scaling_factor
@@ -854,20 +872,28 @@ class MoE(BaseModel):
                 if keep_router:
                     router_logits_list[i][f"layer{idx}"] = self._maybe_offload_router(router_logits[i])
 
-            cat_router_weights = torch.cat(router_weights, dim=0)
-            cat_router_logits = torch.cat(router_logits, dim=0)
-            cat_router_topk_ids = torch.cat(router_topk_ids, dim=0)
-            hidden_states_list[0] = self.aux_loss.accumulate(
-                selected_router_weights=cat_router_weights.index_select(0, nonpad_indices).contiguous().float(),
-                selected_router_logits=cat_router_logits.index_select(0, nonpad_indices).contiguous().float(),
-                selected_experts=cat_router_topk_ids.index_select(0, nonpad_indices).contiguous(),
-                hidden_states=hidden_states_list[0],
-                balancing_ctx=balancing_ctx,
-                z_ctx=z_ctx,
-                num_tokens_local=non_pad_token,
-                num_tokens_global=num_tokens_global,
-                world_size=z_world_size,
-            )
+            if dead_chain_strip_enabled() and balancing_ctx is None and z_ctx is None:
+                hidden_states_list[0] = accumulate_experts_only(
+                    self.aux_loss, router_topk_ids, nonpad_indices, hidden_states_list[0]
+                )
+            else:
+                cat_router_weights = torch.cat(router_weights, dim=0)
+                cat_router_logits = torch.cat(router_logits, dim=0)
+                cat_router_topk_ids = torch.cat(router_topk_ids, dim=0)
+                # Pin the per-layer z-loss to MB0's hidden_states stream. With multiple MBs, only
+                # one carrier may be chosen — all MBs converge into the same total_loss backward,
+                # so MB0's path traverses every aux-loss node exactly once.
+                hidden_states_list[0] = self.aux_loss.accumulate(
+                    selected_router_weights=cat_router_weights.index_select(0, nonpad_indices).contiguous().float(),
+                    selected_router_logits=cat_router_logits.index_select(0, nonpad_indices).contiguous().float(),
+                    selected_experts=cat_router_topk_ids.index_select(0, nonpad_indices).contiguous(),
+                    hidden_states=hidden_states_list[0],
+                    balancing_ctx=balancing_ctx,
+                    z_ctx=z_ctx,
+                    num_tokens_local=non_pad_token,
+                    num_tokens_global=num_tokens_global,
+                    world_size=z_world_size,
+                )
 
         return hidden_states_list
 
