@@ -210,6 +210,7 @@ class LengthGroupedSampler(Sampler):
         self.epoch = 0
         self.step = 0
         self.round_up = round_up
+        self._cycle = False
 
         if self.round_up:
             self.num_samples = math.ceil(len(self.dataset) / global_batch_size) * global_batch_size // world_size
@@ -235,33 +236,45 @@ class LengthGroupedSampler(Sampler):
         self.global_batch_size = global_batch_size
 
     def __iter__(self) -> Iterator[int]:
-        """Iterate the indices."""
-        if self.seed is not None:
-            self.torch_generator.manual_seed(self.seed + self.epoch)
-            self.random_generator.seed(self.seed + self.epoch)
-        indices = get_length_grouped_indices(
-            max_lengths=self.max_lengths,
-            group_batch_size=self.group_batch_size,
-            group_size=self.group_size,
-            torch_generator=self.torch_generator,
-            random_generator=self.random_generator,
-        )
-        assert len(set(indices)) == len(indices)
-        # add extra samples to make it evenly divisible
-        if self.round_up:
-            indices = (indices * int(self.total_size / len(indices) + 1))[: self.total_size]
-        else:
-            indices = indices[: self.total_size]
-        # subsample
-        assert len(indices) == self.total_size
-        indices = indices[self.step + self.rank : self.total_size : self.world_size]
-        assert len(indices) == self.num_samples - self.step // self.world_size
-        yield from iter(indices)
-        self.step = 0
+        """Iterate the indices; yields indefinitely when cycling is enabled."""
+        while True:
+            if self.seed is not None:
+                self.torch_generator.manual_seed(self.seed + self.epoch)
+                self.random_generator.seed(self.seed + self.epoch)
+            indices = get_length_grouped_indices(
+                max_lengths=self.max_lengths,
+                group_batch_size=self.group_batch_size,
+                group_size=self.group_size,
+                torch_generator=self.torch_generator,
+                random_generator=self.random_generator,
+            )
+            assert len(set(indices)) == len(indices)
+            # add extra samples to make it evenly divisible
+            if self.round_up:
+                indices = (indices * int(self.total_size / len(indices) + 1))[: self.total_size]
+            else:
+                indices = indices[: self.total_size]
+            # subsample
+            assert len(indices) == self.total_size
+            indices = indices[self.step + self.rank : self.total_size : self.world_size]
+            assert len(indices) == self.num_samples - self.step // self.world_size
+            yield from iter(indices)
+            self.step = 0
+            if not self._cycle:
+                break
+            self.epoch += 1
 
     def __len__(self) -> int:
         """The number of samples in this rank."""
         return self.num_samples
+
+    def set_cycle(self, cycle: bool = True) -> None:
+        """Set whether to iterate indefinitely across epoch boundaries.
+
+        Args:
+            cycle (bool): Whether to cycle. Defaults to ``True``.
+        """
+        self._cycle = cycle
 
     def set_epoch(self, epoch: int) -> None:
         """Sets the epoch for this sampler.
@@ -307,7 +320,8 @@ class LengthGroupedSampler(Sampler):
         # Attention! Do not set self.step here, or it will cause the next __iter__ to get less samples.
         step_mod = total_consumed_steps % self.total_size
         return {
-            "epoch": self.epoch,
+            # Under cycling, ``self.epoch`` is prefetch-ahead; save the consumed epoch instead.
+            "epoch": total_consumed_steps // self.total_size if self._cycle else self.epoch,
             "step": step_mod,
             "world_size": self.world_size,
             "round_up": self.round_up,
