@@ -10,10 +10,29 @@ import requests
 import torch
 from vllm.entrypoints.openai.api_server import run_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.utils import cli_env_setup
-from vllm.utils import FlexibleArgumentParser
+
+
+try:
+    # vllm < 0.23
+    from vllm.entrypoints.utils import cli_env_setup
+except ImportError:
+    # vllm >= 0.23 moved cli_env_setup into the serve utils.
+    from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
+
+try:
+    # vllm < 0.23
+    from vllm.utils import FlexibleArgumentParser
+except ImportError:
+    # vllm >= 0.23 moved FlexibleArgumentParser into the argparse utils.
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from xtuner.v1.data_proto.rl_data import RolloutState, Status, update_status_from_finish_reason
+from xtuner.v1.rl.rollout.vllm_glm52_compat import (
+    apply_engine_env,
+    glm52_compat_enabled,
+    install_glm52_compat,
+    update_weight_npu_ipc_compat,
+)
 from xtuner.v1.utils.device import get_device, get_torch_device_module
 
 from .rollout_topology import RolloutEngine, RolloutServerProcess, RolloutTopology
@@ -76,6 +95,9 @@ class WorkerWrap:
         )
 
     def update_weight_npu_ipc(self, data):
+        if glm52_compat_enabled():
+            # GLM-5.2-validated vllm_ascend receive path (see vllm_glm52_compat.py).
+            return update_weight_npu_ipc_compat(self, data)
         import base64
         import json
         from multiprocessing.reduction import ForkingPickler
@@ -208,6 +230,10 @@ class vLLMWorker(RolloutWorker):
             f"tensor_parallel_size ({self.config.tensor_parallel_size}) must be divisible by data_parallel_size ({self.dp_size})"
         )
         self.tp_size = self.config.tensor_parallel_size // self.dp_size
+        if glm52_compat_enabled():
+            # GLM-5.2-validated token-level /v1/completions rollout path (see
+            # vllm_glm52_compat.py); with the gate off the class stays upstream.
+            install_glm52_compat(self)
 
     async def _create_request(
         self,
@@ -401,6 +427,9 @@ class vLLMWorker(RolloutWorker):
             "VLLM_SERVER_DEV_MODE": "1",
             "VLLM_ASCEND_ENABLE_NZ": "0",
         }
+        if glm52_compat_enabled():
+            # GLM-5.2-validated engine env overrides (see apply_engine_env).
+            apply_engine_env(env)
 
         # Apply extra_rollout_config overrides for vLLM parameters (prefix: "vllm_")
         extra_cfg = getattr(self.config, "extra_rollout_config", None) or {}
@@ -497,3 +526,14 @@ class vLLMWorker(RolloutWorker):
     def _request_server_terminate(self) -> bool:
         self.logger.warning("VLLM server does not support terminate request, will directly kill the process.")
         return True
+
+
+if glm52_compat_enabled():
+    # Ray captures actor-method signatures when the ActorClass is created, which happens
+    # outside this module after import; deleting the (input_ids, sampling_params)
+    # pass-through stubs in __init__ is too late for that binding (run30: controller calls
+    # generate with rollout_state, Ray validated against the stub and raised
+    # "missing a required argument: 'input_ids'"). Remove them at import time so the
+    # base RolloutWorker.generate template signature is what Ray sees.
+    del vLLMWorker.generate
+    del vLLMWorker.get_logprobs
