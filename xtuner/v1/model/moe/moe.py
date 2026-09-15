@@ -586,7 +586,6 @@ class MoE(BaseModel):
         seq_ctx_list: list[SequenceContext],
         loss_ctx_list: list[MoELossContextDict],
         return_router_logits: bool = False,
-        skip_all_reduce: bool = False,
     ) -> MoEModelOutputs:
         """Micro-batch forward pass for MoE model.
 
@@ -697,9 +696,7 @@ class MoE(BaseModel):
 
                 micro_batch_mtp_losses = torch.tensor(0.0, device=DEVICE)
                 for mtp_idx, (mtp_hidden, mtp_ctx) in enumerate(zip(mtp_outputs, mtp_loss_ctx_list)):
-                    mtp_loss, _ = self.lm_head(
-                        mtp_hidden["hidden_states"], cast(MTPLossContext, mtp_ctx), skip_all_reduce=skip_all_reduce
-                    )
+                    mtp_loss, _ = self.lm_head(mtp_hidden["hidden_states"], cast(MTPLossContext, mtp_ctx))
                     micro_batch_mtp_losses += mtp_loss
 
                     if keep_router:
@@ -748,15 +745,7 @@ class MoE(BaseModel):
                         world_size=z_world_size,
                     )
 
-                if skip_all_reduce:
-                    scaled_mtp_loss = mtp_losses * self.config.mtp_config.loss_scaling_factor
-                    if dist.is_initialized() and scaled_mtp_loss.requires_grad:
-                        scaled_mtp_loss = torch.distributed.nn.functional.all_reduce(
-                            scaled_mtp_loss, op=dist.ReduceOp.SUM, group=dist.group.WORLD
-                        )
-                    output["mtp_loss"] = scaled_mtp_loss
-                else:
-                    output["mtp_loss"] = mtp_losses * self.config.mtp_config.loss_scaling_factor
+                output["mtp_loss"] = mtp_losses * self.config.mtp_config.loss_scaling_factor
 
         # Apply final norm to all micro-batches
         cat_hidden_states = torch.cat(hidden_states_list, dim=1)
@@ -876,7 +865,6 @@ class MoE(BaseModel):
         seq_ctx: SequenceContext,  # todo(@yehaochen): support intra layer micro-batch
         loss_ctx: MoELossContextDict | None,
         return_router_logits: bool = False,
-        skip_all_reduce: bool = False,
     ) -> MoEModelOutputs:
         input_ids = seq_ctx.input_ids
         position_ids = seq_ctx.position_ids
@@ -996,23 +984,15 @@ class MoE(BaseModel):
                     num_tokens_global=mtp_num_tokens_global,
                     world_size=mtp_z_world_size,
                 )
-                mtp_loss, _ = self.lm_head(
-                    mtp_hidden_states, cast(MTPLossContext, mtp_ctx), skip_all_reduce=skip_all_reduce
-                )
+                mtp_loss, _ = self.lm_head(mtp_hidden_states, cast(MTPLossContext, mtp_ctx))
                 mtp_losses += mtp_loss
 
             # Average MTP losses across depths and scale
             mtp_losses = mtp_losses / len(mtp_loss_ctx_list)
             scaled_mtp_loss = mtp_losses * self.config.mtp_config.loss_scaling_factor  # type: ignore
 
-            if skip_all_reduce:
-                if dist.is_initialized() and scaled_mtp_loss.requires_grad:
-                    scaled_mtp_loss = torch.distributed.nn.functional.all_reduce(
-                        scaled_mtp_loss, op=dist.ReduceOp.SUM, group=dist.group.WORLD
-                    )
-                output["mtp_loss"] = scaled_mtp_loss
-            else:
-                output["mtp_loss"] = scaled_mtp_loss
+            # Add to total loss
+            output["mtp_loss"] = scaled_mtp_loss
 
         split_aux_output = self.aux_loss.finalize(
             balancing_ctx=balancing_ctx,
