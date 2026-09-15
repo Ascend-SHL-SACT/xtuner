@@ -1483,6 +1483,12 @@ class Trainer:
         return self._meta
 
     def _data_iter(self):
+        sampler = self._dataloader.sampler
+        cycling = hasattr(sampler, "set_cycle")
+        if cycling:
+            # Cycling: the sampler never raises StopIteration, so the DataLoader
+            # iterator is never reset and its prefetch queue is never cleared.
+            sampler.set_cycle(True)
         data_iter = iter(self._dataloader)
         while self._cur_step < self.total_step:
             try:
@@ -1492,7 +1498,11 @@ class Trainer:
                 self._dataloader.set_epoch(self._cur_epoch)
                 data_iter = iter(self._dataloader)
                 data = next(data_iter)
-
+            if cycling and len(self._dataloader):
+                # Derive from the step count: ``sampler.epoch`` runs ahead of the
+                # trainer under DataLoader prefetch (num_workers x prefetch_factor
+                # batches are pulled as soon as the iterator is created).
+                self._cur_epoch = self._cur_step // len(self._dataloader) + 1
             yield data
 
     def _get_checkpoint_path(self, epoch: int, step: int, is_snapshot: bool = False) -> Path:
