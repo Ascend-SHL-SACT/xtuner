@@ -5,6 +5,14 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
+
+
+try:
+    # torch>=2.10 2D FSDP2 meshes (fsdp x ep/tp) bookkeep expert gradient sharding with
+    # this placement; it derives from Placement directly, NOT from Shard.
+    from torch.distributed.tensor.placement_types import _StridedShard
+except ImportError:  # torch < 2.10: no strided bookkeeping placement exists
+    _StridedShard = Shard  # type: ignore[assignment, misc]
 from torch.utils._foreach_utils import (
     _device_has_foreach_support,
     _has_foreach_support,
@@ -78,9 +86,10 @@ def cal_total_norm(
     if norm_type == 2:
         local_norm_squared = local_norm**2
         for i, placement in enumerate(placements):
-            if isinstance(placement, Shard):
-                # FSDP's strided bookkeeping placement is a Shard subclass, so
-                # RuntimeLayout owns the only concrete private-type dependency.
+            if isinstance(placement, (Shard, _StridedShard)):
+                # The strided bookkeeping placement reduces like a Shard: the strided
+                # chunk layout does not change the sum of squared local norms over
+                # that mesh dimension.
                 dist.all_reduce(local_norm_squared, group=device_mesh.get_group(i))
             elif isinstance(placement, Replicate):
                 pass
