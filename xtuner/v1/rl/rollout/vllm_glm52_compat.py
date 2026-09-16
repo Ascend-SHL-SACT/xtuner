@@ -12,8 +12,9 @@ The bundle carries the GLM-5.2-validated behaviors:
   ``AscendUnquantizedFusedMoEMethod.process_weights_after_loading`` replaces ``w13_weight``/
   ``w2_weight`` with bare transposed parameters (``weight_loader`` lost), and the SFA MLA
   backend (``sparse_mla_backend="torch_npu"``) splits ``kv_b_proj`` into ``W_UV``/``W_UK_T``
-  then disposes the parameter to shape ``(0,)``; both must be restored before a sync
-  ``load_weights`` and re-processed afterwards. Also: vllm 0.23 exposes the in-engine TP rank
+  and disposes the parameter to shape ``(0,)`` (``mla_v1`` splits without disposing); the
+  parameter must be restored before a sync ``load_weights`` and the split re-applied after.
+  Also: vllm 0.23 exposes the in-engine TP rank
   as ``self.rank`` (no ``global_rank``), NPU IPC rebuild signatures carry the sender's device
   index while CPU shm rebuilds do not, and shm-backed host tensors must not be unmapped
   before their H2D copies complete.
@@ -29,7 +30,7 @@ import base64
 import json
 import os
 from multiprocessing.reduction import ForkingPickler
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 import torch
@@ -63,7 +64,10 @@ def apply_engine_env(env: dict[str, str]) -> None:
       globally, but vllm_ascend's sleep mode uses CaMemAllocator, which forbids
       expandable segments (camem.py).
     - Drop ``VLLM_VERSION``: vllm_ascend's ``vllm_version_is()`` consumes it to select
-      version-specific code paths, so a spoofed version selects the wrong ones.
+      version-specific code paths, so a spoofed version selects the wrong ones. Note: Ray
+      merges runtime ``env_vars`` on top of the inherited process environment, so a launch
+      shell that still exports ``VLLM_VERSION`` keeps the spoof alive in the engine
+      processes; the launch environment must not export it alongside the gate.
 
     The gate itself is propagated into the dict so the engine-side
     ``WorkerWrap.update_weight_npu_ipc`` sees the same gate decision when it re-checks
@@ -83,10 +87,11 @@ def apply_engine_env(env: dict[str, str]) -> None:
 def install_glm52_compat(worker: "vLLMWorker") -> None:
     """Install the token-level ``/v1/completions`` rollout behavior onto the worker class.
 
-    Overrides ``_get_request_payload``/``_safe_handle_response`` with the compat versions and
-    deletes the ``generate``/``get_logprobs`` pass-through stubs so the base-class
-    ``RolloutWorker.generate`` template runs. Idempotent: the class is patched once, while the
-    per-instance endpoint switch is applied on every call.
+    Overrides ``_get_request_payload``/``_safe_handle_response`` with the compat versions so the
+    base-class ``RolloutWorker.generate`` template runs (the ``generate``/``get_logprobs``
+    pass-through stubs are deleted at ``vllm.py`` import time, before the ActorClass is
+    created). Idempotent: the class is patched once, while the per-instance endpoint switch is
+    applied on every call.
 
     Args:
         worker (vLLMWorker): The rollout worker instance being initialized.
@@ -118,7 +123,7 @@ def update_weight_npu_ipc_compat(worker: Any, data: dict | str) -> None:
     """
     payload: dict[Any, Any] = json.loads(data) if isinstance(data, str) else data
 
-    def _construct(item):
+    def _construct(item: tuple[Any, Any]) -> torch.Tensor:
         func, args = item
         args = list(args)
         # NPU tensor IPC rebuilds carry the sender's device index at args[6];
@@ -127,7 +132,7 @@ def update_weight_npu_ipc_compat(worker: Any, data: dict | str) -> None:
         # shorter signature and must be rebuilt as-is on the CPU side.
         if len(args) > 6:
             args[6] = DEVICE_MODULE.current_device()
-        return func(*args)
+        return cast(torch.Tensor, func(*args))
 
     serialized_data = payload["serialized_named_tensors"]
     if isinstance(serialized_data, list):
@@ -142,7 +147,7 @@ def update_weight_npu_ipc_compat(worker: Any, data: dict | str) -> None:
     if weights:
         hidden_size = worker.model_runner.vllm_config.model_config.hf_text_config.hidden_size
         _restore_fused_moe_expert_params(model, hidden_size)
-        _restore_disposed_kv_b_proj(model)
+        _prepare_kv_b_proj_for_sync(model)
     try:
         model.load_weights(weights=weights)
     except Exception:
@@ -216,7 +221,9 @@ def _get_request_payload(worker: "vLLMWorker", rollout_state: "RolloutState") ->
                 "stop_token_ids": sample_params.stop_token_ids,
                 "skip_special_tokens": sample_params.skip_special_tokens,
                 "spaces_between_special_tokens": sample_params.spaces_between_special_tokens,
-                "include_stop_str_in_output": sample_params.include_stop_str_in_output,
+                # Mirror the chat path's _transform_sample_params mapping: no_stop_trim is the
+                # sample-params flag that controls stop-string retention for the vLLM backend.
+                "include_stop_str_in_output": sample_params.no_stop_trim,
                 "return_token_ids": True,
                 "logprobs": 0,
             }
@@ -256,14 +263,24 @@ async def _safe_handle_response(
             choice = response["choices"][0]
             token_ids = choice.get("token_ids") or []
             token_logprobs = (choice.get("logprobs") or {}).get("token_logprobs") or []
+            # prompt_tokens backs the base parser's partial-rollout path, which reads
+            # meta_info.prompt_tokens when enable_partial_rollout is set; vLLM reports the
+            # prompt token count in the usage block, falling back to the local prompt ids.
+            prompt_tokens = response.get("usage", {}).get("prompt_tokens") or len(rollout_state.tokens or [])
             native: dict[str, Any] = {
                 "text": choice.get("text", ""),
                 "output_ids": token_ids,
-                "meta_info": {"completion_tokens": len(token_ids)},
+                "meta_info": {"completion_tokens": len(token_ids), "prompt_tokens": prompt_tokens},
             }
             finish_reason = choice.get("finish_reason")
             if finish_reason is not None:
                 native["meta_info"]["finish_reason"] = {"type": finish_reason}
+            if token_ids and len(token_logprobs) != len(token_ids):
+                print(
+                    f"[XTuner][_safe_handle_response] token_logprobs ({len(token_logprobs)}) and token_ids "
+                    f"({len(token_ids)}) length mismatch; output_token_logprobs omitted",
+                    flush=True,
+                )
             if token_ids and len(token_logprobs) == len(token_ids):
                 native["meta_info"]["output_token_logprobs"] = [
                     [logprob, token_id] for logprob, token_id in zip(token_logprobs, token_ids)
@@ -339,9 +356,9 @@ def _reapply_fused_moe_postprocess(model: torch.nn.Module) -> None:
 def _get_sfa_mla_impls(model: torch.nn.Module) -> list:
     """Collect attention impls that hold vllm_ascend's split kv_b state.
 
-    vllm_ascend's ``AscendSFAImpl`` (selected by ``sparse_mla_backend="torch_npu"``)
-    stores ``W_UV``/``W_UK_T`` views split from ``kv_b_proj`` on the impl object
-    reachable as ``Attention.impl``.
+    vllm_ascend's ``AscendSFAImpl`` (selected by ``sparse_mla_backend="torch_npu"``) and
+    ``AscendMLAImpl`` (the ``mla_v1`` backend) store ``W_UV``/``W_UK_T`` views split from
+    ``kv_b_proj`` on the impl object reachable as ``Attention.impl``.
     """
     impls = []
     for module in model.modules():
@@ -351,34 +368,37 @@ def _get_sfa_mla_impls(model: torch.nn.Module) -> list:
     return impls
 
 
-def _restore_disposed_kv_b_proj(model: torch.nn.Module) -> None:
-    """Re-allocate kv_b_proj params disposed by vllm_ascend's SFA backend.
+def _prepare_kv_b_proj_for_sync(model: torch.nn.Module) -> None:
+    """Make the split-kv_b impls loadable again and mark them for the post-sync re-split.
 
-    ``AscendSFAImpl.process_weights_after_loading`` splits ``kv_b_proj`` into
+    vllm_ascend's ``AscendSFAImpl.process_weights_after_loading`` splits ``kv_b_proj`` into
     ``W_UV``/``W_UK_T`` buffers, then calls ``dispose_layer`` to shrink the original
-    parameter to empty (``dispose_tensor`` -> shape ``(0,)``). A sync ``load_weights``
-    then hits ``assert param_data.shape == loaded_weight.shape`` in the
-    ColumnParallelLinear weight loader. Re-allocate the parameter with the analytic
-    TP-shard shape so the loader can copy into it again; the backend's
-    ``process_weights_after_loading`` re-splits into the same buffers afterwards.
-    Marks the impl so ``_reapply_kv_b_postprocess`` only touches layers it restored.
+    parameter to empty (``dispose_tensor`` -> shape ``(0,)``); the ``mla_v1`` backend
+    (``AscendMLAImpl``) splits the same way but keeps the parameter. A sync ``load_weights``
+    on a disposed parameter hits ``assert param_data.shape == loaded_weight.shape`` in the
+    ColumnParallelLinear weight loader. Re-allocate disposed parameters with the analytic
+    TP-shard shape — zeros, so that a sync which never delivers ``kv_b_proj`` cannot leak
+    uninitialized memory into the split buffers — so the loader can copy into them again.
+    Every split-holding impl is marked so ``_reapply_kv_b_postprocess`` re-runs the
+    backend's split for it after the sync; skipping the mark would leave the consumed
+    ``W_UV``/``W_UK_T`` buffers stale while the parameter holds the new weights.
     """
     for impl in _get_sfa_mla_impls(model):
         weight: torch.nn.Parameter = impl.kv_b_proj.weight
-        if weight.numel() != 0:
-            continue
-        shape = (impl.local_num_heads * (impl.qk_nope_head_dim + impl.v_head_dim), impl.kv_lora_rank)
-        weight.data = torch.empty(shape, dtype=weight.dtype, device=weight.device)
+        if weight.numel() == 0:
+            shape = (impl.local_num_heads * (impl.qk_nope_head_dim + impl.v_head_dim), impl.kv_lora_rank)
+            weight.data = torch.zeros(shape, dtype=weight.dtype, device=weight.device)
         impl._xtuner_kv_b_restored = True
 
 
 def _reapply_kv_b_postprocess(model: torch.nn.Module, act_dtype: torch.dtype) -> None:
-    """Re-run the SFA kv_b split after a sync ``load_weights``.
+    """Re-run the backend kv_b split after a sync ``load_weights``.
 
-    The SFA kernels consume ``W_UV``/``W_UK_T`` (whose addresses must stay stable
-    across iterations), so after the freshly synced weights land in ``kv_b_proj``,
-    call the backend's ``process_weights_after_loading`` again: it copies the new
-    weight into the existing buffers and disposes the parameter once more.
+    The split-kv_b backends (SFA and ``mla_v1``) consume ``W_UV``/``W_UK_T`` (whose
+    addresses must stay stable across iterations), so after the freshly synced weights
+    land in ``kv_b_proj``, call the backend's ``process_weights_after_loading`` again:
+    it copies the new weight into the existing buffers and, for the SFA backend,
+    disposes the parameter once more.
     """
     for impl in _get_sfa_mla_impls(model):
         if not getattr(impl, "_xtuner_kv_b_restored", False):
