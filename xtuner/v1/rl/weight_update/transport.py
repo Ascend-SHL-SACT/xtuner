@@ -31,6 +31,7 @@ from xtuner.v1.utils import (
     get_torch_device_module,
     monkey_unpatch_torch_reductions,
 )
+from xtuner.v1.utils.cpu_merge import cpu_merge_enabled, dump_state_dict_file_system, stage_cpu_state_dict_to_shared
 
 from .data import RolloutWeightUpdateInfo, RolloutWeightUpdateTarget, WeightUpdateBatch
 
@@ -162,9 +163,16 @@ class VLLMIPCBackendAdapter(IPCBackendAdapter):
 
         from torch.multiprocessing.reductions import reduce_tensor
 
-        data = [(k, reduce_tensor(v)) for k, v in state_dict.items()]
         buf = BytesIO()
-        ForkingPickler(buf).dump(data)
+        if cpu_merge_enabled():
+            # Host-memory tensors merged by the CPU-merge unshard need the file_system
+            # sharing strategy at REDUCE time (reduce_storage reads the strategy then), so
+            # dump_state_dict_file_system wraps the reduce_tensor pass and the pickle
+            # together; see xtuner/v1/utils/cpu_merge.py.
+            dump_state_dict_file_system(list(state_dict.items()), buf)
+        else:
+            data = [(k, reduce_tensor(v)) for k, v in state_dict.items()]
+            ForkingPickler(buf).dump(data)
         buf.seek(0)
         return base64.b64encode(buf.read()).decode("utf-8")
 
@@ -174,9 +182,12 @@ class VLLMIPCBackendAdapter(IPCBackendAdapter):
         cpu_group: dist.ProcessGroup,
         head_rank: int,
     ) -> list[Any]:
+        state_dict = batch.state_dict
+        if cpu_merge_enabled():
+            state_dict = stage_cpu_state_dict_to_shared(state_dict)
         serialized_data = [None] * self.rollout_tp
         dist.gather_object(
-            self._serialize_state_dict(batch.state_dict),
+            self._serialize_state_dict(state_dict),
             serialized_data if dist.get_rank() == head_rank else None,
             dst=head_rank,
             group=cpu_group,
@@ -455,6 +466,11 @@ class IPCWeightTransport(WeightTransport[IPCBackendAdapter]):
         self.head_rank = int(self.cpu_mesh.mesh[0].item())
 
     def _build_adapter(self) -> IPCBackendAdapter:
+        if cpu_merge_enabled() and self.backend != "vllm":
+            raise RuntimeError(
+                f"XTUNER_UNSHARD_CPU_MERGE=1 keeps merged weights in host memory and relies on the vLLM IPC "
+                f"file_system transport; rollout backend '{self.backend}' does not support the gate."
+            )
         if self.backend == "vllm":
             return VLLMIPCBackendAdapter(rollout_tp=self.rollout_info.tp)
         elif self.backend == "sglang":
@@ -498,6 +514,11 @@ class IPCWeightTransport(WeightTransport[IPCBackendAdapter]):
                     request.body,
                     api_key=self.rollout_info.api_key,
                 )
+            if cpu_merge_enabled():
+                # The head rank returns from its POST only after the rollout engine
+                # consumed this batch's shared-pool bytes; barrier every rank here so
+                # the next bucket build never overwrites pool bytes still being read.
+                dist.barrier(group=self.cpu_group)
 
             self._adapter.after_update_per_batch(batch.finished, self.cpu_group, batch.train_enable_ep)
 

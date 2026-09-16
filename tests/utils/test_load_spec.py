@@ -10,6 +10,7 @@ from torch.distributed.tensor import Shard as DTensorShard
 from torch.distributed.tensor import distribute_tensor
 
 from xtuner.v1.model.base import BaseModel, XTunerBaseModelConfig
+from xtuner.v1.utils import cpu_merge as cpu_merge_module
 from xtuner.v1.utils import load_spec as load_spec_module
 from xtuner.v1.utils.interleaved_shard import InterleavedShard, RuntimeLayout
 from xtuner.v1.utils.load_spec import LoadSpec, ShardDescriptor, unshard_tensors_for_hf_save
@@ -694,6 +695,448 @@ class TestHFSaveUnshard:
         torch.testing.assert_close(output, torch.tensor([4, 5, 6, 7, 12, 13]))
         assert plan.runtime_output_shape == (8,)
         assert plan.output_shape == (6,)
+
+
+class TestCpuMergeUnshard:
+    """Gated CPU-merge path (``XTUNER_UNSHARD_CPU_MERGE=1``) in ``xtuner.v1.utils.cpu_merge``.
+
+    Every final unshard step merges its gathered chunks on host memory — no size
+    threshold, no routing; intermediate steps keep the upstream device merge.
+    """
+
+    @staticmethod
+    def _patch_foreach_all_gather(
+        monkeypatch: pytest.MonkeyPatch,
+        responses: list[list[list[torch.Tensor]]] | None = None,
+    ) -> list[dict[str, object]]:
+        upstream_calls: list[dict[str, object]] = []
+
+        def fake_foreach_all_gather(
+            tensor_list: list[torch.Tensor],
+            group: dist.ProcessGroup,
+        ) -> list[list[torch.Tensor]]:
+            upstream_calls.append(
+                {
+                    "group": group,
+                    "shapes": [tuple(tensor.shape) for tensor in tensor_list],
+                    "dtypes": [tensor.dtype for tensor in tensor_list],
+                }
+            )
+            if responses is not None:
+                return responses.pop(0)
+            return [[tensor] for tensor in tensor_list]
+
+        monkeypatch.setattr(load_spec_module, "foreach_all_gather", fake_foreach_all_gather)
+        return upstream_calls
+
+    @staticmethod
+    def _spy_cpu_merge_entry(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+        entered: list[int] = []
+        real_entry = cpu_merge_module.unshard_tensors_for_hf_save_with_cpu_merge
+
+        def spy_entry(
+            tensors: list[torch.Tensor],
+            save_plans: list[cpu_merge_module.HFSavePlan],
+        ) -> list[torch.Tensor]:
+            entered.append(len(tensors))
+            return real_entry(tensors, save_plans)
+
+        monkeypatch.setattr(cpu_merge_module, "unshard_tensors_for_hf_save_with_cpu_merge", spy_entry)
+        return entered
+
+    def test_gate_off_keeps_upstream_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        single_rank_group: dist.ProcessGroup,
+    ) -> None:
+        monkeypatch.delenv(cpu_merge_module.CPU_MERGE_ENV, raising=False)
+        upstream_calls = self._patch_foreach_all_gather(monkeypatch)
+        spec = LoadSpec(
+            name="gate",
+            global_hf_keys=["gate"],
+            global_shape=(4, 2),
+            shards=[ShardDescriptor(dim=0, group=single_rank_group)],
+        )
+
+        output = unshard_tensors_for_hf_save([torch.ones(4, 2)], [spec.plan_hf_save()])
+
+        assert [tuple(tensor.shape) for tensor in output] == [(4, 2)]
+        assert len(upstream_calls) == 1
+
+    def test_gate_on_merges_final_step_on_host(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        single_rank_group: dist.ProcessGroup,
+    ) -> None:
+        monkeypatch.setenv(cpu_merge_module.CPU_MERGE_ENV, "1")
+        upstream_calls = self._patch_foreach_all_gather(monkeypatch)
+        entered = self._spy_cpu_merge_entry(monkeypatch)
+        spec = LoadSpec(
+            name="gate",
+            global_hf_keys=["gate"],
+            global_shape=(4, 2),
+            shards=[ShardDescriptor(dim=0, group=single_rank_group)],
+        )
+
+        output = unshard_tensors_for_hf_save([torch.ones(4, 2)], [spec.plan_hf_save()])
+
+        assert [tuple(tensor.shape) for tensor in output] == [(4, 2)]
+        torch.testing.assert_close(output[0], torch.ones(4, 2))
+        assert entered == [1]  # gate delegated into the cpu-merge orchestrator
+        assert len(upstream_calls) == 1  # the upstream batched gather schedule is kept
+
+    def test_gate_on_splits_different_dtypes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        single_rank_group: dist.ProcessGroup,
+    ) -> None:
+        monkeypatch.setenv(cpu_merge_module.CPU_MERGE_ENV, "1")
+        upstream_calls = self._patch_foreach_all_gather(monkeypatch)
+        specs = [
+            LoadSpec(
+                name=name,
+                global_hf_keys=[name],
+                global_shape=(4, 2),
+                shards=[ShardDescriptor(dim=0, group=single_rank_group)],
+            )
+            for name in ("gate", "up")
+        ]
+
+        output = unshard_tensors_for_hf_save(
+            [torch.ones(4, 2, dtype=torch.float32), torch.ones(4, 2, dtype=torch.float64)],
+            [spec.plan_hf_save() for spec in specs],
+        )
+
+        assert [tuple(tensor.shape) for tensor in output] == [(4, 2), (4, 2)]
+        assert [call["dtypes"] for call in upstream_calls] == [[torch.float32], [torch.float64]]
+
+    def test_host_merge_restores_padded_runtime_shape(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        single_rank_group: dist.ProcessGroup,
+        set_shard_rank: Callable[[int, int], None],
+    ) -> None:
+        set_shard_rank(3, 2)
+        monkeypatch.setenv(cpu_merge_module.CPU_MERGE_ENV, "1")
+        # Per-rank padded chunks of the (5,) tensor; rank 2's tail element is padding.
+        self._patch_foreach_all_gather(
+            monkeypatch,
+            responses=[[[torch.tensor([0, 1]), torch.tensor([2, 3]), torch.tensor([4, 0])]]],
+        )
+        spec = LoadSpec(
+            name="weight",
+            global_hf_keys=["weight"],
+            global_shape=(5,),
+            shards=[ShardDescriptor(dim=0, group=single_rank_group)],
+        )
+
+        [output] = unshard_tensors_for_hf_save([torch.tensor([4])], [spec.plan_hf_save()])
+
+        torch.testing.assert_close(output, torch.arange(5))
+
+    def test_gate_on_merges_final_steps_on_host_via_batched_rounds(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        single_rank_group: dist.ProcessGroup,
+    ) -> None:
+        monkeypatch.setenv(cpu_merge_module.CPU_MERGE_ENV, "1")
+        host_merge_flags: list[bool] = []
+        real_host_merge = cpu_merge_module._merge_gathered_save_shard_cpu_merge
+
+        def spy_host_merge(
+            gathered_chunks: list[torch.Tensor],
+            shard_step: cpu_merge_module.SaveShardStep,
+            merge_on_cpu: bool,
+            reusable_staging: bool,
+        ) -> torch.Tensor:
+            host_merge_flags.append(merge_on_cpu)
+            return real_host_merge(gathered_chunks, shard_step, merge_on_cpu, reusable_staging)
+
+        monkeypatch.setattr(cpu_merge_module, "_merge_gathered_save_shard_cpu_merge", spy_host_merge)
+        upstream_calls = self._patch_foreach_all_gather(monkeypatch)
+        specs = [
+            LoadSpec(
+                name="experts",
+                global_hf_keys=["k0", "k1"],
+                global_shape=(8, 2),
+                fused_dim=0,
+                shards=[
+                    ShardDescriptor(dim=0, group=single_rank_group),
+                    ShardDescriptor(dim=0, group=single_rank_group),
+                ],
+            ),
+            LoadSpec(
+                name="gate",
+                global_hf_keys=["gate"],
+                global_shape=(4, 2),
+                shards=[ShardDescriptor(dim=0, group=single_rank_group)],
+            ),
+        ]
+
+        output = unshard_tensors_for_hf_save(
+            [torch.ones(8, 2), torch.ones(4, 2)],
+            [spec.plan_hf_save() for spec in specs],
+        )
+
+        assert [tuple(tensor.shape) for tensor in output] == [(8, 2), (4, 2)]
+        # Round 1 gathers the experts' intermediate step (device merge) and the gate's final
+        # step (host merge); round 2 gathers the experts' final step (host merge) — one
+        # batched foreach per round, the upstream schedule.
+        assert host_merge_flags == [False, True, True]
+        assert len(upstream_calls) == 2
+
+    def test_gate_on_output_matches_upstream_preserved_ep(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        local_groups: tuple[dist.ProcessGroup, dist.ProcessGroup, dist.ProcessGroup],
+    ) -> None:
+        ep_group, etp_group, _ = local_groups
+        set_group_layout(
+            monkeypatch,
+            {
+                ep_group: (2, 1, [0, 1]),
+                etp_group: (2, 0, [0, 2]),
+            },
+        )
+        upstream_calls = self._patch_foreach_all_gather(
+            monkeypatch,
+            responses=[
+                [[torch.tensor([4, 6]), torch.tensor([5, 7])]],
+                [[torch.tensor([4, 6]), torch.tensor([5, 7])]],
+            ],
+        )
+        spec = LoadSpec(
+            name="experts",
+            global_hf_keys=["k0", "k1", "k2", "k3"],
+            global_shape=(8,),
+            fused_dim=0,
+            shards=[
+                ShardDescriptor(dim=0, group=ep_group),
+                ShardDescriptor(dim=0, group=etp_group, interleave_factor=2),
+            ],
+        )
+        local = torch.tensor([4, 6])
+
+        monkeypatch.delenv(cpu_merge_module.CPU_MERGE_ENV, raising=False)
+        expected = unshard_tensors_for_hf_save([local], [spec.plan_hf_save(preserve_process_group=ep_group)])[0]
+
+        monkeypatch.setenv(cpu_merge_module.CPU_MERGE_ENV, "1")
+        gated = unshard_tensors_for_hf_save([local], [spec.plan_hf_save(preserve_process_group=ep_group)])[0]
+
+        torch.testing.assert_close(gated, expected)
+        torch.testing.assert_close(gated, torch.tensor([4, 5, 6, 7]))
+        # Both calls ride the batched foreach schedule; the gated one merges the final step
+        # on host chunks instead of the device merge.
+        assert len(upstream_calls) == 2
+
+
+class TestDumpStateDictFileSystem:
+    def test_reduces_host_tensors_under_file_system_strategy(self) -> None:
+        import io
+        from multiprocessing.reduction import ForkingPickler
+
+        pinned = torch.arange(8, dtype=torch.float32).pin_memory()
+        previous_strategy = torch.multiprocessing.get_sharing_strategy()
+
+        buf = io.BytesIO()
+        cpu_merge_module.dump_state_dict_file_system([("w", pinned)], buf)
+
+        buf.seek(0)
+        ((name, reduction),) = ForkingPickler.loads(buf.read())
+        assert name == "w"
+        func, args = reduction
+        rebuilt = func(*args)
+        assert rebuilt.device.type == "cpu"
+        torch.testing.assert_close(rebuilt, pinned.cpu())
+        # the process-global sharing strategy is restored after the dump
+        assert torch.multiprocessing.get_sharing_strategy() == previous_strategy
+
+
+class TestNewSharedCpuTensor:
+    def test_allocates_shared_segment_and_restores_strategy(self) -> None:
+        previous_strategy = torch.multiprocessing.get_sharing_strategy()
+
+        tensor = cpu_merge_module.new_shared_cpu_tensor((3, 4), torch.bfloat16)
+        tensor.copy_(torch.arange(12, dtype=torch.float32).view(3, 4).to(torch.bfloat16))
+
+        assert tensor.is_shared()
+        assert tensor.dtype == torch.bfloat16
+        torch.testing.assert_close(tensor, torch.arange(12, dtype=torch.float32).view(3, 4).to(torch.bfloat16))
+        # the process-global sharing strategy is restored after the allocation
+        assert torch.multiprocessing.get_sharing_strategy() == previous_strategy
+
+    def test_distinct_tensors_get_distinct_segments(self) -> None:
+        first = cpu_merge_module.new_shared_cpu_tensor((4,), torch.float32)
+        second = cpu_merge_module.new_shared_cpu_tensor((4,), torch.float32)
+        first.fill_(1.0)
+        second.fill_(2.0)
+        # separate segments: writing one must not leak into the other
+        torch.testing.assert_close(first, torch.full((4,), 1.0))
+        torch.testing.assert_close(second, torch.full((4,), 2.0))
+
+
+class _StubShardStep:
+    """Minimal SaveShardStep stand-in for direct shared-merge unit tests."""
+
+    def __init__(self, dim: int, interleave_factor: int, runtime_dim_size: int) -> None:
+        self.shard = type("Shard", (), {"dim": dim, "interleave_factor": interleave_factor})()
+        self.shape_before_shard = {dim: runtime_dim_size}
+
+
+def _stage_test_chunks(chunks: list[torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Write chunks into a shared pool staging buffer exactly like the sync path."""
+    total_bytes = sum(chunk.numel() * chunk.element_size() for chunk in chunks)
+    staging = cpu_merge_module.shared_pool_alloc(total_bytes)
+    views = []
+    offset = 0
+    for chunk in chunks:
+        nbytes = chunk.numel() * chunk.element_size()
+        view = staging[offset : offset + nbytes].view(chunk.dtype).view(tuple(chunk.shape))
+        view.copy_(chunk)
+        views.append(view)
+        offset += nbytes
+    return staging, views
+
+
+class TestSharedPool:
+    def test_alloc_slices_are_shared_and_disjoint(self) -> None:
+        cpu_merge_module.reset_shared_pool()
+        first = cpu_merge_module.shared_pool_alloc(8).view(torch.float32)
+        second = cpu_merge_module.shared_pool_alloc(8).view(torch.float32)
+        first.fill_(1.0)
+        second.fill_(2.0)
+        assert first.is_shared() and second.is_shared()
+        torch.testing.assert_close(first, torch.full((2,), 1.0))
+        torch.testing.assert_close(second, torch.full((2,), 2.0))
+
+    def test_reset_reuses_segments_from_byte_zero(self) -> None:
+        cpu_merge_module.reset_shared_pool()
+        first = cpu_merge_module.shared_pool_alloc(16)
+        cpu_merge_module.reset_shared_pool()
+        second = cpu_merge_module.shared_pool_alloc(16)
+        assert second.data_ptr() == first.data_ptr()
+
+    def test_alloc_advances_cursor_in_dtype_aligned_steps(self) -> None:
+        cpu_merge_module.reset_shared_pool()
+
+        # an odd-size payload must not leave the cursor misaligned for later view(dtype)
+        first = cpu_merge_module.shared_pool_alloc(3)
+        second = cpu_merge_module.shared_pool_alloc(8).view(torch.float32)
+
+        assert first.numel() == 3
+        assert second.shape == (2,)
+        assert second.data_ptr() % 4 == 0
+
+
+class TestSharedMerge:
+    def test_dim0_contiguous_chunks_merge_as_zero_copy_view(self) -> None:
+        cpu_merge_module.reset_shared_pool()
+        chunks = [torch.arange(4, dtype=torch.float32) + 10 * rank for rank in range(2)]
+        staging, views = _stage_test_chunks(chunks)
+        step = _StubShardStep(dim=0, interleave_factor=1, runtime_dim_size=7)
+
+        merged = cpu_merge_module._merge_gathered_save_shard_shared(staging, views, step, staged_shared=True)
+
+        # runtime trim (7 of 8 rows) is a prefix view of the shared staging buffer
+        assert merged.is_shared()
+        assert merged.shape == (7,)
+        torch.testing.assert_close(merged, torch.cat(chunks)[:7])
+
+    def test_interleave_merge_matches_upstream_math_in_shared_output(self) -> None:
+        cpu_merge_module.reset_shared_pool()
+        chunks = [torch.arange(4, dtype=torch.float32) + 10 * rank for rank in range(2)]
+        staging, views = _stage_test_chunks(chunks)
+        step = _StubShardStep(dim=0, interleave_factor=2, runtime_dim_size=8)
+
+        merged = cpu_merge_module._merge_gathered_save_shard_shared(staging, views, step, staged_shared=True)
+
+        expected = torch.cat([chunks[0][:2], chunks[1][:2], chunks[0][2:4], chunks[1][2:4]])
+        assert merged.is_shared()
+        torch.testing.assert_close(merged, expected)
+
+    def test_dim1_merge_cats_into_shared_output_and_narrows(self) -> None:
+        cpu_merge_module.reset_shared_pool()
+        chunks = [torch.full((2, 3), float(rank + 1)) for rank in range(2)]
+        staging, views = _stage_test_chunks(chunks)
+        step = _StubShardStep(dim=1, interleave_factor=1, runtime_dim_size=5)
+
+        merged = cpu_merge_module._merge_gathered_save_shard_shared(staging, views, step, staged_shared=True)
+
+        assert merged.is_shared()
+        assert merged.shape == (2, 5)
+        torch.testing.assert_close(merged, torch.cat(chunks, dim=1)[:, :5])
+
+
+class TestStageCpuStateDictToShared:
+    def test_stages_cpu_tensors_into_shared_cache(self) -> None:
+        payload = torch.arange(6, dtype=torch.bfloat16)
+
+        staged = cpu_merge_module.stage_cpu_state_dict_to_shared({"w": payload})
+
+        assert staged["w"].is_shared()
+        torch.testing.assert_close(staged["w"], payload)
+
+    def test_repeated_staging_lands_in_the_reused_pool(self) -> None:
+        cpu_merge_module.reset_shared_pool()
+
+        first = cpu_merge_module.stage_cpu_state_dict_to_shared({"w": torch.zeros(4)})["w"]
+        cpu_merge_module.reset_shared_pool()
+        second = cpu_merge_module.stage_cpu_state_dict_to_shared({"w": torch.ones(4)})["w"]
+
+        # pool segments persist: after a reset the same region serves the next batch
+        assert first.data_ptr() == second.data_ptr()
+        assert second.is_shared()
+        torch.testing.assert_close(second, torch.ones(4))
+
+    def test_same_shape_different_names_get_distinct_segments(self) -> None:
+        staged = cpu_merge_module.stage_cpu_state_dict_to_shared({"a": torch.zeros(4), "b": torch.zeros(4)})
+
+        assert staged["a"].data_ptr() != staged["b"].data_ptr()
+        torch.testing.assert_close(staged["a"], torch.zeros(4))
+        torch.testing.assert_close(staged["b"], torch.zeros(4))
+
+    def test_shared_payloads_pass_through_without_copy(self) -> None:
+        shared = cpu_merge_module.new_shared_cpu_tensor((4,), torch.float32)
+        shared.fill_(7.0)
+
+        staged = cpu_merge_module.stage_cpu_state_dict_to_shared({"w": shared})
+
+        # already-shared payload (cpu_merge shared staging) must keep its identity
+        assert staged["w"] is shared
+
+
+class TestGetHfParamReusableStaging:
+    def _buffer_model(self) -> BaseModel:
+        class BufferModel(BaseModel):
+            def __init__(self) -> None:
+                super().__init__(XTunerBaseModelConfig())
+                self.register_buffer("rotary_coef", torch.tensor([1.25], dtype=torch.float32), persistent=True)
+                self._init_load_spec()
+
+            def to_hf_key_list(self, key: str) -> list[str]:
+                return [key]
+
+        return BufferModel()
+
+    def test_save_path_keeps_fresh_staging_and_sync_flow_reuses_pool(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import xtuner.v1.model.base as base_module
+
+        received: list[bool] = []
+
+        def fake_unshard(tensors, save_plans, reusable_staging=False):
+            received.append(reusable_staging)
+            return list(tensors)
+
+        monkeypatch.setattr(base_module, "unshard_tensors_for_hf_save_with_cpu_merge", fake_unshard)
+        monkeypatch.setenv("XTUNER_UNSHARD_CPU_MERGE", "1")
+        model = self._buffer_model()
+
+        list(model._get_hf_param(model._load_spec_params(), dtype=torch.bfloat16, distributed_save=True))
+        assert received == [False]
+
+        received.clear()
+        list(model._get_hf_param(model._load_spec_params(), dtype=torch.bfloat16, reusable_staging=True))
+        assert received == [True]
 
 
 class TestBaseModelHFSave:

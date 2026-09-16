@@ -97,12 +97,14 @@ class WeightIterator:
             bucket_size=bucket_size,
             preserved_fused_shard_group=preserved_fused_shard_group,
             target_fused_key_partition=target_fused_key_partition,
+            reusable_staging=True,
         )
         other_gen = model._get_hf_param(
             other_params,
             dtype=dtype,
             device=DEVICE,
             bucket_size=bucket_size,
+            reusable_staging=True,
         )
         for name_list, param_list in chain(fused_gen, other_gen):
             # FlattenedTensorBucket stores one dtype per payload. Qwen3.5 keeps
