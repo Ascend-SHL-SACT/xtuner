@@ -338,7 +338,8 @@ class TrainingWorker(SingleAcceleratorWorker):
 
     @ray_method
     def weight_update(self, **kwargs):
-        return self.update_weighter.weight_update(**kwargs)
+        with self._maybe_profiling(self._global_train_step, "weight_update"):
+            return self.update_weighter.weight_update(**kwargs)
 
     @ray_method
     def has_registered_weight_checkpoint(self) -> bool:
