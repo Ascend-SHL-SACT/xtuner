@@ -369,6 +369,11 @@ def unshard_tensors_for_hf_save(
     Returns:
         list[torch.Tensor]: Tensors after all pending save unshard steps have been executed.
     """
+    from xtuner.v1.utils.cpu_merge import cpu_merge_enabled, unshard_tensors_for_hf_save_with_cpu_merge
+
+    if cpu_merge_enabled():
+        return unshard_tensors_for_hf_save_with_cpu_merge(tensors, save_plans)
+
     assert len(tensors) == len(save_plans), "Internal error: save tensor and plan count mismatch"
     if not tensors:
         return []

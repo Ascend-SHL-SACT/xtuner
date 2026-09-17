@@ -48,6 +48,7 @@ from xtuner.v1.module.attention import GatedDeltaNetConfig, MHAConfig, MLAConfig
 from xtuner.v1.module.rope import RopeParametersConfig, RopeScalingConfig
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module, log_rank0, profile_time_and_memory
 from xtuner.v1.utils.compile import MaybeCompile, is_compiled_function, maybe_compile
+from xtuner.v1.utils.cpu_merge import cpu_merge_enabled, unshard_tensors_for_hf_save_with_cpu_merge
 from xtuner.v1.utils.load_spec import (
     HFSavePlan,
     LoadSpec,
@@ -1325,6 +1326,7 @@ class BaseModel(nn.Module):
         distributed_save: bool = False,
         preserved_fused_shard_group: dist.ProcessGroup | None = None,
         target_fused_key_partition: tuple[int, int] | None = None,
+        reusable_staging: bool = False,
     ) -> Generator[tuple[list[str], list[torch.Tensor]], None, None]:
         """Yield HF checkpoint tensors for the given runtime params.
 
@@ -1340,6 +1342,10 @@ class BaseModel(nn.Module):
                 stay local instead of being all-gathered. RL weight sync uses this to stream EP-local expert slices.
             target_fused_key_partition (tuple[int, int] | None): Rollout expert-parallel ``(rank, size)`` used to
                 select fused HF keys after gathering the training layout.
+            reusable_staging (bool): Whether buckets may keep final-step payloads in the cpu_merge shared pool.
+                Only the RL weight-iteration flow may pass ``True``: it finishes reading a bucket before the next
+                one is built. The checkpoint save path must keep ``False`` — its async safetensors writes may still
+                be reading earlier buckets while the next one is built.
 
         Returns:
             Generator[tuple[list[str], list[torch.Tensor]], None, None]: HF key names and tensors to save.
@@ -1375,6 +1381,7 @@ class BaseModel(nn.Module):
                     bucket,
                     dtype=dtype,
                     device=device,
+                    reusable_staging=reusable_staging,
                 )
                 bucket_reconstruction_bytes = 0
                 bucket = []
@@ -1387,6 +1394,7 @@ class BaseModel(nn.Module):
                 bucket,
                 dtype=dtype,
                 device=device,
+                reusable_staging=reusable_staging,
             )
 
     def _make_hf_save_item(
@@ -1443,15 +1451,28 @@ class BaseModel(nn.Module):
         bucket: list[_HFSaveBucketItem],
         dtype: torch.dtype,
         device: torch.device | str,
+        reusable_staging: bool = False,
     ) -> tuple[list[str], list[torch.Tensor]]:
         name_list: list[str] = []
         tensor_list: list[torch.Tensor] = []
         runtime_is_float8_list: list[bool] = []
 
-        full_tensor_list = unshard_tensors_for_hf_save(
-            [item.tensor for item in bucket],
-            [item.save_plan for item in bucket],
-        )
+        if cpu_merge_enabled():
+            # Only the RL weight-iteration flow passes reusable_staging=True: it finishes
+            # reading each bucket before the next one is built, and its IPC transport
+            # barriers after the rollout engine consumed the bucket, so the shared pool
+            # may be reset per bucket. The checkpoint save path keeps False — its async
+            # safetensors writes may still be reading earlier buckets.
+            full_tensor_list = unshard_tensors_for_hf_save_with_cpu_merge(
+                [item.tensor for item in bucket],
+                [item.save_plan for item in bucket],
+                reusable_staging=reusable_staging,
+            )
+        else:
+            full_tensor_list = unshard_tensors_for_hf_save(
+                [item.tensor for item in bucket],
+                [item.save_plan for item in bucket],
+            )
         for full_tensor, save_item in zip(full_tensor_list, bucket, strict=True):
             hf_names, hf_tensors = self._split_hf_tensors_for_save(full_tensor, save_item.save_plan)
             name_list.extend(hf_names)
@@ -1461,7 +1482,16 @@ class BaseModel(nn.Module):
         if dtype == torch.float8_e4m3fn:
             tensor_list, name_list = self._to_float8(tensor_list, name_list, runtime_is_float8_list, dtype)
 
-        tensor_list = [tensor.to(device=device) for tensor in tensor_list]
+        if cpu_merge_enabled():
+            # Host-merged save tensors stay in host memory: the vLLM IPC receiver rebuilds
+            # them from the sender's shm segment and copies into the device parameters, so
+            # a blanket device copy-back here would re-materialize the full bucket on a
+            # device that has no headroom for it.
+            tensor_list = [
+                tensor if tensor.device.type == "cpu" else tensor.to(device=device) for tensor in tensor_list
+            ]
+        else:
+            tensor_list = [tensor.to(device=device) for tensor in tensor_list]
         return name_list, tensor_list
 
     def _split_hf_tensors_for_save(
@@ -1505,15 +1535,21 @@ class BaseModel(nn.Module):
                 f"{len(save_plan.hf_keys)} HF keys for {save_plan.name}"
             )
             key_size = int(key_size)
-            # Keep the legacy save behavior here: fp8 per-block quant kernels have had correctness issues with
-            # non-zero-storage-offset views, so materialize the save-rank slice before splitting HF keys.
-            index = torch.arange(
-                key_start * key_size,
-                key_end * key_size,
-                dtype=torch.int64,
-                device=full_tensor.device,
-            )
-            tensor_to_split = torch.index_select(full_tensor, dim=dim, index=index)
+            if cpu_merge_enabled() and key_start == 0 and key_end == len(save_plan.hf_keys):
+                # Full-range selection is an identity copy; under the CPU-merge gate the
+                # fused tensor may already live in shared memory, so keep the split as
+                # zero-copy views instead of materializing a fresh pageable copy.
+                tensor_to_split = full_tensor
+            else:
+                # Keep the legacy save behavior here: fp8 per-block quant kernels have had correctness issues with
+                # non-zero-storage-offset views, so materialize the save-rank slice before splitting HF keys.
+                index = torch.arange(
+                    key_start * key_size,
+                    key_end * key_size,
+                    dtype=torch.int64,
+                    device=full_tensor.device,
+                )
+                tensor_to_split = torch.index_select(full_tensor, dim=dim, index=index)
 
         if not hf_names:
             return [], []
