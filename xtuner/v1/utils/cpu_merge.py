@@ -409,6 +409,20 @@ def _foreach_all_gather_save_shards_cpu_merge(
     assert all(_is_same_process_group(group, shard_step.shard.group) for shard_step in shard_steps), (
         "Internal error: save all-gather group contains different process groups"
     )
+    if os.environ.get("XTUNER_GLM52_CHUNKED_SAVE_AG") == "1" and not reusable_staging:
+        # Oversized checkpoint-save groups (the ~12 GiB single-tensor expert bucket) gather
+        # via a sliced all_gather_into_tensor loop with page-able staging: the bucket-sized
+        # device and page-locked transients drop to one shard (run109/run111 node resets
+        # happened exactly at this bucket during the final HF save). Weight-update groups
+        # (reusable_staging=True) must keep the shared-pool staging: their payloads reach
+        # the rollout engine through zero-copy IPC off that pool, and a page-able payload
+        # would add a full extra copy per bucket (run112: sync_weight 56s -> 78s). Lazy
+        # import: the chunked module imports this file's helpers.
+        from xtuner.v1.rl.weight_update.chunked_save_unshard import try_chunked_save_unshard
+
+        chunked = try_chunked_save_unshard(tensor_list, shard_steps, merge_on_cpu_flags)
+        if chunked is not None:
+            return chunked
     padded_tensor_list = [
         _pad_tensor_for_save_shard(tensor, shard_step)
         for tensor, shard_step in zip(tensor_list, shard_steps, strict=True)
