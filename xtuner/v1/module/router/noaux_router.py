@@ -6,6 +6,7 @@ import torch.nn as nn
 from cyclopts import Parameter
 from pydantic import BaseModel, ConfigDict
 
+from xtuner.v1.utils.dead_chain import dead_chain_strip_enabled, empty_router_tensor
 from xtuner.v1.utils.device import get_device
 
 from .protocol import RouterProtocol, RouterResults
@@ -126,20 +127,25 @@ class NoAuxRouter(nn.Module, RouterProtocol):
 
         # The returned `router_weights` is only used for computing balance loss
         # It should be normalized
-        scores_for_choice = scores_for_choice / torch.sum(scores_for_choice, dim=-1, keepdim=True)
+        if not dead_chain_strip_enabled():
+            scores_for_choice = scores_for_choice / torch.sum(scores_for_choice, dim=-1, keepdim=True)
 
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
         topk_weight = topk_weight * self.router_scaling_factor  # must multiply the scaling factor
 
-        # TODO: (yehaochen) `Dispatcher` calculate the distribution duplicatedly
-        tokens_per_expert = torch.histc(
-            topk_ids.float(),
-            bins=self.n_routed_experts,
-            min=0,
-            max=self.n_routed_experts,
-        )  # .view(self.ep_mesh.size(), -1)
+        if dead_chain_strip_enabled():
+            # `topkens_per_expert` has no consumers; skip the router-side histc.
+            tokens_per_expert = empty_router_tensor(topk_ids.device)
+        else:
+            # TODO: (yehaochen) `Dispatcher` calculate the distribution duplicatedly
+            tokens_per_expert = torch.histc(
+                topk_ids.float(),
+                bins=self.n_routed_experts,
+                min=0,
+                max=self.n_routed_experts,
+            )  # .view(self.ep_mesh.size(), -1)
 
         return {
             "logits": logits,
@@ -218,19 +224,24 @@ class NoAuxGroupedRouter(NoAuxRouter):
 
         # The returned `router_weights` is only used for computing balance loss
         # It should be normalized
-        scores_for_choice = scores_for_choice / torch.sum(scores_for_choice, dim=-1, keepdim=True)
+        if not dead_chain_strip_enabled():
+            scores_for_choice = scores_for_choice / torch.sum(scores_for_choice, dim=-1, keepdim=True)
 
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
         topk_weight = topk_weight * self.router_scaling_factor  # must multiply the scaling factor
 
-        tokens_per_expert = torch.histc(
-            topk_ids.float(),
-            bins=self.n_routed_experts,
-            min=0,
-            max=self.n_routed_experts,
-        )  # .view(self.ep_mesh.size(), -1)
+        if dead_chain_strip_enabled():
+            # `topkens_per_expert` has no consumers; skip the router-side histc.
+            tokens_per_expert = empty_router_tensor(topk_ids.device)
+        else:
+            tokens_per_expert = torch.histc(
+                topk_ids.float(),
+                bins=self.n_routed_experts,
+                min=0,
+                max=self.n_routed_experts,
+            )  # .view(self.ep_mesh.size(), -1)
 
         return {
             "logits": logits,
