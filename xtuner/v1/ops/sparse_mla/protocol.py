@@ -6,9 +6,12 @@ import torch
 from xtuner.v1.data_proto import SequenceContext
 
 
-SparseMLABackend = Literal["torch", "tilelang", "cudnn_dsa", "torch_npu"]
+SparseMLABackend = Literal["torch", "tilelang", "cudnn_dsa", "flash_mla", "torch_npu"]
 # ``deep_gemm_fp8`` names the runtime dependency and its FP8 MQA score path.
-DSAIndexerBackend = Literal["torch", "tilelang", "cudnn_dsa", "torch_npu", "deep_gemm_fp8"]
+# ``tilelang_deepselect`` keeps TileLang scoring and replaces ``torch.topk`` with DeepSelect.
+DSAIndexerBackend = Literal[
+    "torch", "tilelang", "cudnn_dsa", "flash_mla", "torch_npu", "deep_gemm_fp8", "cute_dsl", "tilelang_deepselect"
+]
 
 
 class SparseMLAOutputs(NamedTuple):
@@ -61,4 +64,5 @@ class DSATopKIndicesProtocol(Protocol):
         *,
         index_head_dim: int,
         index_topk: int,
+        query_chunk_size: int | None = None,
     ) -> torch.Tensor: ...
