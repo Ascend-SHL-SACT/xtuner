@@ -194,8 +194,9 @@ class DSAMLAConfig(MLAConfig):
     # The SparseMLA forward and the indexer are independent choices with different backend
     # vocabularies (``flash_mla_cudnn`` is SparseMLA-only), so neither defaults to the other.
     sparse_mla_backend: SparseMLABackend = "tilelang"
-    # ``deep_gemm_fp8`` selects the DeepGEMM FP8 MQA score path.
-    indexer_backend: DSAIndexerBackend = "tilelang"
+    # ``deep_gemm_fp8`` selects the DeepGEMM FP8 MQA score path. ``None`` follows
+    # ``sparse_mla_backend``.
+    indexer_backend: DSAIndexerBackend | None = None
     freeze_dsa_indexer: bool = True
     indexer_topk_query_chunk_size: int | None = None
 
@@ -210,7 +211,7 @@ class DSAMLAConfig(MLAConfig):
     ) -> "DSAMultiLatentAttention":
         if not self.freeze_dsa_indexer:
             raise ValueError("freeze_dsa_indexer=False is not supported until the indexer has a differentiable output")
-        indexer_backend = self.indexer_backend
+        indexer_backend = cast(DSAIndexerBackend, self.indexer_backend or self.sparse_mla_backend)
         _validate_indexer_backend_config(
             indexer_backend,
             index_head_dim=self.index_head_dim,
@@ -259,7 +260,7 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         indexer_rope_interleave: bool = True,
         indexer_types: list[str] | None = None,
         sparse_mla_backend: SparseMLABackend = "torch",
-        indexer_backend: DSAIndexerBackend = "tilelang",
+        indexer_backend: DSAIndexerBackend | None = None,
         freeze_dsa_indexer: bool = True,
         indexer_topk_query_chunk_size: int | None = None,
         **kwargs,
@@ -288,7 +289,7 @@ class DSAMultiLatentAttention(MultiLatentAttention):
         self.indexer_rope_interleave = indexer_rope_interleave
         self.indexer_types = indexer_types
         self.sparse_mla_backend = sparse_mla_backend
-        self.indexer_backend = indexer_backend
+        self.indexer_backend = cast(DSAIndexerBackend, indexer_backend or sparse_mla_backend)
         self.freeze_dsa_indexer = freeze_dsa_indexer
         _validate_query_chunk_size(
             indexer_topk_query_chunk_size,
