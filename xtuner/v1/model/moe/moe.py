@@ -293,6 +293,11 @@ class MoE(BaseModel):
         self._configure_model_specific_layers()
         # Per-dispatch grouped-GEMM row counts of the current train step; None outside one.
         self._ep_recv_tokens: list[int] | None = None
+        # Pinned staging buffer + last issued device tensor for the EP-load all_gather input, so the
+        # per-step H2D can be issued non-blocking from pinned memory instead of a synchronous
+        # torch.tensor(list, device=...) that stalls the host on the tail of backward.
+        self._ep_load_pinned: torch.Tensor | None = None
+        self._ep_load_local: torch.Tensor | None = None
 
         self.fp32_layers = [self.rotary_emb]
 
@@ -601,7 +606,9 @@ class MoE(BaseModel):
     def post_micro_batch_forward(self, batch_outputs: Sequence[MoEModelOutputs]) -> MoEBatchForwardInfo:
         base_info = super().post_micro_batch_forward(batch_outputs)
         logs_info = base_info["logs_info"]
-        logs_info.update(self._ep_load_info())
+        # With XTUNER_LOSS_DEFER_ITEM=1 the EP-load scalars are deliberately kept as on-device tensors here;
+        # the trainer's consolidated step-end pass converts them like the other deferred metrics.
+        logs_info.update(self._ep_load_info())  # type: ignore[arg-type]
 
         first_tokens_per_expert = batch_outputs[0]["tokens_per_expert_global"]
         tokens_per_expert_global = torch.zeros_like(first_tokens_per_expert)
@@ -635,7 +642,7 @@ class MoE(BaseModel):
             if isinstance(module, MoEDecoderLayer):
                 module.recv_tokens_hook = hook
 
-    def _ep_load_info(self) -> dict[str, float]:
+    def _ep_load_info(self) -> dict[str, float | torch.Tensor]:
         # EP load imbalance, measured on what each rank actually computes: the grouped-GEMM rows (routed token
         # copies, padding included) that land on its local experts after every dispatch. The balanced share of a
         # dispatch is the mean over the rank's EP group, which equals n_tokens * topk for fixed-length packs.
@@ -656,22 +663,42 @@ class MoE(BaseModel):
         # an EP group, and the per-forward WORLD all-reduce of aux-loss expert counts forces equal micro-batch
         # counts across groups. Column 0 identifies the EP group by its lowest global rank.
         ep_group_id = min(dist.get_process_group_ranks(self.ep_mesh.get_group()))
-        local = torch.tensor([ep_group_id, *recv_tokens], dtype=torch.int64, device=DEVICE)
+        # Stage [ep_group_id, *recv_tokens] through a pinned buffer and issue the H2D with
+        # non_blocking=True: torch.tensor(list, device=DEVICE) performs a synchronous pageable H2D that
+        # blocks the host until the device catches up with the tail of backward. The pinned copy is a
+        # host-side memcpy, and the device read of the buffer happens inside this step's all_gather, long
+        # before the next step overwrites the staging buffer. The device input tensor is kept alive on
+        # self until the next issue, since the HCCL task reads it from the communication stream.
+        n = 1 + len(recv_tokens)
+        pin = self._ep_load_pinned
+        if pin is None or pin.numel() < n:
+            pin = torch.empty(n, dtype=torch.int64).pin_memory()
+            self._ep_load_pinned = pin
+        pin[0] = ep_group_id
+        pin[1:n] = torch.tensor(recv_tokens, dtype=torch.int64)
+        local = pin[:n].to(DEVICE, non_blocking=True)
+        self._ep_load_local = local
         gathered = local.new_empty(dist.get_world_size(), local.numel())
         dist.all_gather_into_tensor(gathered, local)
-        gathered = gathered.cpu()
 
-        _, group_idx = gathered[:, 0].unique(return_inverse=True)  # [world]
-        recv = gathered[:, 1:].double()  # [world, n_dispatch]
-        n_groups = int(group_idx.max()) + 1
-        group_sum = recv.new_zeros(n_groups, recv.shape[1]).index_add_(0, group_idx, recv)
-        group_max = recv.new_zeros(n_groups, recv.shape[1]).index_reduce_(0, group_idx, recv, "amax")
-        fair_share = group_sum / ep_size  # [n_groups, n_dispatch]
-
-        load_ratio = recv.sum(dim=1) / fair_share.sum(dim=1)[group_idx]
-        peak_ratio = (recv / fair_share[group_idx]).amax(dim=1)
-        straggler_ratio = group_max.sum(dim=1) / fair_share.sum(dim=1)
+        # The whole reduction stays on-device (see _ep_load_reduce): no .cpu() right after the all_gather —
+        # which used to block the host on the cross-rank barrier — and the final scalars are read at
+        # step-end logging (trainer), like the other deferred metrics.
+        load_ratio, peak_ratio, straggler_ratio = _ep_load_reduce(gathered, ep_size)
         rank = dist.get_rank()
+
+        if os.environ.get("XTUNER_LOSS_DEFER_ITEM", "0") == "1":
+            # Keep the scalars on-device; the trainer's consolidated step-end pass converts them, merging the
+            # D2H reads into its existing sync point instead of blocking the host right after the all_gather.
+            return {
+                "ep_load_ratio": load_ratio[rank],
+                "ep_load_ratio_max": load_ratio.max(),
+                "ep_load_ratio_max_rank": load_ratio.argmax().float(),
+                "ep_load_peak_ratio": peak_ratio[rank],
+                "ep_load_peak_ratio_max": peak_ratio.max(),
+                "ep_load_peak_ratio_max_rank": peak_ratio.argmax().float(),
+                "ep_straggler_ratio": straggler_ratio.max(),
+            }
         return {
             "ep_load_ratio": load_ratio[rank].item(),
             "ep_load_ratio_max": load_ratio.max().item(),
@@ -1931,3 +1958,33 @@ class MoE(BaseModel):
     ) -> MoEModelOutputs: ...
 
     __call__ = nn.Module.__call__
+
+
+def _ep_load_reduce(gathered: torch.Tensor, ep_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reduce an EP-load all_gather matrix to per-rank/group imbalance ratios.
+
+    The reduction uses plain view/reduce ops only: DeviceMesh assigns EP groups as contiguous world-rank
+    blocks and the all_gather rows follow the world-rank order, so the gathered matrix reshapes to
+    ``[n_groups, ep_size, n_dispatch]`` directly and nothing here forces a host-device sync (no
+    ``unique`` with data-dependent shapes, no CPU-fallback ``index_reduce_``).
+
+    Args:
+        gathered (torch.Tensor): ``[world, 1 + n_dispatch]`` int64 matrix from the per-step all_gather;
+            column 0 holds each rank's EP-group id, the rest the per-dispatch routed-row counts.
+        ep_size (int): Number of ranks per EP group (>= 2; the metrics are only collected for EP > 1).
+
+    Returns:
+        Tuple of ``(load_ratio, peak_ratio, straggler_ratio)`` — the first two are ``[world]`` per-rank
+        ratios, the last is ``[n_groups]`` per-group. Each ranges from 1.0 (balanced) to ``ep_size``.
+    """
+    n_groups = gathered.shape[0] // ep_size
+    rows = gathered[:, 1:].double().view(n_groups, ep_size, gathered.shape[1] - 1)
+    group_sum = rows.sum(dim=1)  # [n_groups, n_dispatch]
+    group_max = rows.amax(dim=1)  # [n_groups, n_dispatch]
+    fair_share = group_sum / ep_size  # [n_groups, n_dispatch]
+    fair_rows = fair_share.unsqueeze(1)  # [n_groups, 1, n_dispatch]
+
+    load_ratio = (rows.sum(dim=2) / fair_rows.sum(dim=2)).reshape(-1)  # [world]
+    peak_ratio = (rows / fair_rows).amax(dim=2).reshape(-1)  # [world]
+    straggler_ratio = group_max.sum(dim=1) / fair_share.sum(dim=1)  # [n_groups]
+    return load_ratio, peak_ratio, straggler_ratio
