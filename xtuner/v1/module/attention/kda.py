@@ -99,10 +99,21 @@ _CHUNK_KERNEL_MIN_SEQ_LEN = 64
 _fla_kda_import_error: BaseException | None = None
 
 try:
-    from fla.modules import FusedRMSNormGated as _FLAFusedRMSNormGated
-    from fla.modules import ShortConvolution as _FLAShortConvolution
-    from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
-    from fla.ops.kda import fused_recurrent_kda as _fused_recurrent_kda
+    from xtuner.v1.ops.kda.npu_backend import npu_impl_selected
+
+    if npu_impl_selected():
+        # NPU backend: the fla wheel is absent on 910C; the validated kernels are the fla_npu
+        # Ascend C ops re-exposed under the fla surface (see npu_backend's docstring for the
+        # one contract deviation: the chunk kernel gates internally from raw inputs).
+        from xtuner.v1.ops.kda.npu_backend import FusedRMSNormGated as _FLAFusedRMSNormGated
+        from xtuner.v1.ops.kda.npu_backend import ShortConvolution as _FLAShortConvolution
+        from xtuner.v1.ops.kda.npu_backend import fused_recurrent_kda as _fused_recurrent_kda
+        from xtuner.v1.ops.kda.npu_backend import rms_norm_gated as _fla_rms_norm_gated
+    else:
+        from fla.modules import FusedRMSNormGated as _FLAFusedRMSNormGated  # type: ignore[no-redef]
+        from fla.modules import ShortConvolution as _FLAShortConvolution  # type: ignore[no-redef]
+        from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated  # type: ignore[no-redef]
+        from fla.ops.kda import fused_recurrent_kda as _fused_recurrent_kda  # type: ignore[no-redef]
 
     class FusedRMSNormGated(_FLAFusedRMSNormGated):
         """Overrides ``forward`` to unshard ``weight`` first.
