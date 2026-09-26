@@ -97,6 +97,15 @@ class DeterministicDDPTestCase(DistributedTestBase):
             raise AssertionError(
                 f"Failed to check relative error of loss, expected: {losses_ref}, got {losses}, Mean diff: {avg_relative_diff}")
 
+    def backend(self, device) -> str:
+        # Upstream maps every non-cuda/non-hpu device to gloo, which cannot
+        # serve NPU-tensor collectives. transfer_to_npu rewrites the "nccl"
+        # string to "hccl" inside init_process_group, and returning "nccl"
+        # (not "hccl") also keeps create_pg's set_device_index branch alive.
+        if device == "npu":
+            return "nccl"
+        return super().backend(device)
+
     def create_pg(self, device):
         ret = super().create_pg(device)
         os.environ["LOCAL_RANK"] = str(dist.get_rank() % torch.cuda.device_count())
