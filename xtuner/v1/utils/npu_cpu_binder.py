@@ -6,8 +6,6 @@ import subprocess
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
-import psutil
-
 
 CPU_MASK_BIT = 32
 MAIN_PROCESS_RANGE = 5
@@ -632,7 +630,7 @@ def run(rank_id: int, config: dict | None = None) -> None:
     loop_count = 0
     input_data = config if config is not None else DEFAULT_CPU_BIND_CONFIG
     cpu_allocer = CpuAlloc(DeviceInfo())
-    current_pid = psutil.Process().pid
+    current_pid = os.getpid()
     binder_list = load_custom_bind(input_data)
     for bind in binder_list:
         loop_count += 1
