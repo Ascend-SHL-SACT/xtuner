@@ -634,6 +634,10 @@ class SequenceContext:
         else:
             self.cu_seq_lens_q = self.cu_seq_lens_q.to(device)  # type: ignore
             self.cu_seq_lens_k = self.cu_seq_lens_k.to(device)  # type: ignore
+        # Refresh the host-side lists consumed by the KDA cu_host_list fast path so they can
+        # never desync from the device tensors (cheap: cu maps are small int tensors).
+        self.cu_seq_lens_q_list = self.cu_seq_lens_q.tolist()  # type: ignore[union-attr]
+        self.cu_seq_lens_k_list = self.cu_seq_lens_k.tolist()  # type: ignore[union-attr]
 
         if self.position_ids is not None and hasattr(self.position_ids, "to"):
             self.position_ids = self.position_ids.to(device)  # type: ignore
