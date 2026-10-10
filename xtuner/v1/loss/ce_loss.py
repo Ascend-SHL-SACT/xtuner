@@ -204,13 +204,17 @@ class LMHeadLossContext(BaseLossContext):
         shifted_labels = shifted_labels.flatten()
         loss_weight = loss_weight.flatten()
 
-        rank_grad_tokens = (shifted_labels != self.loss_cfg.ignore_idx).sum()
-        if rank_grad_tokens == 0:
-            loss = logits.sum() * 0
-        else:
-            loss = F.cross_entropy(logits, shifted_labels, reduction="none", ignore_index=self.loss_cfg.ignore_idx)
-            # Step 2.b in the loss calculation: sum the loss over all tokens
-            loss = (loss * loss_weight).sum()
+        # The historical ``if rank_grad_tokens == 0`` branch required a device->host bool
+        # conversion here -- one host sync per chunk, ~256 per training step across the CE and
+        # MTP chunk loops, each parked behind the stream queue. It is replaceable without
+        # changing any value: ``cross_entropy`` emits an exact 0.0 for every ignored label
+        # (the same path the historical else-branch exercised on every real step), so an
+        # all-ignored chunk sums to 0.0 -- the same value ``logits.sum() * 0`` produced --
+        # and normal rows keep their labels and weights, so the loss and its gradient are
+        # bit-identical on both branches.
+        loss = F.cross_entropy(logits, shifted_labels, reduction="none", ignore_index=self.loss_cfg.ignore_idx)
+        # Step 2.b in the loss calculation: sum the loss over all tokens
+        loss = (loss * loss_weight).sum()
 
         return loss, (logits, {})
 
