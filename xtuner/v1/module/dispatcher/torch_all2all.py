@@ -1,3 +1,4 @@
+import os
 from typing import Literal, TypeAlias, cast
 
 import torch
@@ -28,6 +29,12 @@ if get_device() == "npu":
 
 DEVICE = get_device()
 logger = get_logger()
+
+# The meta a2a (per-expert token counts) is issued with async_op=True and is
+# fenced before the token-count D2Hs (see _dispatch); the contiguous launch
+# overlaps the meta wire meanwhile. Read once at import time: flipping it at
+# runtime requires a module reload.
+_META_A2A_ASYNC = os.environ.get("XTUNER_MOE_META_A2A_ASYNC", "1") == "1"
 
 
 # The execution steps of Torch all to all are as follows:
@@ -88,11 +95,34 @@ def _dispatch(
     tokens_per_expert = torch.histc(topk_ids, bins=n_routed_experts, min=0, max=n_routed_experts)
     # self._comm_stream.wait_event(event)
     tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
-    dist.all_to_all_single(
-        tokens_per_expert_group,
-        tokens_per_expert,
-        group=process_group,
-    )
+    if _META_A2A_ASYNC:
+        meta_work = dist.all_to_all_single(
+            tokens_per_expert_group,
+            tokens_per_expert,
+            group=process_group,
+            async_op=True,
+        )
+        try:
+            # Overlap the meta wire with the dense copy: contiguous() is a device
+            # op on a different buffer, so it is safe to run unfenced. The
+            # token-count D2Hs below must NOT precede meta_work.wait(): an
+            # unfenced D2H of either a2a buffer races the in-flight collective
+            # (read-read on the send buffer, read-write on the recv buffer --
+            # silently wrong splits), which torch_npu.profiler also reports as
+            # error 507015.
+            hidden_states = hidden_states.contiguous()
+            meta_work.wait()
+        finally:
+            # Never abandon the meta collective in flight on an exception path:
+            # a dangling async collective would make peers hang at their next
+            # collective. Work.wait() is idempotent, so paying it twice is safe.
+            meta_work.wait()
+    else:
+        dist.all_to_all_single(
+            tokens_per_expert_group,
+            tokens_per_expert,
+            group=process_group,
+        )
 
     # (r0e0, r0e1, ..., r0ei-1,
     #  r1e0, r1e1, ..., r1ei-1,
