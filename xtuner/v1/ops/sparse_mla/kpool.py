@@ -104,7 +104,7 @@ def build_pool_index(seq_ctx: SequenceContext, seq_len: int, index_kpool: int, d
             the global token id at that slot, or ``-1`` if the pool is incomplete there (its
             document ended before filling the pool).
     """
-    cu = seq_ctx.cu_seq_lens_q.to(device=device)
+    cu = seq_ctx.cu_seq_lens_q_on(device)
     num_pools_per_doc, doc_pool_start = _doc_pool_layout(cu, index_kpool)
     # start=0: pools always cover the whole sequence, never a shard (see build_pools).
     token_ids, doc_of_token, local_pos = _token_doc_layout(cu, 0, seq_len, device)
@@ -112,7 +112,12 @@ def build_pool_index(seq_ctx: SequenceContext, seq_len: int, index_kpool: int, d
     pool_id = doc_pool_start[doc_of_token] + local_pos // index_kpool
     slot = local_pos % index_kpool
 
-    num_pools = int(num_pools_per_doc.sum().item())
+    # The pool count comes from the host-side cumulative-length list instead of
+    # ``num_pools_per_doc.sum().item()``: reading the device value synchronised the stream
+    # behind the freshly enqueued layout kernels on every indexer call (192 calls/step at
+    # 30B/128K, ~20 ms of device idle each). Pure host arithmetic over the same lengths.
+    cu_host = seq_ctx.cu_seq_lens_q_list
+    num_pools = sum(-(-int(cu_host[i + 1] - cu_host[i]) // index_kpool) for i in range(len(cu_host) - 1))
     pool_index = torch.full((num_pools, index_kpool), -1, device=device, dtype=torch.int64)
     pool_index[pool_id, slot] = token_ids
     return pool_index
@@ -152,12 +157,11 @@ def build_pools(
             - ``pool_complete`` ``[P]`` bool (all ``index_kpool`` slots valid).
     """
     seq_len, device = k.shape[0], k.device
-    # Reading `cu_seq_lens_q[-1]` is a host sync, and under `torch.compile` it is also a graph
-    # break in every DSA layer. What it guards against -- a caller that forgot to gather across
-    # the SP mesh -- is a programming error, not a data condition, so eager (which every test and
-    # the first training step exercise) is where it is worth paying for.
+    # Same host-list read as ``build_pool_index``: the eager-only whole-sequence guard is
+    # free through ``cu_seq_lens_q_list`` (the device ``.item()`` read synced the stream per
+    # call). Still skipped under ``torch.compile`` to avoid the host constant as a graph break.
     if not torch.compiler.is_compiling():
-        global_len = int(seq_ctx.cu_seq_lens_q[-1].item())
+        global_len = int(seq_ctx.cu_seq_lens_q_list[-1])
         if seq_len != global_len:
             raise RuntimeError(
                 f"build_pools needs key features for the whole sequence ({global_len} tokens) but "
@@ -228,7 +232,7 @@ def _visible_tail_tokens(seq_ctx: SequenceContext, query_len: int, index_kpool: 
     if max_tail_width == 0:
         return torch.empty((query_len, 0), device=device, dtype=torch.int32)
 
-    cu = seq_ctx.cu_seq_lens_q.to(device=device)
+    cu = seq_ctx.cu_seq_lens_q_on(device)
     token_ids, _, local_pos = _token_doc_layout(cu, seq_ctx.shard_start, query_len, device)
     tail_count = (local_pos + 1) % index_kpool
 

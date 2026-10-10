@@ -1,3 +1,4 @@
+import inspect
 import os
 from typing import Any, cast
 
@@ -11,13 +12,25 @@ def _patch_triton_autotune_for_determinism() -> None:
     if getattr(original_autotune, "_xtuner_deterministic_patched", False):
         return
 
+    # `cache_results` only exists on triton >= 3.3; probing the signature once keeps the
+    # wrapper compatible with older tritons (e.g. the triton-ascend 3.2 shipped on Ascend
+    # boxes), where injecting the kwarg raises TypeError the moment a kernel module
+    # applies @triton.autotune at import time. Determinism is unaffected: pinning
+    # ``configs[:1]`` already leaves autotune a single choice, so the cached result can
+    # only ever refer to that same config.
+    try:
+        supports_cache_results = "cache_results" in inspect.signature(original_autotune).parameters
+    except (TypeError, ValueError):
+        supports_cache_results = False
+
     def deterministic_autotune(configs, *args, **kwargs):
         # Triton autotune 会按 benchmark/cache 在多个 kernel config 中选一个实现；
         # 不同 cache 目录或计时抖动可能选到不同 tiling/num_warps/reduction 路径，
         # 从而改变浮点累加顺序。确定性模式固定第一个 config，并禁用 cache 结果。
         if configs:
             configs = configs[:1]
-        kwargs["cache_results"] = False
+        if supports_cache_results:
+            kwargs["cache_results"] = False
         return original_autotune(configs, *args, **kwargs)
 
     patched = cast(Any, deterministic_autotune)

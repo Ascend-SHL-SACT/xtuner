@@ -197,6 +197,43 @@ def use_moe_ep_compile_cfg(config: MoEConfig) -> bool:
     return config.ep_size > 1 or config.expert_tp_size > 1
 
 
+def nonpad_index_and_count(seq_ctx_list: list[SequenceContext]) -> tuple[torch.Tensor, int]:
+    """Build the concatenated non-padding index vector and its token count.
+
+    ``SequenceContext.mask`` is "all True except the last ``num_padding`` positions" by
+    construction (the tail slice in the mask property is its only writer), so the valid
+    positions of the concatenated mask are the per-context leading
+    ``[start, start + T - num_padding)`` ranges. Deriving them from host metadata keeps
+    this path free of ``torch.nonzero``'s mandatory host-device sync (it must read the
+    mask to size its output: 14x/3.4 s per profiled step, up to 831 ms per call, on
+    mind-12 run12) and is bit-identical: both produce the same ascending int64 index
+    sequence. ``non_pad_token`` falls out of the same pass: the final offset is the
+    total token count, and padding never lands inside any ``[start, seg_end)``.
+
+    Args:
+        seq_ctx_list (list[SequenceContext]): The per-context sequence metadata; every
+            context must carry ``input_ids`` or ``inputs_embeds``.
+
+    Returns:
+        tuple[torch.Tensor, int]: The int64 non-padding token index vector (on the
+        contexts' device) and the non-padding token count.
+    """
+    nonpad_parts: list[torch.Tensor] = []
+    offset = 0
+    num_padding_total = 0
+    for ctx in seq_ctx_list:
+        ref = ctx.input_ids if ctx.input_ids is not None else ctx.inputs_embeds
+        assert ref is not None, "seq_ctx carries neither input_ids nor inputs_embeds"
+        t_len = int(ref.shape[1])
+        seg_end = offset + t_len - int(ctx.num_padding)
+        nonpad_parts.append(torch.arange(offset, seg_end, dtype=torch.int64, device=ref.device))
+        offset += t_len
+        num_padding_total += int(ctx.num_padding)
+    non_pad_token = offset - num_padding_total
+    nonpad_indices = torch.cat(nonpad_parts) if len(nonpad_parts) > 1 else nonpad_parts[0]
+    return nonpad_indices, non_pad_token
+
+
 class MoE(BaseModel):
     """Transformer decoder consisting of *config.num_hidden_layers* layers.
     Each layer is a [`InternLM3DecoderLayer`]
@@ -754,11 +791,10 @@ class MoE(BaseModel):
             # Activation offload resizes saved tensors after D2H. A chunk view
             # cannot release its shared embedding storage independently.
             hidden_states_list = [hidden_states.clone() for hidden_states in hidden_states_list]
-        cat_mask = torch.cat([ctx.mask for ctx in seq_ctx_list], dim=1)
         # Hoisted out of the per-layer accumulate path: mask is constant across layers,
         # so the non-pad index lookup runs once per forward instead of once per (layer, ctx).
-        nonpad_indices = torch.nonzero(cat_mask, as_tuple=True)[1]
-        non_pad_token = nonpad_indices.numel()
+        nonpad_indices, non_pad_token = nonpad_index_and_count(seq_ctx_list)
+        mask_device = nonpad_indices.device
 
         # Initialize output containers
         output: dict = {}
@@ -770,7 +806,7 @@ class MoE(BaseModel):
             [{} for _ in range(len(seq_ctx_list))] if keep_router else []
         )
         balancing_ctx, z_ctx = self._extract_aux_loss_ctx(loss_ctx_list)
-        num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, cat_mask.device)
+        num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, mask_device)
 
         for seq_ctx in seq_ctx_list:
             self._mark_dynamic(seq_ctx)
@@ -816,7 +852,10 @@ class MoE(BaseModel):
                 seq_ctx=mtp_seq_ctx_list,
             )
 
-            mtp_losses = torch.tensor(0.0, device=DEVICE)
+            # Accumulate from the first loss tensor (no host-built 0.0 seed): the CPU->NPU
+            # scalar H2D parks the host at the tail of the stream queue. 0.0 + x is
+            # IEEE-exact, so the sum stays bit-identical in the same order.
+            mtp_losses: torch.Tensor | None = None
             has_mtp_loss = False
             for micro_batch_idx, (loss_ctx_dict, mtp_outputs) in enumerate(zip(loss_ctx_list, mtp_outputs_per_mb)):
                 mtp_loss_ctx_list = loss_ctx_dict.get("mtp")
@@ -835,15 +874,24 @@ class MoE(BaseModel):
                         (target_hidden_states, draft_hidden_states),
                         cast(MTPE2ETVLossContext, mtp_tv_loss_ctx),
                     )
-                    mtp_losses += mtp_loss
+                    # None-start with an explicit fp32 accumulator (.float() is a no-op on
+                    # fp32 inputs): reproduces the historical fp32-seeded sum without
+                    # relying on the first loss tensor already being fp32.
+                    mtp_losses = mtp_loss.float() if mtp_losses is None else mtp_losses + mtp_loss.float()
                     has_mtp_loss = True
                 elif mtp_loss_ctx_list is not None:
-                    micro_batch_mtp_losses = torch.tensor(0.0, device=DEVICE)
+                    micro_batch_mtp_losses: torch.Tensor | None = None
                     for mtp_hidden, mtp_ctx in zip(mtp_outputs, mtp_loss_ctx_list):
                         mtp_loss, _ = self.lm_head(mtp_hidden["hidden_states"], cast(MTPLossContext, mtp_ctx))
-                        micro_batch_mtp_losses += mtp_loss
+                        micro_batch_mtp_losses = (
+                            mtp_loss.float()
+                            if micro_batch_mtp_losses is None
+                            else micro_batch_mtp_losses + mtp_loss.float()
+                        )
 
-                    mtp_losses += micro_batch_mtp_losses / len(mtp_loss_ctx_list)
+                    assert micro_batch_mtp_losses is not None, "mtp loss loop never ran"
+                    mb_mean = micro_batch_mtp_losses / len(mtp_loss_ctx_list)
+                    mtp_losses = mb_mean if mtp_losses is None else mtp_losses + mb_mean
                     has_mtp_loss = True
 
             if has_mtp_loss:
@@ -886,6 +934,7 @@ class MoE(BaseModel):
                         world_size=z_world_size,
                     )
 
+                assert mtp_losses is not None
                 output["mtp_loss"] = mtp_losses * self.config.mtp_config.loss_scaling_factor
 
         # Apply final norm to all micro-batches
@@ -1129,6 +1178,7 @@ class MoE(BaseModel):
                 )
                 draft_hidden_states.append(mtp_hidden_states)
 
+            mtp_losses: torch.Tensor
             if mtp_tv_loss_ctx is not None:
                 # One joint call is required: the acceptance products in Eq. 13
                 # couple all recurrent MTP steps.
@@ -1138,11 +1188,17 @@ class MoE(BaseModel):
                 )
             else:
                 assert mtp_loss_ctx_list is not None
-                mtp_losses = torch.tensor(0.0, device=DEVICE)
+                # Accumulate from the first loss tensor (no host-built 0.0 seed): the CPU->NPU
+                # scalar H2D parks the host at the tail of the stream queue. The explicit
+                # fp32 accumulator (.float() is a no-op on fp32 inputs) reproduces the
+                # historical fp32-seeded sum without relying on the first loss tensor
+                # already being fp32.
+                acc: torch.Tensor | None = None
                 for mtp_hidden_states, mtp_ctx in zip(draft_hidden_states, mtp_loss_ctx_list):
                     mtp_loss, _ = self.lm_head(mtp_hidden_states, cast(MTPLossContext, mtp_ctx))
-                    mtp_losses += mtp_loss
-                mtp_losses = mtp_losses / len(mtp_loss_ctx_list)
+                    acc = mtp_loss.float() if acc is None else acc + mtp_loss.float()
+                assert acc is not None
+                mtp_losses = acc / len(mtp_loss_ctx_list)
 
             # Both objectives are normalized over MTP depth internally; scale once.
             scaled_mtp_loss = mtp_losses * self.config.mtp_config.loss_scaling_factor  # type: ignore

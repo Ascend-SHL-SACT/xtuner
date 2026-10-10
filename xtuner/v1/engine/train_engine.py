@@ -624,9 +624,19 @@ class TrainEngine:
         # total_loss directly, rather than iterating through fields to sum losses here.
         # This would provide better separation of concerns and make the loss computation logic
         # more explicit and maintainable.
-        loss = torch.tensor(0.0, device=DEVICE)
+        # Accumulate from the first loss tensor instead of seeding with a host-built
+        # ``torch.tensor(0.0, device=...)``: that CPU->NPU scalar H2D lands at the tail
+        # of the device stream queue, so the host parks until every kernel ahead of it
+        # retires (24x/5.5 s per profiled step on mind-12, run12). ``value.float()``
+        # reproduces the historical fp32 accumulator exactly (the old seed was fp32, so
+        # every ``+=`` promoted into fp32) without relying on the first loss field
+        # already being fp32; on fp32 inputs ``.float()`` returns ``self`` at zero cost,
+        # keeping the sum bit-identical in the same field order.
+        loss: torch.Tensor | None = None
         for key in model_outputs.model_fields:
             value = getattr(model_outputs, key)
             if "loss" in key and isinstance(value, torch.Tensor):
-                loss += value
+                value32 = value.float()
+                loss = value32 if loss is None else loss + value32
+        assert loss is not None, "model_outputs carries no tensor loss field"
         return loss

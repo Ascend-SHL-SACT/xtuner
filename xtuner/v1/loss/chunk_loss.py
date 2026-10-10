@@ -68,12 +68,16 @@ class ChunkLoss(torch.autograd.Function):
     def backward(ctx, *grad_output):
         grad_input = ctx.saved_tensors[0]
         grad_weight = ctx.saved_tensors[1] if ctx.weight_requires_grad else None
-        if torch.ne(grad_output[0], torch.tensor(1.0, device=grad_output[0].device)):
-            # In-place mul avoids allocating a head_weight-sized grad temp.
-            # Use a python scalar (.item()): torch_npu mul_(0-dim tensor) goes
-            # through the tensor-operand dispatch and allocates a temp, while
-            # mul_(python float) is a truly in-place element-wise scale.
-            scale = grad_output[0].item()
+        # Scale with the upstream grad tensor itself, as a stream-ordered device mul.
+        # Reading the scale with .item() fences the whole stream: the host parks until
+        # every kernel ahead of grad_output[0] retires (28x/2.6 s per profiled step on
+        # mind-12, run12), because mul has a data dependency on that grad either way.
+        # x*1.0 is IEEE-exact (bit-identical to skipping the mul), so the unconditional
+        # mul keeps the scale==1.0 path numerically identical while the host never
+        # blocks. The tensor operand costs one temp allocation per call (torch_npu
+        # mul_ dispatch), far cheaper than the fenced read.
+        scale = grad_output[0]
+        if scale is not None:
             grad_input.mul_(scale)
             if grad_weight is not None:
                 grad_weight.mul_(scale)
