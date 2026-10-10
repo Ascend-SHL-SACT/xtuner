@@ -35,6 +35,9 @@ token id in this module is global. Concretely that splits the work in two:
   :meth:`SequenceContext.packed_causal_query_ranges`.
 """
 
+import os
+import weakref
+
 import torch
 from torch import Tensor
 
@@ -42,6 +45,22 @@ from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.ops.comm import gather_for_sequence_parallel
 
 from .tilelang import tilelang_indexer_topk_from_ranges
+
+
+# ``pool_index`` is a pure function of the packed-sequence lengths, so it is rebuilt once per
+# (context, pool size) instead of once per indexer call -- at 128K that skips the per-call
+# layout/scatter chain (~10 device ops) and the host-side pool-count sum over every document,
+# ~253k generator frames per training step on the live path (``build_pools`` calls this on
+# every indexer invocation). Keyed weakly by the SequenceContext so entries die with the
+# micro-batch. The cached tensor is shared read-only; ``build_pools`` returns a fresh
+# ``.to(torch.int32)`` copy to its callers, so in-place edits of that copy cannot corrupt it.
+_POOL_INDEX_CACHE: weakref.WeakKeyDictionary[SequenceContext, dict[tuple[int, int, torch.device], Tensor]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _pool_index_cache_on() -> bool:
+    return os.environ.get("XTUNER_SPARSE_MLA_POOL_INDEX_CACHE", "1") == "1"
 
 
 def kpool_output_width(index_topk: int, index_kpool: int, alignment: int) -> int:
@@ -104,6 +123,26 @@ def build_pool_index(seq_ctx: SequenceContext, seq_len: int, index_kpool: int, d
             the global token id at that slot, or ``-1`` if the pool is incomplete there (its
             document ended before filling the pool).
     """
+    cache: dict[tuple[int, int, torch.device], Tensor] | None = None
+    key: tuple[int, int, torch.device] | None = None
+    if _pool_index_cache_on():
+        # ``pool_index`` is a pure function of the packed-sequence lengths, so with the
+        # cache lever on (default) it is reused once per (context, pool size, device)
+        # instead of rebuilt on every indexer call -- at 128K that skips the per-call
+        # layout/scatter chain (~10 device ops) and the host-side pool-count sum over
+        # every document, ~253k generator frames per training step on the live path. The
+        # cached tensor is shared read-only; ``build_pools`` returns a fresh
+        # ``.to(torch.int32)`` copy to its callers, so in-place edits of that copy cannot
+        # corrupt it. Entries die with the micro-batch via the weak key.
+        cache = _POOL_INDEX_CACHE.get(seq_ctx)
+        if cache is None:
+            cache = {}
+            _POOL_INDEX_CACHE[seq_ctx] = cache
+        key = (index_kpool, seq_len, torch.device(device))
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+
     cu = seq_ctx.cu_seq_lens_q_on(device)
     num_pools_per_doc, doc_pool_start = _doc_pool_layout(cu, index_kpool)
     # start=0: pools always cover the whole sequence, never a shard (see build_pools).
@@ -120,6 +159,8 @@ def build_pool_index(seq_ctx: SequenceContext, seq_len: int, index_kpool: int, d
     num_pools = sum(-(-int(cu_host[i + 1] - cu_host[i]) // index_kpool) for i in range(len(cu_host) - 1))
     pool_index = torch.full((num_pools, index_kpool), -1, device=device, dtype=torch.int64)
     pool_index[pool_id, slot] = token_ids
+    if cache is not None and key is not None:
+        cache[key] = pool_index
     return pool_index
 
 

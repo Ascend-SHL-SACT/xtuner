@@ -15,7 +15,9 @@ DSAIndexerBackend = Literal[
 # GLM-5.3-Flash's KPool indexer (design doc F5.a) only has these two: "torch" is the eager
 # reference path, "tilelang" is the only production kernel today -- unlike GLM-5.2's per-token
 # DSAIndexerBackend, there's no cudnn_dsa/flash_mla/deep_gemm_fp8/cute_dsl KPool kernel.
-KPoolIndexerBackend = Literal["torch", "tilelang"]
+# "torch_npu" adds the Ascend backend (fused lightning scoring on NPU, chunked-eager fallback
+# elsewhere).
+KPoolIndexerBackend = Literal["torch", "tilelang", "torch_npu"]
 
 
 class SparseMLAOutputs(NamedTuple):
