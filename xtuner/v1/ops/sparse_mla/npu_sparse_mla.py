@@ -544,7 +544,7 @@ def _sparse_mla_tnd_packed(
         value_tnd = key_tnd
         key_rope_tnd = k_rope.contiguous()  # [T_g, 1, Dr]
         cu_seq_q_local = cu_seq_q_global
-        cu_seq_k_local = seq_ctx.cu_seq_lens_k.to(torch.int32).to(device)
+        cu_seq_k_local = seq_ctx.cu_seq_lens_k_on(device).to(torch.int32)
         kv_slice_offset = 0
     else:
         # ── SP>1: prefix-extended KV slice ──
