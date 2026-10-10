@@ -178,6 +178,13 @@ class SequenceContext:
         self._shard_start = shard_start
         self._shard_size = shard_size
         self.seq_idx = None
+        # Per-(device, dtype) cached device copies of the (CPU-resident) cu maps. On NPU the
+        # cu tensors deliberately stay on CPU (see ``to``), and every consumer needs a device
+        # copy; a per-call ``.to(device)`` is a host-blocking pageable H2D parked behind the
+        # whole queued stream, so the copy is built once per context and reused read-only.
+        # Values are (pinned staging, device copy) pairs -- the staging outlives the async H2D.
+        self._cu_seq_lens_q_device: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._cu_seq_lens_k_device: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
 
         # `DeviceMesh.get_local_rank` is not compatible with `torch.compile`, we calculate `_sp_rank` in
         # `SequenceContext`
@@ -197,6 +204,65 @@ class SequenceContext:
                 position_ids = split_for_sequence_parallel(position_ids, dim=1, sp_mesh=self.sequence_parallel_mesh)  # type: ignore
 
         self.position_ids = position_ids
+
+    def cu_seq_lens_q_on(self, device: str | torch.device) -> torch.Tensor:
+        """Device copy of ``cu_seq_lens_q``, cached per (device, dtype).
+
+        On NPU the cu maps stay CPU-resident (see :meth:`to`); consumers need a device copy
+        every call, and a per-call ``.to(device)`` is a host-blocking pageable H2D parked
+        behind the whole queued stream. The copy is built once per context through a pinned
+        staging buffer (non-blocking for the host) and shared read-only afterwards; callers
+        must treat the returned tensor as immutable. The cache is dropped whenever ``to``
+        reassigns the CPU tensor.
+
+        Stream contract: the one-shot H2D is enqueued on the *current* stream at first
+        call, so the copy is only guaranteed ordered for consumers running on that same
+        stream (today's call sites are all on the main stream). A consumer on a side
+        stream must synchronize before reading it.
+
+        Args:
+            device (str | torch.device): Target device of the returned copy. Callers on
+                multi-device hosts must pass a fully-specified device (with index); the
+                cache key keeps the device as given.
+
+        Returns:
+            torch.Tensor: ``cu_seq_lens_q`` on ``device``, same dtype as the CPU tensor.
+        """
+        return self._cu_seq_lens_device(self.cu_seq_lens_q, self._cu_seq_lens_q_device, device)
+
+    def cu_seq_lens_k_on(self, device: str | torch.device) -> torch.Tensor:
+        """Device copy of ``cu_seq_lens_k``, cached per (device, dtype).
+
+        See :meth:`cu_seq_lens_q_on` for the caching contract.
+
+        Args:
+            device (str | torch.device): Target device of the returned copy.
+
+        Returns:
+            torch.Tensor: ``cu_seq_lens_k`` on ``device``, same dtype as the CPU tensor.
+        """
+        return self._cu_seq_lens_device(self.cu_seq_lens_k, self._cu_seq_lens_k_device, device)
+
+    def _cu_seq_lens_device(
+        self,
+        cu: torch.Tensor,
+        cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]],
+        device: str | torch.device,
+    ) -> torch.Tensor:
+        dev = torch.device(device)
+        if cu.device == dev:
+            return cu
+        key = (dev, cu.dtype)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit[1]
+        staging = torch.empty(cu.shape, dtype=cu.dtype, device="cpu", pin_memory=True)
+        staging.copy_(cu)
+        copy = torch.empty(cu.shape, dtype=cu.dtype, device=dev)
+        copy.copy_(staging, non_blocking=True)
+        # The pinned staging must outlive the in-flight H2D; cache it next to the copy.
+        cache[key] = (staging, copy)
+        return copy
 
     @property
     def sp_rank(self):
@@ -219,7 +285,7 @@ class SequenceContext:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return global ``[start, end)`` KV ranges for local packed
         queries."""
-        cu_seq_lens = self.cu_seq_lens_q.to(device)
+        cu_seq_lens = self.cu_seq_lens_q_on(device)
         query_positions = torch.arange(query_len, device=device) + self._shard_start
         sequence_indices = torch.searchsorted(cu_seq_lens, query_positions, right=True) - 1
 
@@ -387,8 +453,8 @@ class SequenceContext:
                 if len(cu_seq_lens_k) == 0
                 else (seq_ctx.cu_seq_lens_k + cu_seq_lens_k[-1][-1])[1:]
             )
-            max_length_q = max(max_length_q, seq_ctx.max_length_q)  # type: ignore[call-overload]
-            max_length_k = max(max_length_k, seq_ctx.max_length_k)  # type: ignore[call-overload]
+            max_length_q = max(max_length_q, seq_ctx.max_length_q)  # type: ignore[call-overload,assignment]
+            max_length_k = max(max_length_k, seq_ctx.max_length_k)  # type: ignore[call-overload,assignment]
             num_padding += seq_ctx.num_padding
             device.append(torch.device(seq_ctx.device))
             if seq_ctx.inputs_embeds is not None:
@@ -636,8 +702,16 @@ class SequenceContext:
             self.cu_seq_lens_k = self.cu_seq_lens_k.to(device)  # type: ignore
         # Refresh the host-side lists consumed by the KDA cu_host_list fast path so they can
         # never desync from the device tensors (cheap: cu maps are small int tensors).
-        self.cu_seq_lens_q_list = self.cu_seq_lens_q.tolist()  # type: ignore[union-attr]
-        self.cu_seq_lens_k_list = self.cu_seq_lens_k.tolist()  # type: ignore[union-attr]
+        # The cu values are never mutated in place anywhere, so on paths where ``to``
+        # leaves them on an accelerator this refresh would only add a blocking D2H read;
+        # refresh from the host only, which is the NPU layout this project trains with.
+        if self.cu_seq_lens_q is not None and self.cu_seq_lens_q.is_cpu:
+            self.cu_seq_lens_q_list = self.cu_seq_lens_q.tolist()  # type: ignore[union-attr]
+        if self.cu_seq_lens_k is not None and self.cu_seq_lens_k.is_cpu:
+            self.cu_seq_lens_k_list = self.cu_seq_lens_k.tolist()  # type: ignore[union-attr]
+        # The cached device copies of the old cu tensors are stale now; drop them.
+        self._cu_seq_lens_q_device.clear()
+        self._cu_seq_lens_k_device.clear()
 
         if self.position_ids is not None and hasattr(self.position_ids, "to"):
             self.position_ids = self.position_ids.to(device)  # type: ignore

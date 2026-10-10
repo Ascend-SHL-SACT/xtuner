@@ -153,8 +153,10 @@ def get_sp_mode_and_slice(
         _SP_SLICE_CACHE[seq_ctx] = per_ctx
     entry = per_ctx.get(key)
     if entry is None:
-        cu_seq_q_global = seq_ctx.cu_seq_lens_q.to(torch.int32).to(device)
-        is_sp1 = shard_start == 0 and seq_len == cu_seq_q_global[-1].item()
+        cu_seq_q_global = seq_ctx.cu_seq_lens_q_on(device).to(torch.int32)
+        # Host-side SP=1 probe: the CPU cu map already knows its last cumulative length, so
+        # the device readback (.item()) is avoided -- it parked the host behind the queue.
+        is_sp1 = shard_start == 0 and seq_len == seq_ctx.cu_seq_lens_q_list[-1]
         slice_meta: SpSliceMeta | None = None
         if not is_sp1:
             slice_meta = compute_slice(cu_seq_q_global, shard_start, shard_start + seq_len, device)
@@ -375,7 +377,7 @@ def _indexer_tnd_packed(
         # ── SP=1: V1 kernel with global KV ──
         k_tnd = k.squeeze(0).unsqueeze(1).contiguous().to(torch.bfloat16)
         cu_seq_q_local = cu_seq_q_global
-        cu_seq_k_local = seq_ctx.cu_seq_lens_k.to(torch.int32).to(device)
+        cu_seq_k_local = seq_ctx.cu_seq_lens_k_on(device).to(torch.int32)
         kv_slice_offset = 0
 
         topk_indices, _ = torch_npu.npu_lightning_indexer(
