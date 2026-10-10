@@ -1,5 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-"""NPU SparseMLA backend for GLM-5.2 DSA attention.
+"""NPU SparseMLA backend for GLM-5.2 DSA and GLM-5.3-Flash NoPE attention.
 
 Wraps ``torch_npu.npu_sparse_flash_attention`` (V1) for fused sparse MLA
 on Ascend NPU (910B/910C).
@@ -21,6 +21,19 @@ Key implementation notes:
     V1 kernel backward to produce NaN (sparse_mode=3 + multi-segment TND).
   - indices passed to kernel are per-segment local (each segment from 0).
 
+This module is also what ``get_sparse_mla("torch_npu")`` hands out to both model families,
+via :func:`npu_sfa_rope_padded` below: it dispatches on the input geometry -- rope-tailed
+absorbed inputs (GLM-5.2 DSA full-form and the pre-split ``(q_nope, q_rope)`` tuple) are
+forwarded to :func:`npu_sparse_mla` untouched, while NoPE full-form queries (GLM-5.3-Flash,
+``q.shape[-1] == value_dim``) are zero-padded to the kernel's 512+64 absorbed-MLA geometry.
+``npu_sparse_flash_attention`` (V1) has no zero-width rope geometry: GLM-5.3-Flash's NoPE
+absorbed MLA (``qk_rope_head_dim=0``) slices ``q_rope``/``k_rope`` empty, and the kernel
+rejects them (aclnnSparseFlashAttention 561002). The padding contract -- proven end to end
+at 64K context on 910C -- pads both the absorbed query and the compressed KV with
+``SFA_ROPE_DIM`` zero channels; the padded channels contribute nothing to the QK product and
+the value path reads only the first ``value_dim`` channels, so the result is exact, and the
+caller's ``scaling`` (``q_head_dim**-0.5``) passes through unchanged.
+
 Reference: mindspeed/core/transformer/experimental_attention_variant/dsa_fused.py:426-475
 """
 
@@ -29,11 +42,81 @@ from functools import lru_cache
 
 import torch
 import torch_npu
+from torch import Tensor
 
 from xtuner.v1.data_proto import SequenceContext
 
 from .npu_indexer import _compute_prefix_extended_kv_slice, get_sp_mode_and_slice
 from .protocol import SparseMLAOutputs
+
+
+SFA_ROPE_DIM = 64
+
+
+class _ContiguousGradFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor) -> Tensor:
+        return x
+
+    @staticmethod
+    def backward(ctx, g: Tensor) -> tuple[Tensor]:
+        return (g.contiguous(),)
+
+
+def _contiguous_grad(x: Tensor) -> Tensor:
+    """Identity forward; makes the incoming gradient contiguous in backward.
+
+    The zero-pad in :func:`npu_sfa_rope_padded` is a concat whose backward slices the last dim
+    and hands a non-dense view to the upstream sequence-parallel all-gather's backward -- whose
+    internal ``reduce_scatter`` rejects non-contiguous inputs (c10d "Expected
+    input.is_contiguous()", killed the first 30B smoke at the first checkpoint backward).
+    Contiguous-izing here costs one ``[S_g, 1, Rkv]`` copy per layer in backward; the query
+    path needs no such guard (its grad feeds only local matmuls, which accept non-contiguous
+    inputs).
+    """
+    if torch.is_grad_enabled() and x.requires_grad:
+        return _ContiguousGradFn.apply(x)
+    return x
+
+
+def npu_sfa_rope_padded(
+    q: Tensor | tuple[Tensor, Tensor],
+    kv: Tensor,
+    indices: Tensor,
+    scaling: float | None,
+    value_dim: int | None = None,
+    *,
+    seq_ctx: SequenceContext | None = None,
+) -> SparseMLAOutputs:
+    """``torch_npu`` sparse-MLA entry: zero-pads NoPE absorbed inputs, passes the rest
+    through.
+
+    Args:
+        q (Tensor | tuple[Tensor, Tensor]): Either a rope-tailed absorbed query
+            ``[S, N, Rkv + Dr]`` or the pre-split ``(q_nope [S, N, Rkv], q_rope [S, N, Dr])``
+            tuple (GLM-5.2 DSA) -- forwarded to :func:`npu_sparse_mla` unchanged -- or a NoPE
+            absorbed query ``[S, N, Rkv]`` (GLM-5.3-Flash; ``q.shape[-1] == value_dim``,
+            zero-width rope) -- zero-padded to the kernel's ``Rkv + SFA_ROPE_DIM`` geometry
+            first.
+        kv (Tensor): SP-gathered compressed KV, ``[S_g, 1, Rkv]`` (NoPE) or
+            ``[S_g, 1, Rkv + Dr]`` (rope-tailed).
+        indices (Tensor): Top-k token ids ``[S, 1, K]`` int32, ``-1``-padded (the kernel
+            rewrites ``-1`` slots to the query's own position).
+        scaling (float | None): Softmax scale; passed through to :func:`npu_sparse_mla`.
+        value_dim (int | None): Value dimension (``Rkv``); passed through, and its equality
+            with ``q.shape[-1]`` is the NoPE discriminator.
+        seq_ctx (SequenceContext | None): Packed-sequence metadata for the kernel's
+            per-segment causal masking.
+
+    Returns:
+        SparseMLAOutputs: ``raw_output`` ``[S, N, value_dim]`` and ``softmax_lse``
+        ``[S, N]``.
+    """
+    if isinstance(q, Tensor) and value_dim is not None and q.shape[-1] == value_dim:
+        query = torch.cat([q, q.new_zeros(q.shape[:-1] + (SFA_ROPE_DIM,))], dim=-1)
+        key = torch.cat([_contiguous_grad(kv), kv.new_zeros(kv.shape[:-1] + (SFA_ROPE_DIM,))], dim=-1)
+        return npu_sparse_mla(query, key, indices, scaling, value_dim=value_dim, seq_ctx=seq_ctx)
+    return npu_sparse_mla(q, kv, indices, scaling, value_dim=value_dim, seq_ctx=seq_ctx)
 
 
 def npu_sparse_mla(
