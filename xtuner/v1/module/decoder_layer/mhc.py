@@ -35,6 +35,14 @@ from xtuner.v1.utils.compile import maybe_compile
 
 
 try:  # fused NPU mHC kernels (triton-ascend); absent on CPU / reference boxes
+    # All five mHC env gates live in xtuner.v1.ops.mhc_fused (single home); the two
+    # dispatch-site flags are consumed at this module's conditions below.
+    from xtuner.v1.ops.mhc_fused import (
+        HC_POST_FUSED as _HC_POST_FUSED,
+    )
+    from xtuner.v1.ops.mhc_fused import (
+        MHC_SINKHORN_FUSED as _MHC_SINKHORN_FUSED,
+    )
     from xtuner.v1.ops.mhc_fused import (
         _hc_post_eager_matmul,
     )
@@ -56,10 +64,11 @@ except ImportError:  # pragma: no cover - triton-less environments
     _hc_split_sinkhorn_fused = None  # type: ignore[assignment]
     _hc_combine = None  # type: ignore[assignment]
     _hc_collapse = None  # type: ignore[assignment]
-
-# Escape hatch: force the eager split-Sinkhorn on NPU (debugging only; the fused
-# kernels are the run81 128K-anchor numerics, so eager changes the loss by design).
-_MHC_SINKHORN_EAGER = os.getenv("XTUNER_GLM53_MHC_SINKHORN_EAGER", "0") == "1"
+    # mhc_fused failed to import: every fused branch these two flags gate first
+    # requires an entry point that is None above, so the flags collapse to their
+    # defaults without re-parsing the env (behavior-identical on this path).
+    _HC_POST_FUSED = True
+    _MHC_SINKHORN_FUSED = True
 
 
 __all__ = ["MHCConfig", "hc_split_sinkhorn", "hc_pre", "hc_post"]
@@ -71,14 +80,14 @@ __all__ = ["MHCConfig", "hc_split_sinkhorn", "hc_pre", "hc_post"]
 # doc/progress.md F4) rather than silently wired to a nonexistent module.
 _USE_MHC_KERNELS = os.getenv("XTUNER_USE_MHC_KERNELS", "0") == "1"
 
-# Debug-only parity escape hatch for NPU: restore HEAD's HF broadcast form
-# (_hc_post_eager) for regression bisecting / HF parity debugging. The default
-# NPU numerics are deliberately the matmul form (_hc_post_eager_matmul, run81
-# anchor; approved 1.9e-4 loss deviation from the broadcast form) -- without
-# this switch no env combination reproduces HEAD bit-for-bit on NPU. Costs
-# ~14 s/step at the 30B shape (materializes the [B, S, H, H, D] intermediate);
-# never set it for production runs.
-_HC_POST_EAGER_BROADCAST = os.getenv("XTUNER_GLM53_HC_POST_EAGER_BROADCAST", "0") == "1"
+# Debug-only parity escape for NPU: XTUNER_HC_POST_FUSED=0 restores HEAD's HF
+# broadcast form (_hc_post_eager) for regression bisecting / HF parity debugging. The
+# default NPU numerics are deliberately the matmul form (_hc_post_eager_matmul, run81
+# anchor; approved 1.9e-4 loss deviation from the broadcast form) -- without this
+# switch no env combination reproduces HEAD bit-for-bit on NPU. The broadcast form
+# costs ~14 s/step at the 30B shape (materializes the [B, S, H, H, D] intermediate);
+# never set 0 for production runs. The flag is defined in xtuner.v1.ops.mhc_fused and
+# imported above.
 
 
 class MHCConfig(BaseModel):
@@ -210,8 +219,8 @@ def hc_pre(
     # materialises the [T, H*D] fp32 normed copy -- plus the on-chip split-Sinkhorn (the
     # eager chain issues ~5 tiny kernels per Sinkhorn iteration, ~700K instances/step).
     # Both ops fall back internally (``None`` return / device+hc_mult gate) and the eager
-    # chain below is the CPU reference; the readout stays eager unless
-    # XTUNER_GLM53_HC_COLLAPSE_FUSED=1 (as run81).
+    # chain below is the CPU reference; the readout is the fused triton collapse by
+    # default (as run81), with XTUNER_HC_COLLAPSE_FUSED=0 falling back to eager.
     fused_mixes = None
     if _mhc_norm_linear is not None and x_flat.device.type == "npu":
         fused_mixes = _mhc_norm_linear(x_flat.reshape(-1, x_flat.size(-1)), hc_fn.to(dtype), norm_eps)
@@ -226,19 +235,14 @@ def hc_pre(
         )
         mixes = torch.nn.functional.linear(flat_normed, hc_fn.to(dtype)).float()
 
-    if (
-        _hc_split_sinkhorn_fused is not None
-        and not _MHC_SINKHORN_EAGER
-        and hc_mult == 4
-        and x_flat.device.type == "npu"
-    ):
+    if _hc_split_sinkhorn_fused is not None and _MHC_SINKHORN_FUSED and hc_mult == 4 and x_flat.device.type == "npu":
         pre, post, comb = _hc_split_sinkhorn_fused(mixes, hc_scale, hc_base, hc_mult, iters, eps)
     else:
         pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps)
 
     # Weighted reduce over the hc_mult axis: y[..., d] = sum_h pre[..., h] * x[..., h, d].
-    # Env-gated fused triton path (XTUNER_GLM53_HC_COLLAPSE_FUSED=1); its eager fallback is
-    # the same expression, so the default-off behavior below is unchanged.
+    # Fused triton path by default (XTUNER_HC_COLLAPSE_FUSED=1); its eager fallback is
+    # the same expression, so the =0 fallback is numerically identical to HEAD.
     if _hc_collapse is not None:
         y = _hc_collapse(pre, x_flat.view(shape))
     else:
@@ -289,13 +293,13 @@ def hc_post(x: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
         # report ``is_cuda == True``, which would route Ascend onto the CUDA-only Triton
         # kernel below and die in BiShengIR (UB overflow compiling _hc_post_bwd_dred_kernel
         # on 910C), so the NPU dispatch must return before the CUDA gate is evaluated.
-        if _HC_POST_EAGER_BROADCAST:
+        if not _HC_POST_FUSED:
             # Parity escape hatch (see the module-level env note): HEAD's HF broadcast
             # form, slow but bit-comparable against non-NPU reference runs.
             return _hc_post_eager(x, residual, post, comb)
-        # Env-gated fused triton combine (XTUNER_GLM53_HC_COMBINE_FUSED=1, net device-time
-        # win); its eager fallback is the matmul form in xtuner.v1.ops.mhc_fused, so
-        # the default-off behavior is unchanged.
+        # Fused triton combine by default (XTUNER_HC_COMBINE_FUSED=1, net device-time
+        # win); XTUNER_HC_COMBINE_FUSED=0 falls back to the matmul form in
+        # xtuner.v1.ops.mhc_fused.
         if _hc_combine is not None:
             return _hc_combine(post, comb, x, residual)
         if _hc_post_eager_matmul is not None:

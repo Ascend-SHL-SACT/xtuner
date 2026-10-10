@@ -64,13 +64,14 @@ must be contiguous.
 Environment switches (eager fallbacks always available; the decoder layer wires
 them):
 
-- ``XTUNER_GLM53_MHC_FUSED`` (default on): :func:`mhc_norm_linear`.
-- ``XTUNER_GLM53_MHC_SINKHORN_EAGER=1``: escapes the fused sinkhorn (the op
-  itself is ungated, mirroring MindSpeed-MM).
-- ``XTUNER_GLM53_HC_COMBINE_FUSED`` / ``XTUNER_GLM53_HC_COLLAPSE_FUSED``
-  (default off): :func:`hc_combine` / :func:`hc_collapse`.
-- ``XTUNER_GLM53_HC_POST_EAGER_BROADCAST=1``: escapes the default matmul-form
-  ``hc_post`` back to HEAD's broadcast form.
+- ``XTUNER_MHC_NORM_LINEAR_FUSED`` (default 1; ``0`` = eager rms_norm + F.linear
+  chain): :func:`mhc_norm_linear`.
+- ``XTUNER_MHC_SINKHORN_FUSED`` (default 1; ``0`` = eager split-sinkhorn chain).
+- ``XTUNER_HC_COMBINE_FUSED`` / ``XTUNER_HC_COLLAPSE_FUSED`` (default 1; ``0`` = the
+  matmul-form / eager-sum fallbacks): :func:`hc_combine` / :func:`hc_collapse`.
+- ``XTUNER_HC_POST_FUSED`` (default 1; ``0`` = HEAD's broadcast-multiply ``hc_post``,
+  ~14 s/step slower at the 30B shape): the default is the matmul formulation, and the
+  triton combine kernel sits on top of it (see :func:`hc_combine`).
 
 Persistent-grid contract: the norm-linear and combine/collapse kernels run a
 persistent grid of at most ``_MAX_PROGS`` programs -- the aiv physical block
@@ -108,19 +109,30 @@ except ImportError:  # pragma: no cover - CPU-only environments
 __all__ = [
     "HC_COLLAPSE_FUSED",
     "HC_COMBINE_FUSED",
-    "MHC_FUSED_NORM_LINEAR",
+    "HC_POST_FUSED",
+    "MHC_NORM_LINEAR_FUSED",
+    "MHC_SINKHORN_FUSED",
     "hc_collapse",
     "hc_combine",
     "hc_split_sinkhorn_fused",
     "mhc_norm_linear",
 ]
 
-# Env gates read once at import; set XTUNER_GLM53_MHC_FUSED=0 to restore the
-# eager rms_norm + F.linear chain, XTUNER_GLM53_HC_COMBINE_FUSED=1 /
-# XTUNER_GLM53_HC_COLLAPSE_FUSED=1 to enable the two stream kernels.
-MHC_FUSED_NORM_LINEAR = os.environ.get("XTUNER_GLM53_MHC_FUSED", "1") not in ("0", "off", "false")
-HC_COMBINE_FUSED = os.environ.get("XTUNER_GLM53_HC_COMBINE_FUSED", "0") == "1"
-HC_COLLAPSE_FUSED = os.environ.get("XTUNER_GLM53_HC_COLLAPSE_FUSED", "0") == "1"
+# All five mHC env gates are defined here, read once at import, and share one
+# contract: value ``0`` selects that layer's eager/HEAD-reference fallback, any other
+# value (including unset) keeps the fused path -- the all-fused configuration is the
+# run81 128K anchor and the production default, and setting all five to ``0``
+# restores the complete HEAD numerics. The decoder layer
+# (xtuner.v1.module.decoder_layer.mhc) imports the flags and wires them into its
+# dispatch conditions. Note ``XTUNER_HC_POST_FUSED`` refers to the *formulation-level*
+# fusion (batched matmul vs HEAD's broadcast-multiply + reduce-sum chain, ~16x less
+# traffic); the triton combine kernel on top of it is gated separately by
+# ``XTUNER_HC_COMBINE_FUSED``.
+MHC_NORM_LINEAR_FUSED = os.environ.get("XTUNER_MHC_NORM_LINEAR_FUSED", "1") != "0"
+MHC_SINKHORN_FUSED = os.environ.get("XTUNER_MHC_SINKHORN_FUSED", "1") != "0"
+HC_COMBINE_FUSED = os.environ.get("XTUNER_HC_COMBINE_FUSED", "1") != "0"
+HC_COLLAPSE_FUSED = os.environ.get("XTUNER_HC_COLLAPSE_FUSED", "1") != "0"
+HC_POST_FUSED = os.environ.get("XTUNER_HC_POST_FUSED", "1") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +467,7 @@ def mhc_norm_linear(x2d: Tensor, w: Tensor, eps: float) -> Tensor | None:
         fused path cannot serve the request (caller falls back to the eager
         chain).
     """
-    if not (MHC_FUSED_NORM_LINEAR and _mhc_servable(x2d, w)):
+    if not (MHC_NORM_LINEAR_FUSED and _mhc_servable(x2d, w)):
         return None
     return _MhcNormLinearFn.apply(x2d, w, eps)
 
@@ -903,8 +915,8 @@ def _hc_split_sinkhorn_backward_kernel_part2(
 
 
 def _padded_comb_buffer(rows: int, hc_mult: int, block_align: int, ref: Tensor, fill: float, slot: str) -> Tensor:
-    """Return a cached ``[rows, hc_mult, block_align]`` buffer with pad columns
-    pre-filled with ``fill``.
+    """Return a cached ``[rows, hc_mult, block_align]`` buffer with pad
+    columns pre-filled with ``fill``.
 
     The caller rewrites only the leading ``hc_mult`` columns (slice copy), so
     the pad columns keep their fill value forever and the per-call ``F.pad``
@@ -957,7 +969,7 @@ def _comb_scratch_buffer(shape: tuple[int, ...], ref: Tensor) -> Tensor:
 
 
 class SinkhornFunction(torch.autograd.Function):
-    """MHC split + Sinkhorn projection as two fused triton kernels."""
+    """mHC split + Sinkhorn projection as two fused triton kernels."""
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -1662,8 +1674,7 @@ def _probe_max_progs(device: torch.device) -> int:
 
 
 def _resolve_max_progs(device: torch.device) -> None:
-    """Lazily fill ``_TRITON_MAX_PROGS[0]`` from the one-shot NaN-sentinel
-    probe."""
+    """Lazily fill ``_TRITON_MAX_PROGS[0]`` from the one-shot NaN-sentinel probe."""
     if _TRITON_MAX_PROGS[0] is None:
         try:
             _TRITON_MAX_PROGS[0] = _probe_max_progs(device)
@@ -1880,8 +1891,7 @@ def hc_combine(
 
 
 def hc_collapse(pre: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
-    """Collapse streams into the sublayer input ``collapsed = Σₖ preₖ ·
-    streamₖ``.
+    """Collapse streams into the sublayer input ``collapsed = Σₖ preₖ · streamₖ``.
 
     Args:
         pre (torch.Tensor): Collapse weights ``[B, S, H]`` (fp32 mHC mixes).
