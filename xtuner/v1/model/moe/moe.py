@@ -4,6 +4,7 @@ import os
 import types
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Callable, Literal, Self, Sequence, TypedDict, cast
+from weakref import WeakKeyDictionary
 
 import torch
 import torch.distributed as dist
@@ -232,6 +233,50 @@ def nonpad_index_and_count(seq_ctx_list: list[SequenceContext]) -> tuple[torch.T
     non_pad_token = offset - num_padding_total
     nonpad_indices = torch.cat(nonpad_parts) if len(nonpad_parts) > 1 else nonpad_parts[0]
     return nonpad_indices, non_pad_token
+
+
+# Sub-meshes derived in ``scale_and_reduce_grad`` are deterministic per (parent mesh,
+# replicate-dim names), but ``DeviceMesh.__getitem__``/``_flatten`` rebuild them from
+# scratch on every call (pure host-side work on torch 2.9.1; measured 1128
+# rebuilds/step at 30B/16-NPU). Cache the derived meshes instead.
+# XTUNER_MOE_FLAT_MESH_CACHE=0 restores the per-call rebuild.
+#
+# Lifetime note: entries are process-lifetime in practice, NOT garbage-collected with
+# the parent -- deriving a sub-mesh strongly pins the parent in torch's global mesh
+# registry (``_MeshResources.child_to_root_mapping``), so the weak key only covers the
+# never-derived parent. The cache is bounded by the small number of distinct
+# (parent mesh, replicate-dims) pairs, and it assumes the world process group is not
+# destroyed and re-created within the process: a re-created world whose new mesh
+# compares value-equal to an old one would hit a stale entry holding a dead group.
+_FLAT_REPLICATE_MESH_CACHE: WeakKeyDictionary[DeviceMesh, dict[tuple[str, ...], DeviceMesh]] = WeakKeyDictionary()
+_MOE_FLAT_MESH_CACHE = os.environ.get("XTUNER_MOE_FLAT_MESH_CACHE", "1") == "1"
+
+
+def _flat_replicate_mesh(mesh: DeviceMesh, replicate_dim_names: tuple[str, ...]) -> DeviceMesh:
+    # Lock-free get->create->insert: benign under the GIL (worst case an equivalent entry
+    # is derived twice). The only caller runs on the main training thread.
+    per_mesh = _FLAT_REPLICATE_MESH_CACHE.get(mesh)
+    if per_mesh is None:
+        per_mesh = {}
+        _FLAT_REPLICATE_MESH_CACHE[mesh] = per_mesh
+    flat_mesh = per_mesh.get(replicate_dim_names)
+    if flat_mesh is not None:
+        return flat_mesh
+    # `DeviceMesh.get_group()` only supports a single mesh dimension, so calling it
+    # directly on a multi-dim sub-mesh raises RuntimeError. `_flatten()` collapses all
+    # Replicate dims into a 1D mesh whose process group covers every rank across those
+    # dimensions, allowing a single all_reduce regardless of how many Replicate dims
+    # exist.
+    if len(replicate_dim_names) > 1:
+        flat_mesh = mesh[replicate_dim_names]._flatten()
+    else:
+        # In the case that only one replicate dim, in pt2.8 _flatten is worked due to a bug.
+        # in pt2.9.1 this bug is fixed and _flatten will raise error when the mesh is already 1D,
+        # which means replicate_dim_names represents an existing single mesh dimension
+        # so we directly get the submesh without flatten in this case.
+        flat_mesh = mesh[replicate_dim_names[0]]
+    per_mesh[replicate_dim_names] = flat_mesh
+    return flat_mesh
 
 
 class MoE(BaseModel):
@@ -1723,12 +1768,12 @@ class MoE(BaseModel):
             if not replicate_dim_names:
                 continue
 
-            # `DeviceMesh.get_group()` only supports a single mesh dimension,
-            # so calling it directly on a multi-dim sub-mesh raises RuntimeError.
-            # `_flatten()` collapses all Replicate dims into a 1D mesh whose
-            # process group covers every rank across those dimensions, allowing
-            # a single all_reduce regardless of how many Replicate dims exist.
-            if len(replicate_dim_names) > 1:
+            # `_flat_replicate_mesh` (cache hit) or the torch sub-mesh builders below
+            # collapse all Replicate dims into a 1D mesh whose process group covers
+            # every rank across those dimensions, so one all_reduce suffices.
+            if _MOE_FLAT_MESH_CACHE:
+                flat_mesh = _flat_replicate_mesh(param.device_mesh, replicate_dim_names)
+            elif len(replicate_dim_names) > 1:
                 flat_mesh = param.device_mesh[replicate_dim_names]._flatten()
             else:
                 # In the case that only one replicate dim, in pt2.8 _flatten is worked due to a bug.
