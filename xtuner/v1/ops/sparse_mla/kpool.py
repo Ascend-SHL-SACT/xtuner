@@ -35,8 +35,8 @@ token id in this module is global. Concretely that splits the work in two:
   :meth:`SequenceContext.packed_causal_query_ranges`.
 """
 
-import math
-from typing import Literal
+import os
+import weakref
 
 import torch
 from torch import Tensor
@@ -44,8 +44,23 @@ from torch import Tensor
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.ops.comm import gather_for_sequence_parallel
 
-from .sequence_parallel_indexer import get_indexer_sp_partition, redistribute_indexer_queries
 from .tilelang import tilelang_indexer_topk_from_ranges
+
+
+# ``pool_index`` is a pure function of the packed-sequence lengths, so it is rebuilt once per
+# (context, pool size) instead of once per indexer call -- at 128K that skips the per-call
+# layout/scatter chain (~10 device ops) and the host-side pool-count sum over every document,
+# ~253k generator frames per training step on the live path (``build_pools`` calls this on
+# every indexer invocation). Keyed weakly by the SequenceContext so entries die with the
+# micro-batch. The cached tensor is shared read-only; ``build_pools`` returns a fresh
+# ``.to(torch.int32)`` copy to its callers, so in-place edits of that copy cannot corrupt it.
+_POOL_INDEX_CACHE: weakref.WeakKeyDictionary[SequenceContext, dict[tuple[int, int, torch.device], Tensor]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _pool_index_cache_on() -> bool:
+    return os.environ.get("XTUNER_SPARSE_MLA_POOL_INDEX_CACHE", "1") == "1"
 
 
 def kpool_output_width(index_topk: int, index_kpool: int, alignment: int) -> int:
@@ -108,6 +123,26 @@ def build_pool_index(seq_ctx: SequenceContext, seq_len: int, index_kpool: int, d
             the global token id at that slot, or ``-1`` if the pool is incomplete there (its
             document ended before filling the pool).
     """
+    cache: dict[tuple[int, int, torch.device], Tensor] | None = None
+    key: tuple[int, int, torch.device] | None = None
+    if _pool_index_cache_on():
+        # ``pool_index`` is a pure function of the packed-sequence lengths, so with the
+        # cache lever on (default) it is reused once per (context, pool size, device)
+        # instead of rebuilt on every indexer call -- at 128K that skips the per-call
+        # layout/scatter chain (~10 device ops) and the host-side pool-count sum over
+        # every document, ~253k generator frames per training step on the live path. The
+        # cached tensor is shared read-only; ``build_pools`` returns a fresh
+        # ``.to(torch.int32)`` copy to its callers, so in-place edits of that copy cannot
+        # corrupt it. Entries die with the micro-batch via the weak key.
+        cache = _POOL_INDEX_CACHE.get(seq_ctx)
+        if cache is None:
+            cache = {}
+            _POOL_INDEX_CACHE[seq_ctx] = cache
+        key = (index_kpool, seq_len, torch.device(device))
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+
     cu = seq_ctx.cu_seq_lens_q_on(device)
     num_pools_per_doc, doc_pool_start = _doc_pool_layout(cu, index_kpool)
     # start=0: pools always cover the whole sequence, never a shard (see build_pools).
@@ -124,6 +159,8 @@ def build_pool_index(seq_ctx: SequenceContext, seq_len: int, index_kpool: int, d
     num_pools = sum(-(-int(cu_host[i + 1] - cu_host[i]) // index_kpool) for i in range(len(cu_host) - 1))
     pool_index = torch.full((num_pools, index_kpool), -1, device=device, dtype=torch.int64)
     pool_index[pool_id, slot] = token_ids
+    if cache is not None and key is not None:
+        cache[key] = pool_index
     return pool_index
 
 
@@ -247,7 +284,6 @@ def _visible_tail_tokens(seq_ctx: SequenceContext, query_len: int, index_kpool: 
     return tail_ids.masked_fill(~tail_valid, -1).to(torch.int32)
 
 
-@torch.compile
 @torch.no_grad()
 def expand_pools_and_tail(
     selected_pool_ids: Tensor,
@@ -279,9 +315,7 @@ def expand_pools_and_tail(
     width = kpool_output_width(index_topk, index_kpool, alignment)
     out = selected_pool_ids.new_full((seq_len, width), -1, dtype=torch.int32)
 
-    # Top-k order is not semantic, but changes the sparse attention reduction order.
-    # Canonicalize pools before expansion so identical selections agree across SP sizes.
-    selected = selected_pool_ids.squeeze(1).sort(dim=-1).values.to(torch.int64)
+    selected = selected_pool_ids.squeeze(1).to(torch.int64)  # [S, index_topk // index_kpool]
     valid_sel = selected >= 0
     safe_sel = selected.clamp(min=0)
     expanded = pool_index[safe_sel].masked_fill(~valid_sel.unsqueeze(-1), -1)  # [S, select_k, kpool]
@@ -310,14 +344,9 @@ def kpool_topk_indices(
     always_select_tail: bool = True,
     alignment: int = 512,
     query_chunk_size: int | None = None,
-    scorer: Literal["original", "cooperative"] = "original",
-    balance_sp: bool = False,
-    sp_full_pool_work_ratio: float = 0.5,
 ) -> Tensor:
-    """Build pools (A), score/select pools (B), expand to token ids + tail (C).
-
-    ``scorer="original"`` retains TileLang + torch.topk. ``"cooperative"`` uses
-    the SM90 BF16 producer kernel + DeepSelect with reusable query-chunk scratch.
+    """Production KPool indexer top-k: build pools (A), score+top-k over pools by reusing the
+    existing DSA indexer kernel unmodified (B), expand back to token ids + tail (C).
 
     Args:
         q (Tensor): Index query, shape ``[1, S, index_n_heads, index_head_dim]``, bf16.
@@ -331,19 +360,14 @@ def kpool_topk_indices(
         seq_ctx (SequenceContext): Packed-sequence and SP metadata.
         index_head_dim (int): Indexer head dimension (scaling only; kernel infers dims from q/k).
         index_topk (int): Semantic token budget (e.g. 2048); must be divisible by ``index_kpool``.
+        index_kpool (int): Pool size.
         always_select_tail (bool): Whether to append the incomplete trailing pool.
         alignment (int): Output width alignment (FlashMLA: 512; TileLang: 64).
-        balance_sp (bool): Redistribute query scoring work with neighbor P2P, then
-            restore attention ownership before token expansion and tail selection.
-        sp_full_pool_work_ratio (float): Fixed per-query selection/launch estimate
-            relative to the full pool width. Must be finite and nonnegative.
 
     Returns:
         Tensor: ``[S, 1, kpool_output_width(index_topk, index_kpool, alignment)]`` int32.
     """
     assert index_topk % index_kpool == 0
-    if not math.isfinite(sp_full_pool_work_ratio) or sp_full_pool_work_ratio < 0:
-        raise ValueError("sp_full_pool_work_ratio must be finite and nonnegative")
     # SP: queries stay sharded; the key side gathers *before* pooling, because a pool can
     # straddle the shard seam (see build_pools). This costs 2 x [S, index_head_dim] per layer
     # instead of the [P, index_head_dim] a post-pooling gather would move -- the price of
@@ -354,63 +378,22 @@ def kpool_topk_indices(
 
     pool_key, pool_index, _ = build_pools(k, gate_scores, kpool_ape, seq_ctx, index_kpool=index_kpool)
 
+    starts, ends = pool_causal_ranges(seq_ctx, pool_index, q.shape[1], q.device)
+
     q_local = q.squeeze(0).contiguous()
     index_n_heads = q_local.shape[1]
     scaled_weights = (weights.squeeze(0) * (index_n_heads**-0.5) * (index_head_dim**-0.5)).contiguous()
-    # Account for fixed selection/launch overhead so short-prefix queries do not
-    # take an oversized shard. This tunable estimate is borrowed from the original
-    # dense selector; DeepSelect uses causal ends and need not scan the full width.
-    # A global-width estimate conservatively limits movement for packed short docs.
-    query_alignment = 4 if scorer == "cooperative" else (128 // index_n_heads if 128 % index_n_heads == 0 else 1)
-    partition = None
-    if balance_sp:
-        partition = get_indexer_sp_partition(
-            seq_ctx,
-            index_kpool,
-            query_alignment,
-            round(pool_key.shape[0] * sp_full_pool_work_ratio),
-            query_len=q_local.shape[0],
-        )
-    query_ctx = seq_ctx
-    if partition is not None:
-        assert sp_mesh is not None
-        q_local, scaled_weights = redistribute_indexer_queries(
-            (q_local, scaled_weights), partition.attention, partition.indexer, sp_mesh
-        )
-        query_ctx = seq_ctx.copy(shard_start=partition.indexer[sp_mesh.get_local_rank()], shard_size=q_local.shape[0])
 
     select_k = index_topk // index_kpool
-    if scorer == "cooperative":
-        from .cooperative_kpool import cooperative_kpool_topk
-
-        selected_pool_ids = cooperative_kpool_topk(
-            q_local,
-            pool_key.contiguous(),
-            scaled_weights,
-            query_ctx.cu_seq_lens_q,
-            query_ctx.shard_start,
-            index_kpool,
-            select_k,
-            1024 if query_chunk_size is None else query_chunk_size,
-        )
-    elif scorer == "original":
-        starts, ends = pool_causal_ranges(query_ctx, pool_index, q_local.shape[0], q.device)
-        selected_pool_ids = tilelang_indexer_topk_from_ranges(
-            q_local,
-            pool_key.contiguous(),
-            scaled_weights,
-            starts,
-            ends,
-            select_k,
-            query_chunk_size=query_chunk_size,
-        )
-    else:
-        raise ValueError(f"Unsupported KPool scorer: {scorer}")
-    if partition is not None:
-        assert sp_mesh is not None
-        (selected_pool_ids,) = redistribute_indexer_queries(
-            (selected_pool_ids,), partition.indexer, partition.attention, sp_mesh
-        )
+    selected_pool_ids = tilelang_indexer_topk_from_ranges(
+        q_local,
+        pool_key.contiguous(),
+        scaled_weights,
+        starts,
+        ends,
+        select_k,
+        query_chunk_size=query_chunk_size,
+    )
 
     return expand_pools_and_tail(
         selected_pool_ids,
@@ -438,8 +421,6 @@ def torch_kpool_topk_indices(
     always_select_tail: bool = True,
     alignment: int = 512,
     query_chunk_size: int | None = None,
-    balance_sp: bool = False,
-    sp_full_pool_work_ratio: float = 0.5,
 ) -> Tensor:
     """Reference-only KPool top-k (correctness anchor for tests / small shapes
     / CPU).
@@ -452,8 +433,7 @@ def torch_kpool_topk_indices(
     reached through the same protocol) and ignored: this path exists to be obviously correct,
     and bounding its memory is what the production path is for.
     """
-    # Keep the reference's uniform query ownership as an independent anchor.
-    del query_chunk_size, balance_sp, sp_full_pool_work_ratio
+    del query_chunk_size
     assert index_topk % index_kpool == 0
     sp_mesh = seq_ctx.sequence_parallel_mesh
     k = gather_for_sequence_parallel(k.squeeze(0), dim=0, sp_mesh=sp_mesh)
