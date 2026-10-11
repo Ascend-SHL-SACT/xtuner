@@ -43,6 +43,7 @@ from xtuner.v1.utils.init_weight import init_params
 # topk-index buffer width must match what that backend's kernel expects.
 _SPARSE_MLA_ALIGNMENT: dict[str, int] = {
     "torch": 1,
+    "torch_npu": 1,
     "flash_mla_cudnn": 512,
     "tilelang": 64,
 }
@@ -150,7 +151,7 @@ class NoPEDSAMLAConfig(MLAConfig):
     # Production default: FlashMLA fwd (native 512 head_dim) + cuDNN bwd (no dim hardcoding) --
     # equivalent to Automodel's cudnn_sparse_attention; doesn't need the TileLang tail_dim=0 fix
     # (design doc 3.5.2). "tilelang" needs that kernel fix and is not implemented yet (F5.b).
-    sparse_mla_backend: Literal["torch", "flash_mla_cudnn", "tilelang"] = "flash_mla_cudnn"
+    sparse_mla_backend: Literal["torch", "flash_mla_cudnn", "tilelang", "torch_npu"] = "flash_mla_cudnn"
     # Independent of `sparse_mla_backend` above, which is `flash_mla_cudnn` here and is not
     # even a valid indexer backend -- inheriting it would never have worked.
     indexer_backend: KPoolIndexerBackend = "tilelang"
@@ -299,7 +300,16 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
         else:
             topk_ids = self.indexer(hidden_states, q_resid, seq_ctx)
 
-        out = self.sparse_mla_func(query_states, key_states, topk_ids, self.softmax_scale, value_dim=self.kv_lora_rank)
+        if self.sparse_mla_backend != "torch_npu":
+            out = self.sparse_mla_func(
+                query_states, key_states, topk_ids, self.softmax_scale, value_dim=self.kv_lora_rank
+            )
+        else:
+            # npu_sparse_mla consumes seq_ctx for its packed per-segment causal masking;
+            # tilelang's entry has no seq_ctx parameter, so it cannot be passed unconditionally.
+            out = self.sparse_mla_func(
+                query_states, key_states, topk_ids, self.softmax_scale, value_dim=self.kv_lora_rank, seq_ctx=seq_ctx
+            )
         raw_output = torch.einsum("shm,hdm->shd", out.raw_output, w_vc)
         raw_output = raw_output.reshape(bsz, seq_len, self.num_attention_heads * self.v_head_dim).contiguous()
         projected_output = self.o_proj(raw_output)

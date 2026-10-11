@@ -27,9 +27,12 @@ def get_sparse_mla(backend: SparseMLABackend) -> SparseMLAProtocol:
 
         return tilelang_sparse_mla
     if backend == "torch_npu":
-        from .npu_sparse_mla import npu_sparse_mla
+        # The adapter forwards rope-tailed inputs (GLM-5.2 DSA full-form and the pre-split
+        # SPLITQ tuple) to npu_sparse_mla untouched and zero-pads only NoPE full-form queries
+        # (GLM-5.3-Flash) to the kernel's 512+64 absorbed-MLA geometry.
+        from .npu_sparse_mla import npu_sfa_rope_padded
 
-        return npu_sparse_mla
+        return npu_sfa_rope_padded
     if backend == "cudnn_dsa":
         from .cudnn_dsa import cudnn_dsa_sparse_mla
 
@@ -90,6 +93,10 @@ def get_kpool_topk_indices(backend: KPoolIndexerBackend) -> KPoolTopKIndicesProt
         return torch_kpool_topk_indices
     if backend == "tilelang":
         return kpool_topk_indices
+    if backend == "torch_npu":
+        from .kpool_npu import npu_kpool_topk_indices
+
+        return npu_kpool_topk_indices
     raise ValueError(f"Unsupported KPool indexer backend: {backend}")
 
 
