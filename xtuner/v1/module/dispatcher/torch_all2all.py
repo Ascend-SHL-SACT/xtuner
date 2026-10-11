@@ -1,4 +1,5 @@
 import os
+import threading
 from typing import Literal, TypeAlias, cast
 
 import torch
@@ -30,11 +31,24 @@ if get_device() == "npu":
 DEVICE = get_device()
 logger = get_logger()
 
-# The meta a2a (per-expert token counts) is issued with async_op=True and is
-# fenced before the token-count D2Hs (see _dispatch); the contiguous launch
-# overlaps the meta wire meanwhile. Read once at import time: flipping it at
+# Kill switch for the whole async meta schedule (see _dispatch): async meta
+# a2a fenced before the token-count D2Hs, the contiguous launch overlapped
+# with the meta wire, and the two token-count D2Hs fused into one pinned
+# transfer. "0" restores the pre-#99 blocking path unchanged; flipping at
 # runtime requires a module reload.
 _META_A2A_ASYNC = os.environ.get("XTUNER_MOE_META_A2A_ASYNC", "1") == "1"
+
+
+class _PinnedSplitsBufs(threading.local):
+    def __init__(self) -> None:
+        super().__init__()
+        # Per-thread pinned staging for the fused split D2H, keyed by ep_size
+        # (row 0 input_splits, row 1 output_splits); thread-local so two
+        # concurrent dispatches never share a buffer across refills.
+        self.bufs: dict[int, torch.Tensor] = {}
+
+
+_PINNED_SPLITS_BUFS = _PinnedSplitsBufs()
 
 
 # The execution steps of Torch all to all are as follows:
@@ -129,10 +143,26 @@ def _dispatch(
     tokens_per_expert_group = tokens_per_expert_group.view(ep_size, -1)
 
     # Get number experts each group
-    input_splits = (
-        tokens_per_expert.reshape(ep_size, num_experts_per_rank).to(device=torch.device("cpu")).sum(dim=1).tolist()
-    )
-    output_splits = tokens_per_expert_group.to(device=torch.device("cpu")).sum(dim=-1).tolist()
+    if _META_A2A_ASYNC and hidden_states.device.type != "cpu":
+        # Fuse the two split D2Hs into one: sum on-device (exact for
+        # integers), pack into the pinned buffer and fence with a single
+        # stream sync -- the meta-wire park is paid once, not twice. Sums
+        # read only histc/a2a-recv outputs after meta_work.wait(), so the
+        # fence contract above is untouched.
+        bufs = _PINNED_SPLITS_BUFS.bufs
+        if ep_size not in bufs:
+            bufs[ep_size] = torch.empty((2, ep_size), dtype=torch.int64, pin_memory=True)
+        packed_splits = bufs[ep_size]
+        packed_splits[0].copy_(tokens_per_expert.reshape(ep_size, num_experts_per_rank).sum(dim=1), non_blocking=True)
+        packed_splits[1].copy_(tokens_per_expert_group.sum(dim=-1), non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+        input_splits = packed_splits[0].tolist()
+        output_splits = packed_splits[1].tolist()
+    else:
+        input_splits = (
+            tokens_per_expert.reshape(ep_size, num_experts_per_rank).to(device=torch.device("cpu")).sum(dim=1).tolist()
+        )
+        output_splits = tokens_per_expert_group.to(device=torch.device("cpu")).sum(dim=-1).tolist()
 
     hidden_states = hidden_states.contiguous()
 
