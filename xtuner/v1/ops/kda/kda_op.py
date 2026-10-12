@@ -384,6 +384,19 @@ _SEG_COPY_MIN_ROW_ELEMS = 256
 _SEG_COPY_GATHER_ROWS = 1024
 _SEG_COPY_D_BLOCK = 256
 _SEG_COPY_ROWS = 64
+# Byte budget for one compiled tile of the seg-copy/gather kernels: BiShengIR's
+# ConvertLinalgRToBinary fails deterministically whenever a single [ROWS, W]
+# tile exceeds 32768 bytes, independent of dtype, SP geometry or triton flags
+# (0924-box 910_9392 sweep: 32768 B tiles compile and copy bit-exact at
+# [128,128] bf16 / [512,32] bf16 / [2,8192] bf16 / [1024,8] fp32; 65536 B
+# tiles fail at [4,8192] bf16 / [1024,16] fp32). The wide kernel's
+# _SEG_COPY_ROWS x _SEG_COPY_D_BLOCK x 2 B tile sits exactly on the budget,
+# and the gather kernel's fixed 1024-row block only fits bf16 rows up to
+# W=16 -- SP64 shards q/k/v/gate to W=128, whose [1024,128] bf16 tile is
+# 256 KB and aborted every rank of the 320B SP64 job at the first q repack.
+# The dispatches below therefore derive ROWS from this budget instead of
+# assuming the constants fit.
+_SEG_COPY_TILE_BYTES = 32768
 # Persistent-grid cap for the segment-copy kernels. Under
 # TRITON_ALL_BLOCKS_PARALLEL=1 the ascend backend clamps every launch's
 # blockNum to the physical block count (launcher C template; measured on
@@ -505,12 +518,18 @@ def _repack_padded(
     sentinel row, so no ``F.pad`` runs and the CANN ``index_select`` engine --
     which stalls on that repeated sentinel filling ~26% of a training pack's
     rows (run128 profile: ~1.5 ms per launch, 1.67 s/step) -- is out of the
-    loop. Non-pow2 row widths keep the monotone ``F.pad + index_select``
-    gather. All paths reproduce the zero-padded rebuild bit-for-bit.
+    loop. Tile row counts derive from the 32768-byte BiShengIR tile budget
+    (``_SEG_COPY_TILE_BYTES``); row widths the budget cannot afford (and
+    non-pow2 widths) keep the monotone ``F.pad + index_select`` gather. All
+    paths reproduce the zero-padded rebuild bit-for-bit.
     """
     row_elems = tensor.numel() // tensor.shape[1]
+    row_bytes = row_elems * tensor.element_size()
     wide = tensor.dim() in (3, 4) and row_elems >= _SEG_COPY_MIN_ROW_ELEMS and row_elems % _SEG_COPY_D_BLOCK == 0
     if wide:
+        # bf16 keeps the tuned 64-row tile (exactly on the byte budget); wider
+        # dtypes shrink the row block so the compiled tile stays inside it.
+        rows = min(_SEG_COPY_ROWS, _SEG_COPY_TILE_BYTES // (_SEG_COPY_D_BLOCK * tensor.element_size()))
         nseg = cu_t.shape[0] - 1
         src = tensor.reshape(tensor.shape[1], row_elems)
         dst = torch.empty((n_padded, row_elems), dtype=tensor.dtype, device=tensor.device)
@@ -525,18 +544,22 @@ def _repack_padded(
             nseg,
             D=row_elems,
             D_BLOCK=_SEG_COPY_D_BLOCK,
-            ROWS=_SEG_COPY_ROWS,
+            ROWS=rows,
             num_warps=4,
         )
         return dst.reshape((1, n_padded, *tensor.shape[2:]))
-    if tensor.dim() in (3, 4) and (row_elems & (row_elems - 1)) == 0:
+    if tensor.dim() in (3, 4) and (row_elems & (row_elems - 1)) == 0 and row_bytes <= _SEG_COPY_TILE_BYTES:
         # Narrow rows: flat row gather over the cached pad_to_pack table; the
         # pow2 row-width guard keeps the W arange legal (non-pow2 rows fall
-        # through to the monotone gather below).
+        # through to the monotone gather below). ROWS shrinks with the row
+        # width so the [ROWS, W] tile stays inside the byte budget -- rows a
+        # compile-time tile cannot afford (row_bytes > budget) fall through
+        # to the monotone gather below instead of failing BiShengIR.
+        gather_rows = min(_SEG_COPY_GATHER_ROWS, _SEG_COPY_TILE_BYTES // row_bytes)
         n_tokens = tensor.shape[1]
         src = tensor.reshape(n_tokens, row_elems)
         packed = torch.empty((1, n_padded, row_elems), dtype=tensor.dtype, device=tensor.device)
-        grid = (min(triton.cdiv(n_padded, _SEG_COPY_GATHER_ROWS), _SEG_COPY_MAX_PROGS),)
+        grid = (min(triton.cdiv(n_padded, gather_rows), _SEG_COPY_MAX_PROGS),)
         _seg_copy_rows_gather_kernel[grid](
             src,
             packed,
@@ -544,7 +567,7 @@ def _repack_padded(
             n_tokens,
             n_padded,
             W=row_elems,
-            ROWS=_SEG_COPY_GATHER_ROWS,
+            ROWS=gather_rows,
             num_warps=4,
         )
         packed = packed.reshape((1, n_padded, *tensor.shape[2:]))
