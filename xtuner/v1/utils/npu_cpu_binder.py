@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -626,12 +627,153 @@ def load_custom_bind(data: Dict) -> List[CustomBind]:
     return binders
 
 
+MAIN_BIND_NAME = "xtuner.v1.train.cli.sft"
+AUX_BIND_NAMES = ("acl_thread", "release_thread", "hccp_connect")
+MAIN_CORE_COUNT = 8
+HOST_BUSY_SAMPLE_S = 0.1
+HOST_BUSY_MIN_RATIO = 0.5
+
+
+def parse_node_escape() -> Dict[int, int]:
+    """Parse XTUNER_BIND_NODE_ESCAPE ("rank:node,rank:node") into rank -> target node.
+
+    The rank key is the LOCAL rank within one 16-rank box, matching the key used by
+    ``sitecustomize.py``; on a single-node launch this equals the global rank.
+    """
+    raw = os.environ.get("XTUNER_BIND_NODE_ESCAPE", "")
+    escape_map: Dict[int, int] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        rank_str, _, node_str = item.partition(":")
+        try:
+            rank, node = int(rank_str), int(node_str)
+        except ValueError:
+            logging.warning(f"Skip invalid XTUNER_BIND_NODE_ESCAPE entry '{item}', expected 'rank:node'.")
+            continue
+        if rank in escape_map:
+            logging.warning(
+                f"Duplicate XTUNER_BIND_NODE_ESCAPE rank={rank}: node={node} overrides node={escape_map[rank]}."
+            )
+        escape_map[rank] = node
+    return escape_map
+
+
+def _host_busy_cores(sample_s: float, min_ratio: float) -> set[int]:
+    """Sample host-wide per-core busy ratio from /proc/stat and return the loaded cores.
+
+    /proc/stat is not lxcfs-masked on this box, so it reports all 320 host cores and the
+    co-tenant load that ``binder_list`` cannot see. Escape targets must avoid co-tenant
+    hot cores, otherwise the escape re-creates the very contention it is meant to fix.
+    Returns an empty set when /proc/stat cannot be parsed.
+    """
+
+    def _read_idle() -> dict[int, tuple[int, int]]:
+        idle: dict[int, tuple[int, int]] = {}
+        with open("/proc/stat") as f:
+            for line in f:
+                if not line.startswith("cpu"):
+                    return idle
+                parts = line.split()
+                if parts[0] == "cpu":
+                    continue
+                # name user nice system idle iowait irq softirq steal guest ...
+                total = sum(int(x) for x in parts[1:])
+                idle[int(parts[0][3:])] = (total, int(parts[4]) + int(parts[5]))
+        return idle
+
+    try:
+        first = _read_idle()
+        time.sleep(sample_s)
+        second = _read_idle()
+    except (OSError, ValueError, IndexError):
+        return set()
+    busy: set[int] = set()
+    for core, (total2, idle2) in second.items():
+        total1, idle1 = first.get(core, (total2, idle2))
+        delta = total2 - total1
+        if delta > 0 and (delta - (idle2 - idle1)) / delta >= min_ratio:
+            busy.add(core)
+    return busy
+
+
+def build_escape_plans(escape_map: Dict[int, int], binder_list: List[CustomBind]) -> Dict[int, Dict[str, List[int]]]:
+    """Plan replacement cores on the escape target nodes for the escaped ranks.
+
+    Cores reserved by any binder entry (for any rank) are skipped, as are cores that
+    look busy host-wide. Within one node, 8 main cores are handed to **all** escaped
+    ranks on that node first, so no rank can exhaust the node and downgrade its peers;
+    the remaining cores then go to the auxiliary binders round-robin (aux index, then
+    rank), and aux binders that find no core left share the main cores of their own rank.
+    A rank whose main core count falls short of MAIN_CORE_COUNT is logged loudly, since a
+    constrained rank is exactly the straggler this escape exists to remove.
+    """
+    busy: set[int] = set()
+    for binder in binder_list:
+        for entry in binder.cpu_list:
+            busy.update(entry)
+    host_busy = _host_busy_cores(HOST_BUSY_SAMPLE_S, HOST_BUSY_MIN_RATIO)
+    if host_busy:
+        logging.info(f"Node-escape skips {len(host_busy)} host-busy cores (co-tenant load): {sorted(host_busy)}")
+    busy |= host_busy
+    node_ranks: Dict[int, List[int]] = {}
+    for rank in sorted(escape_map):
+        node_ranks.setdefault(escape_map[rank], []).append(rank)
+    plans: Dict[int, Dict[str, List[int]]] = {}
+    for node, ranks in sorted(node_ranks.items()):
+        try:
+            with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+                free = [c for c in expand_cpu_list(f.read().strip()) if c not in busy]
+        except (OSError, ValueError) as e:
+            logging.warning(f"Skip node-escape ranks={ranks} node={node}: cannot read node cpulist ({e}).")
+            continue
+        main_cores_by_rank: Dict[int, List[int]] = {}
+        for rank in ranks:
+            main_cores, free = free[:MAIN_CORE_COUNT], free[MAIN_CORE_COUNT:]
+            if len(main_cores) < MAIN_CORE_COUNT:
+                logging.warning(
+                    f"Node-escape rank={rank} node={node} got {len(main_cores)}/{MAIN_CORE_COUNT} main cores; "
+                    "drop this rank from XTUNER_BIND_NODE_ESCAPE or free cores on the target node."
+                )
+            if main_cores:
+                main_cores_by_rank[rank] = main_cores
+        # Hand remaining cores to the aux binders interleaved by (aux index, rank) so the
+        # leftover cores spread evenly across the escaped ranks instead of stacking onto
+        # the first rank; exhausted ranks fall back to sharing their own main cores.
+        for i, name in enumerate(AUX_BIND_NAMES):
+            for rank in ranks:
+                if rank not in main_cores_by_rank:
+                    continue
+                plan = plans.setdefault(rank, {})
+                if MAIN_BIND_NAME not in plan:
+                    plan[MAIN_BIND_NAME] = main_cores_by_rank[rank]
+                if free:
+                    plan[name] = [free.pop(0)]
+                else:
+                    mains = main_cores_by_rank[rank]
+                    plan[name] = [mains[i % len(mains)]]
+    for rank in sorted(plans):
+        plan = plans[rank]
+        logging.info(
+            f"Node-escape plan rank={rank}: main={plan[MAIN_BIND_NAME]} aux={{{', '.join(f'{n}:{c[0]}' for n, c in plan.items() if n != MAIN_BIND_NAME)}}}"
+        )
+    if escape_map and not plans:
+        logging.warning("XTUNER_BIND_NODE_ESCAPE is set but no escape plan was built; no rank will be remapped.")
+    return plans
+
+
 def run(rank_id: int, config: dict | None = None) -> None:
     loop_count = 0
     input_data = config if config is not None else DEFAULT_CPU_BIND_CONFIG
     cpu_allocer = CpuAlloc(DeviceInfo())
     current_pid = os.getpid()
     binder_list = load_custom_bind(input_data)
+    escape_plans = build_escape_plans(parse_node_escape(), binder_list)
+    # Escape keys are LOCAL ranks (sitecustomize.py key space): on a single-box launch
+    # rank_id and LOCAL_RANK coincide, and the static table below is indexed the same way.
+    my_escape = escape_plans.get(rank_id % 16)
+    escape_matched = False
     for bind in binder_list:
         loop_count += 1
         logging.info(f"Start binding core round {loop_count}: {bind.__dict__}")
@@ -644,7 +786,19 @@ def run(rank_id: int, config: dict | None = None) -> None:
                     continue
                 if len(bind.cpu_list) > 1:
                     bind.cpu_list = [bind.cpu_list[rank_id % 16]]
+                escape_cores = (my_escape or {}).get(bind.process_name)
+                if escape_cores is not None:
+                    escape_matched = True
+                    logging.info(
+                        f"Node-escape remap rank={rank_id} {bind.process_name} -> cores {escape_cores} ({len(escape_cores)}/{MAIN_CORE_COUNT if bind.process_name == MAIN_BIND_NAME else 1})"
+                    )
+                    bind.cpu_list = [list(escape_cores)]
                 bind.bind(cpu_allocer, current_pid)
         except Exception as e:
             logging.error(e)
         logging.info(f"===== Round {loop_count} of core binding has ended. =====")
+    if my_escape is not None and not escape_matched:
+        logging.warning(
+            f"Node-escape planned rank={rank_id} cores={my_escape} but no binder in the config "
+            f"matched it; XTUNER_BIND_NODE_ESCAPE did not take effect for this rank."
+        )
