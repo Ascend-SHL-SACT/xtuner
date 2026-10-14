@@ -32,7 +32,7 @@ from pydantic import Field, computed_field
 from typing_extensions import Self, override
 
 from xtuner.v1.model.base import DEFAULT_FLOAT8_CFG, HFSaveCfg, TorchCompileOption
-from xtuner.v1.model.moe.moe import MoE, MoEConfig
+from xtuner.v1.model.moe.moe import BalancingLossConfig, MoE, MoEConfig
 from xtuner.v1.module.decoder_layer.mhc import MHCConfig
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEActFnConfig
 from xtuner.v1.module.mtp import MTPConfig
@@ -174,6 +174,7 @@ class Glm53TextMoE(MoE):
                     hidden_factor=config.hidden_factor,
                     router_config=config.router,
                     router_compute_dtype=config.router_compute_dtype,
+                    router_projection_block_size=config.router_projection_block_size,
                     moe_act_fn_cfg=config.moe_act_fn_cfg,
                     dispatcher=config.dispatcher,
                     ep_mesh=self.ep_mesh,
@@ -181,8 +182,9 @@ class Glm53TextMoE(MoE):
                     ep_tp_mesh=self.ep_tp_mesh,
                 )
                 if self.config.freeze_routers:
-                    layers[str(layer_idx)].gate.requires_grad_(False)
-                    layers[str(layer_idx)].gate.eval()
+                    gate = cast(nn.Module, layers[str(layer_idx)].gate)
+                    gate.requires_grad_(False)
+                    gate.eval()
 
         layers.__class__.__repr__ = module_dict_repr  # type: ignore[method-assign]
         return layers
@@ -193,8 +195,8 @@ class Glm53TextMoE(MoE):
 
         mtp_config = config.mtp_config
         assert mtp_config is not None
-        assert mtp_config.share_weights and mtp_config.num_layers == 1, (
-            "GLM-5.3-Flash checkpoint has exactly one physical MTP layer (layers.45)."
+        assert mtp_config.share_weights and mtp_config.num_layers > 0, (
+            "GLM-5.3-Flash requires one shared physical MTP layer (layers.45) and positive logical depth."
         )
         decoder_layer = self.moe_decoder_layer_cls(
             hidden_size=config.hidden_size,
@@ -218,6 +220,7 @@ class Glm53TextMoE(MoE):
             generate_config=config.generate_config,
             router_config=config.router,
             router_compute_dtype=config.router_compute_dtype,
+            router_projection_block_size=config.router_projection_block_size,
             moe_act_fn_cfg=config.moe_act_fn_cfg,
             float8_cfg=config.float8_cfg,
             layer_idx=config.num_hidden_layers,
@@ -330,10 +333,19 @@ class Glm53TextMoEConfig(MoEConfig):
     router: NoAuxRouterConfig = NoAuxRouterConfig(
         n_group=1, topk_group=1, scoring_func="sigmoid", norm_topk_prob=True, router_scaling_factor=2.5
     )
+    # GLM-5.3 balances its MoE auxiliary-loss-free: `e_score_correction_bias` is updated after
+    # every optimizer step (`MoE.update_moe_gate_bias`). HF only adds the aux loss under
+    # `output_router_logits=True` (the checkpoint leaves it False) and AutoModel hardcodes
+    # `aux_loss_coeff=0.0`, so the base default `BalancingLossConfig()` is overridden here --
+    # otherwise SFT silently carries a 1e-3-weighted balancing loss whose softmax-over-logits
+    # formula does not even match this sigmoid router. Pass a BalancingLossConfig explicitly
+    # to opt back in.
+    balancing_loss_cfg: BalancingLossConfig | None = None
     num_nextn_predict_layers: int | None = 1
     mtp_config: MTPConfig | None = MTPConfig(num_layers=1, share_weights=True)
 
     mhc: MHCConfig = MHCConfig(hc_mult=4, hc_eps=1e-6, hc_sinkhorn_iters=20)
+    router_projection_block_size: int = Field(default=0, ge=0)
 
     # `fully_shard` upcasts every trainable parameter to an fp32 master and then casts it to
     # `MixedPrecisionPolicy.param_dtype` for the forward all-gather, so declaring a parameter
@@ -342,6 +354,10 @@ class Glm53TextMoEConfig(MoEConfig):
     # `fully_shard(ignored_params=...)`, leaving them replicated and untouched by the policy
     # (and `_get_save_dtype` then writes them back out as fp32). Needed because
     # `hc_split_sinkhorn`'s 20 iterations and KDA's `fused_kda_gate` are bf16-unstable.
+    # Convolution masters must also stay fp32 so their gradients are not rounded before
+    # replicated-parameter reduction; the convolution forward still uses the activation dtype.
+    # This shared policy also exports convolution tensors as fp32. BF16 inference loads
+    # round them to the same values used by the convolution forward during training.
     #
     # `hc_*_fn` is deliberately absent: `hc_pre` already casts it to the activation dtype, and
     # ignored parameters are replicated rather than sharded, so pinning a
@@ -356,6 +372,7 @@ class Glm53TextMoEConfig(MoEConfig):
             r"model\.language_model\.layers\.\d+\.hc_(attn|ffn)_(base|scale)",
             r"model\.language_model\.layers\.\d+\.self_attn\.A_log",
             r"model\.language_model\.layers\.\d+\.self_attn\.dt_bias",
+            r"model\.language_model\.layers\.\d+\.self_attn\.[qkv]_conv1d\.(weight|bias)",
         ],
     )
 
@@ -370,7 +387,10 @@ class Glm53TextMoEConfig(MoEConfig):
     # x11, pattern [KDA,KDA,KDA,DSA]*11 + KDA. "deepseek_sparse_attention" maps to XTuner's
     # generic "full_attention" bucket (build_layers dispatches on config.attention for it).
     glm53_layer_types: list[Literal["linear_attention", "deepseek_sparse_attention"]] = Field(
-        default_factory=lambda: (["linear_attention"] * 3 + ["deepseek_sparse_attention"]) * 11 + ["linear_attention"]
+        default_factory=lambda: cast(
+            list[Literal["linear_attention", "deepseek_sparse_attention"]],
+            (["linear_attention"] * 3 + ["deepseek_sparse_attention"]) * 11 + ["linear_attention"],
+        )
     )
 
     @property
@@ -419,6 +439,7 @@ class Glm53TextMoEConfig(MoEConfig):
                 index_n_heads=cfg.index_n_heads,
                 index_kpool=cfg.index_kpool,
                 index_kpool_always_select_tail=cfg.index_kpool_always_select_tail,
+                rms_norm_eps=cfg.rms_norm_eps,
             ),
             linear_attention=KDAConfig(
                 num_heads=cfg.linear_attn_config["num_heads"],
@@ -442,6 +463,7 @@ class Glm53TextMoEConfig(MoEConfig):
                 router_scaling_factor=cfg.routed_scaling_factor,
             ),
             mhc=MHCConfig(hc_mult=cfg.hc_mult, hc_eps=cfg.hc_eps, hc_sinkhorn_iters=cfg.hc_sinkhorn_iters),
+            balancing_loss_cfg=None,
             num_nextn_predict_layers=getattr(cfg, "num_nextn_predict_layers", None),
             mtp_config=MTPConfig(num_layers=cfg.num_nextn_predict_layers, share_weights=True)
             if getattr(cfg, "num_nextn_predict_layers", 0)
