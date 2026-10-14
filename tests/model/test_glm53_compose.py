@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch.testing._internal.common_distributed import DistributedTestBase
 
+from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model.compose.glm53 import Glm53BaseConfig, Glm53ProjectorConfig, Glm53VisionConfig
 from xtuner.v1.model.moe.glm53.glm53 import Glm53TextMoEConfig
@@ -23,7 +24,7 @@ MERGE = 2
 SEQ_LEN = 128
 
 
-def _build_model():
+def _build_model(fully_shard=False):
     text_cfg = Glm53TextMoEConfig(
         compile_cfg=False,
         vocab_size=200,
@@ -74,14 +75,14 @@ def _build_model():
         spatial_merge_size=MERGE,
         rms_norm_eps=1e-6,
         attn_impl="eager_attention",
-        fully_shard=False,
+        fully_shard=fully_shard,
     )
     proj_cfg = Glm53ProjectorConfig(
         vision_hidden_size=HIDDEN,
         out_hidden_size=HIDDEN,
         spatial_merge_size=MERGE,
         projection_intermediate_size=48,
-        fully_shard=False,
+        fully_shard=fully_shard,
     )
     compose_cfg = Glm53BaseConfig(
         compile_cfg=False, vision_config=vision_cfg, projector_config=proj_cfg, text_config=text_cfg
@@ -144,6 +145,52 @@ class TestGlm53ComposeSequenceParallel(DistributedTestBase):
         local_len = SEQ_LEN // sp_size
         expected = reference[:, rank * local_len : (rank + 1) * local_len]
         torch.testing.assert_close(sp_logits, expected, rtol=2e-2, atol=2e-2)
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+
+class TestGlm53ComposeFSDPBackward(DistributedTestBase):
+    @pytest.mark.gpu
+    def test_text_and_mixed_media_ranks_backward(self, device="cuda"):
+        # A text-only rank must join the same vision/projector FSDP collectives as a rank
+        # whose pack contains both image and video samples, including in backward.
+        self.create_pg(device)
+        torch.manual_seed(0)
+        model = _build_model(fully_shard=True)
+        model.fully_shard(FSDPConfig(ep_size=1, vision_recompute_ratio=0.0))
+        model.train()
+
+        rank = torch.distributed.get_rank()
+        input_ids = torch.randint(2, 200, (1, SEQ_LEN), device=device)
+        seq_ctx = SequenceContext.from_input_ids((input_ids,), device=device)
+        mm_type = torch.zeros(1, SEQ_LEN, dtype=torch.long, device=device)
+        if rank == 1:
+            mm_type[0, 10] = 1
+            mm_type[0, 60] = 2
+            grid = torch.tensor([[1, 2, 2]], device=device)
+            seq_ctx.pixel_values = torch.randn(4, _patch_dim(model), device=device, dtype=torch.bfloat16)
+            seq_ctx.image_grid_thw = grid
+            seq_ctx.pixel_values_videos = torch.randn(4, _patch_dim(model), device=device, dtype=torch.bfloat16)
+            seq_ctx.video_grid_thw = grid
+        seq_ctx.mm_token_type_ids = mm_type
+        data = {"seq_ctx": seq_ctx, "shifted_labels": input_ids.roll(-1, dims=1)}
+        loss_ctx = model.build_loss_ctx_batch([data], sp_mesh=None)[0]
+
+        loss = model(seq_ctx=seq_ctx, loss_ctx=loss_ctx)["loss"]
+        assert torch.isfinite(loss)
+        loss.backward()
+        model.scale_and_reduce_grad()
+        for param in (
+            model.vision_tower.patch_embed.proj.weight,
+            model.multi_modal_projector.downsample.weight,
+            model.language_model.embed_tokens.weight,
+        ):
+            assert param.grad is not None
+            local_grad = param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
+            assert torch.isfinite(local_grad).all()
+            assert local_grad.abs().sum() > 0
 
     @property
     def world_size(self) -> int:
@@ -223,6 +270,33 @@ class TestGlm53ComposeForward:
         with pytest.raises(ValueError, match="placeholder count"):
             model(seq_ctx=seq_ctx, loss_ctx=None)
 
+    @pytest.mark.parametrize("media", ["text", "image", "image_and_video"])
+    def test_every_pack_calls_the_vision_tower_exactly_once(self, media):
+        # FSDP 每次视觉塔调用都会在全体 rank 上 all-gather 参数，而 pack 含哪些模态是各 rank
+        # 自己的数据。按模态各调一次时，图+视频的 rank 调两次、其余调一次，
+        # all-gather 序号错位，下一步卡死直到 NCCL watchdog。不论内容都只调一次。
+        model = _build_model()
+        calls = []
+        handle = model.vision_tower.register_forward_hook(lambda *_: calls.append(1))
+        input_ids = torch.randint(2, 200, (1, SEQ_LEN)).cuda()
+        seq_ctx = SequenceContext.from_input_ids((input_ids,), device="cuda")
+        mm_type = torch.zeros(1, SEQ_LEN, dtype=torch.long, device="cuda")
+        grid = torch.tensor([[1, 2, 2]], device="cuda")
+        if media != "text":
+            mm_type[0, 10] = 1
+            seq_ctx.pixel_values = torch.randn(4, _patch_dim(model), device="cuda", dtype=torch.bfloat16)
+            seq_ctx.image_grid_thw = grid
+        if media == "image_and_video":
+            mm_type[0, 60] = 2
+            seq_ctx.pixel_values_videos = torch.randn(4, _patch_dim(model), device="cuda", dtype=torch.bfloat16)
+            seq_ctx.video_grid_thw = grid
+        seq_ctx.mm_token_type_ids = mm_type
+        try:
+            model(seq_ctx=seq_ctx, loss_ctx=None)
+        finally:
+            handle.remove()
+        assert len(calls) == 1
+
     def test_pack_with_an_image_sample_and_a_video_sample(self):
         # 单个样本不能混图视频（由 TokenizeFn 拦截），但一个 pack 里放一个图像样本和一个视频样本
         # 是常态。之前 compose 模型在 pack 级别拒绝，数据修好、视频真正参与训练后第 2 步就崩。
@@ -245,7 +319,9 @@ class TestGlm53ComposeForward:
         embeds = model.language_model.embed_tokens(input_ids)
         embeds[mm_type == 1] = model.get_visual_features(pixel_values, grid).to(embeds.dtype)
         embeds[mm_type == 2] = model.get_visual_features(pixel_values_videos, grid).to(embeds.dtype)
-        ref_ctx = SequenceContext.from_input_ids((input_ids,), device="cuda").copy(input_ids=None, inputs_embeds=embeds)
+        ref_ctx = SequenceContext.from_input_ids((input_ids,), device="cuda").copy(
+            input_ids=None, inputs_embeds=embeds
+        )
         reference = model.language_model(ref_ctx, None).logits
 
         torch.testing.assert_close(logits, reference, rtol=0, atol=0)

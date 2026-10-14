@@ -20,6 +20,7 @@ preprocessing path makes internally. Verified bitwise-equal to the real processo
 ``video_grid_thw`` output for a synthetic 4-frame video in this repo's development scratch.
 """
 
+import copy
 import os
 from typing import Any, Literal
 
@@ -40,10 +41,11 @@ from ..utils import apply_exif_orientation
 from .base_mllm_tokenize_fn import (
     BaseMLLMTokenizeFnConfig,
     BaseMLLMTokenizeFunction,
-    collect_image_video_paths_and_extra,
+    OSSLoaderConfig,
     get_image_path,
     load_image,
 )
+from .qwen3_vl_utils import Qwen3VLOSSLoader, pil_loader
 
 
 logger = get_logger()
@@ -142,10 +144,11 @@ class Glm53VLTokenizeFunction(BaseMLLMTokenizeFunction):
         debug: bool = False,
         oss_time_log_thr: int = 10,
         trim_memory_interval: int = 1,
+        oss_loader_cfg: OSSLoaderConfig | None = None,
     ):
         if processor_path not in _PROCESSOR_CACHE:
             _PROCESSOR_CACHE[processor_path] = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
-        self.processor = _PROCESSOR_CACHE[processor_path]
+        self.processor = copy.deepcopy(_PROCESSOR_CACHE[processor_path])
         self.image_processor = self.processor.image_processor
         self.video_processor = self.processor.video_processor
 
@@ -164,20 +167,34 @@ class Glm53VLTokenizeFunction(BaseMLLMTokenizeFunction):
         )
         self.merge_unit = self.image_processor.merge_size**2
 
-        # Consumed by BaseMLLMTokenizeFunction's OSS media loader, same as qwen3_vl's.
+        self.oss_loader = None
         self.debug = debug
         self.oss_time_log_thr = oss_time_log_thr
+        if oss_loader_cfg is not None:
+            self.oss_loader = Qwen3VLOSSLoader(
+                backend=oss_loader_cfg.backend,
+                debug=self.debug,
+                oss_time_log_thr=self.oss_time_log_thr,
+                **oss_loader_cfg.backend_kwargs,
+            )
         self.add_generation_prompt = add_generation_prompt
         self.enable_thinking = enable_thinking
         self.reasoning_effort = reasoning_effort
         self.system_message = system_message
         self.data_name = os.path.basename(anno_name)
 
+        # Every __init__ parameter that affects cache-path output (per-sample num_tokens) must be
+        # encoded here -- hash() is the only invalidation guard of the on-disk length cache, and a
+        # missing entry means stale lengths survive a config change (packer budgets by old lengths
+        # while runtime truncates by new ones). max_length is read from the local variable because
+        # super().__init__ (which stores it as self.max_length) runs after this string is built.
         _hash_str = (
             f"{self.image_processor.min_image_tokens}_{self.image_processor.max_image_tokens}_"
             f"{self.video_processor.fps}_{self.video_processor.max_frames}_{self.merge_unit}_"
             f"processor_path:{processor_path}_llm_pack_weight:{llm_pack_weight}_"
-            f"visual_pack_weight:{visual_pack_weight}"
+            f"visual_pack_weight:{visual_pack_weight}_max_length:{max_length}_"
+            f"system_message:{system_message}_add_generation_prompt:{add_generation_prompt}_"
+            f"enable_thinking:{enable_thinking}_reasoning_effort:{reasoning_effort}"
         )
 
         super().__init__(
@@ -192,17 +209,6 @@ class Glm53VLTokenizeFunction(BaseMLLMTokenizeFunction):
             visual_pack_weight=visual_pack_weight,
             trim_memory_interval=trim_memory_interval,
         )
-
-    def __call__(self, item: dict, media_root: str = "", **kwargs) -> Any:
-        image_paths, video_paths, _ = collect_image_video_paths_and_extra(item["messages"])
-        if image_paths and video_paths:
-            raise NotImplementedError(
-                "GLM-5.3-Flash TokenizeFn only supports image-only or video-only samples in this "
-                "version; mixed image+video in a single sample needs grid/placeholder/"
-                "mm_token_type_ids/num_img_tokens global-order support that isn't implemented yet "
-                "(design doc §8.2)."
-            )
-        return super().__call__(item, media_root=media_root, **kwargs)
 
     # ---- shared render/expand/tokenize, called by both cache and runtime paths ----
 
@@ -253,8 +259,15 @@ class Glm53VLTokenizeFunction(BaseMLLMTokenizeFunction):
     def multi_modal_get_item(self, data_item: dict, media_root: str = "") -> Glm53VLDataItem:
         images = []
         for image_file in self._image_path:
-            image = load_image(get_image_path(image_file, media_root))
-            images.append(apply_exif_orientation(image))
+            image_path_ = get_image_path(image_file, media_root)
+            if self.oss_loader is not None and "s3://" in image_path_:
+                img_str = self.oss_loader.client.get(image_path_)
+                image = pil_loader(img_str)
+            else:
+                assert "s3://" not in image_path_, "Please use oss_loader_cfg to load image from s3."
+                image = load_image(image_path_)
+            image = apply_exif_orientation(image)
+            images.append(image)
 
         processed = self.image_processor(images=images, return_tensors="pt")
         pixel_values = processed["pixel_values"]
@@ -458,6 +471,7 @@ class Glm53VLTokenizeFnConfig(BaseMLLMTokenizeFnConfig):
     processor_path: str
     min_pixels: int | None = None
     max_pixels: int | None = None
+    oss_loader_cfg: OSSLoaderConfig | None = None
     fps: float | None = None
     max_frames: int | None = None
     add_generation_prompt: bool = False
@@ -474,6 +488,7 @@ class Glm53VLTokenizeFnConfig(BaseMLLMTokenizeFnConfig):
             anno_name,
             min_pixels=self.min_pixels,
             max_pixels=self.max_pixels,
+            oss_loader_cfg=self.oss_loader_cfg,
             fps=self.fps,
             max_frames=self.max_frames,
             system_message=self.system_message,

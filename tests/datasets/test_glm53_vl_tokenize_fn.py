@@ -16,29 +16,33 @@ TestGlm53MixedMediaAndTruncation
     test_glm53_visual_truncation_is_dropped         截断会切断视觉跨度时 cache 阶段就丢弃
 TestGlm53CacheInvalidation
     test_glm53_cache_invalidates_on_processor_or_pack_change  processor/pack 变化使缓存失效
+    test_glm53_hash_covers_every_init_parameter  逐参数 hash 失效 + __init__ 参数分类完备性
 """
 
+import inspect
 import os
+from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase
 from transformers.video_utils import VideoMetadata
-from xtuner.v1.datasets.mllm_tokenize_fn import Glm53VLTokenizeFnConfig
+from xtuner.v1.datasets.mllm_tokenize_fn import Glm53VLTokenizeFnConfig, Glm53VLTokenizeFunction
+from xtuner.v1.datasets.mllm_tokenize_fn.base_mllm_tokenize_fn import BaseMLLMTokenizeFunction
+from xtuner.v1.datasets.mllm_tokenize_fn.qwen3_vl_utils import sort_frames
 
 
-GLM_5_3_FLASH_PATH = os.environ.get(
-    "GLM_5_3_FLASH_PATH", "/mnt/shared-storage-user/zhaopenghao/model/GLM-5.3-Flash-25B"
-)
+GLM_5_3_FLASH_PATH = os.environ["GLM_5_3_FLASH_PATH"]
 
 
 @pytest.fixture(scope="module")
 def ckpt_path():
     if not os.path.isdir(GLM_5_3_FLASH_PATH):
-        pytest.skip(f"GLM_5_3_FLASH_PATH not found: {GLM_5_3_FLASH_PATH}")
+        pytest.fail(f"GLM_5_3_FLASH_PATH not found: {GLM_5_3_FLASH_PATH}")
     return GLM_5_3_FLASH_PATH
 
 
@@ -155,6 +159,68 @@ class TestGlm53TokenizeCacheRuntimeParity:
         assert cache_ret["num_img_tokens"] == runtime_ret["num_img_tokens"]
 
 
+class TestGlm53OSSLoader:
+    def test_oss_image_matches_local_and_cache(
+        self,
+        ckpt_path: str,
+        tokenizer: PreTrainedTokenizerBase,
+        image_fixture: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = Mock()
+        backend = Mock(return_value=client)
+        monkeypatch.setattr("xtuner.v1.datasets.mllm_tokenize_fn.qwen3_vl_utils.get_oss_backend", backend)
+        fn = Glm53VLTokenizeFnConfig(
+            processor_path=ckpt_path,
+            oss_loader_cfg={"backend": "petrel", "backend_kwargs": {"conf_path": "test.conf"}},
+        ).build(tokenizer, anno_name="test")
+        backend.assert_called_once_with("petrel", conf_path="test.conf")
+
+        local_item = _image_item(image_fixture)
+        remote_item = _image_item("img.png")
+        client.get.side_effect = {"s3://bucket/img.png": Path(image_fixture).read_bytes()}.__getitem__
+        fn.state = "cache"
+        cache = fn(remote_item, media_root="s3://bucket/")
+        client.get.assert_not_called()
+        fn.state = "runtime"
+        local = fn(local_item)
+        client.get.assert_not_called()
+        remote = fn(remote_item, media_root="s3://bucket/")
+        assert client.get.called
+        assert cache["num_tokens"] == remote["num_tokens"] == local["num_tokens"]
+        assert cache["num_img_tokens"] == remote["num_img_tokens"] == local["num_img_tokens"]
+        for key in ("input_ids", "labels"):
+            assert remote[key] == local[key]
+        for key in ("pixel_values", "image_grid_thw", "mm_token_type_ids"):
+            assert torch.equal(remote[key], local[key])
+
+    def test_oss_image_requires_loader(self, tokenize_fn: Glm53VLTokenizeFunction) -> None:
+        tokenize_fn.state = "runtime"
+        with pytest.raises(AssertionError, match="oss_loader_cfg"):
+            tokenize_fn(_image_item("s3://bucket/image.png"))
+
+    def test_oss_loader_cfg_does_not_change_cache_hash(
+        self, ckpt_path: str, tokenizer: PreTrainedTokenizerBase, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The media backend only affects runtime reading, never cache-path geometry:
+        # a differing hash would silently invalidate every cached length.
+        monkeypatch.setattr(
+            "xtuner.v1.datasets.mllm_tokenize_fn.qwen3_vl_utils.get_oss_backend", Mock(return_value=Mock())
+        )
+        plain = Glm53VLTokenizeFnConfig(processor_path=ckpt_path).build(tokenizer, anno_name="test")
+        with_oss = Glm53VLTokenizeFnConfig(
+            processor_path=ckpt_path,
+            oss_loader_cfg={"backend": "petrel", "backend_kwargs": {"conf_path": "test.conf"}},
+        ).build(tokenizer, anno_name="test")
+        assert plain.hash() == with_oss.hash()
+
+
+class TestFrameNamingConvention:
+    def test_sort_frames_rejects_nonconforming_names(self) -> None:
+        with pytest.raises(ValueError, match="naming convention"):
+            sort_frames(["cluster:s3://bucket/frames/frame.0068.tonemap.jpg"])
+
+
 class TestGlm53VisualPlaceholderAndTokenSemantics:
     def test_glm53_visual_placeholder_count(self, tokenize_fn, image_fixture):
         tokenize_fn.state = "runtime"
@@ -216,17 +282,23 @@ class TestGlm53MmTokenTypeIdsMatchesProcessorGolden:
 
 
 class TestGlm53MixedMediaAndTruncation:
-    def test_glm53_mixed_media_fails_fast(self, tokenize_fn, image_fixture, video_fixture):
+    @pytest.mark.parametrize("state", ["cache", "runtime"])
+    def test_glm53_mixed_media_fails_fast(
+        self, tokenize_fn: Glm53VLTokenizeFunction, state: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert Glm53VLTokenizeFunction.__call__ is BaseMLLMTokenizeFunction.__call__
+        load = Mock(side_effect=AssertionError("Mixed samples must fail before loading media"))
+        monkeypatch.setattr("xtuner.v1.datasets.mllm_tokenize_fn.glm53_vl_tokenize_fn.load_image", load)
         item = {
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": {"url": image_fixture, "image_wh": [448, 448]}},
+                        {"type": "image", "image": {"url": "unused.jpg", "image_wh": [448, 448]}},
                         {
                             "type": "video",
                             "video": {
-                                "url": video_fixture,
+                                "url": "unused.mp4",
                                 "image_wh": [224, 224],
                                 "origin_video_length": 6,
                                 "origin_fps": 2.0,
@@ -236,9 +308,10 @@ class TestGlm53MixedMediaAndTruncation:
                 }
             ]
         }
-        tokenize_fn.state = "runtime"
-        with pytest.raises(NotImplementedError):
+        tokenize_fn.state = state
+        with pytest.raises(NotImplementedError, match="Mixed image and video"):
             tokenize_fn(item)
+        load.assert_not_called()
 
     def test_glm53_visual_truncation_is_dropped(self, ckpt_path, tokenizer, image_fixture):
         # max_length 短于样本、会切进 256 token 的图像跨度：cache 阶段就必须报 num_tokens=0，让
@@ -267,3 +340,71 @@ class TestGlm53CacheInvalidation:
         assert base.hash() != changed_pixels.hash()
         assert base.hash() != changed_fps.hash()
         assert base.hash() != changed_weight.hash()
+
+    def test_glm53_hash_covers_every_init_parameter(self, ckpt_path, tokenizer):
+        params = set(inspect.signature(Glm53VLTokenizeFunction.__init__).parameters) - {"self"}
+        classified = _HASH_PARAMS | _NON_HASH_PARAMS
+        assert params == classified, (
+            f"Glm53VLTokenizeFunction.__init__ params {sorted(params)} != classified "
+            f"{sorted(classified)}; unclassified: {sorted(params ^ classified)}. If a new param "
+            "can change cache output (num_tokens), add it to _hash_str and _HASH_PARAMS; "
+            "otherwise add it to _NON_HASH_PARAMS with a reason."
+        )
+        assert set(_ALT_VALUES) == _HASH_PARAMS - {"processor_path"}
+
+        for name, override in _ALT_VALUES.items():
+            base = Glm53VLTokenizeFnConfig(processor_path=ckpt_path).build(tokenizer, anno_name="test")
+            variant = Glm53VLTokenizeFnConfig(processor_path=ckpt_path, **override).build(tokenizer, anno_name="test")
+            assert base.hash() != variant.hash(), f"{name} changed but hash() did not -- stale cache entry"
+
+
+# __init__ 参数中影响 cache 输出（每条样本 num_tokens）的，必须进 _hash_str。processor_path
+# 也在 _hash_str 里，但换一个值需要磁盘上真实存在另一个 checkpoint，这里不实际变它。
+_HASH_PARAMS = {
+    "processor_path",
+    "min_pixels",
+    "max_pixels",
+    "fps",
+    "max_frames",
+    "system_message",
+    "max_length",
+    "llm_pack_weight",
+    "visual_pack_weight",
+    "add_generation_prompt",
+    "enable_thinking",
+    "reasoning_effort",
+}
+
+# 不影响 cache 输出的参数：
+#   tokenizer           -- 身份由基类 hash() 里的 tokenizer_xxhash 单独覆盖
+#   anno_name           -- 数据文件本身；cache 目录按数据文件隔离，不跨文件共享
+#   tokenizer_hash/hash -- 对 hash 结果的显式覆盖
+#   debug / oss_time_log_thr / trim_memory_interval -- 运行期开关，不改变 token 数
+#   oss_loader_cfg      -- 只控制 runtime 存储读取，另有 cache hash 一致性测试
+_NON_HASH_PARAMS = {
+    "tokenizer",
+    "anno_name",
+    "tokenizer_hash",
+    "hash",
+    "debug",
+    "oss_time_log_thr",
+    "trim_memory_interval",
+    "oss_loader_cfg",
+}
+
+# _HASH_PARAMS（除 processor_path）逐参数构造变体用的 override。取值必须避开 processor 默认值
+# （min=16 / max=8000 / fps=2 / max_frames=2048）和其他测试残留进共享 processor 的值
+# （max_pixels=1000、fps=4.0）。
+_ALT_VALUES = {
+    "min_pixels": {"min_pixels": 1000},
+    "max_pixels": {"max_pixels": 2000},
+    "fps": {"fps": 8.0},
+    "max_frames": {"max_frames": 8},
+    "system_message": {"system_message": "You are a helpful assistant."},
+    "max_length": {"max_length": 64},
+    "llm_pack_weight": {"llm_pack_weight": 0.5},
+    "visual_pack_weight": {"visual_pack_weight": 0.5},
+    "add_generation_prompt": {"add_generation_prompt": True},
+    "enable_thinking": {"enable_thinking": False},
+    "reasoning_effort": {"reasoning_effort": "low"},
+}
