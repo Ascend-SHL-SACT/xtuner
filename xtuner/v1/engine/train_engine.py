@@ -49,6 +49,7 @@ from xtuner.v1.utils import (
     log_rank0,
     profile_time_and_memory,
 )
+from xtuner.v1.utils.activation_offload import OffloadManager
 from xtuner.v1.utils.grad_norm import cal_grad_norm
 
 
@@ -221,6 +222,14 @@ class TrainEngine:
         micro_batch_iter = 0
         micro_batch_results = []
 
+        # Saved-tensor offload state is released at the START of a train step, one
+        # full optimizer step after the offload copies were issued: the copies are
+        # long complete by then, and the fence only waits on work the upcoming
+        # forward depends on anyway (the previous optimizer step's parameter
+        # update), so it costs no wall-clock time. Clearing here also covers the
+        # abort/OOM paths of the previous step without a mid-step blocking sync.
+        OffloadManager().clear_step()
+
         data_batch_info = self.model.pre_micro_batch_forward(data_batches)
         total_loss = torch.tensor(0.0, device=DEVICE)
 
@@ -251,6 +260,7 @@ class TrainEngine:
             ProberList.after_micro_iter_forward()
 
         batch_forward_info = self.model.post_micro_batch_forward(micro_batch_results)
+
         if os.environ.get("XTUNER_LOSS_DEFER_ITEM", "0") == "1":
             # Keep total_loss on-device; the .item() is deferred to step-end
             # logging in the trainer, so the host can launch clip/optim

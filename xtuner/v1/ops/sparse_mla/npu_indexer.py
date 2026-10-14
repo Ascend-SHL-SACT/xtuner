@@ -33,6 +33,7 @@ def npu_dsa_topk_indices(
     *,
     index_head_dim: int,
     index_topk: int,
+    query_chunk_size: int | None = None,
 ) -> torch.Tensor:
     """NPU fused DSA top-k index computation.
 
@@ -43,6 +44,10 @@ def npu_dsa_topk_indices(
         seq_ctx: Sequence context for packed causal masking.
         index_head_dim: Indexer head dimension (128 for GLM-5.2).
         index_topk: Number of top-k tokens to select (2048 for GLM-5.2).
+        query_chunk_size: Protocol parameter for chunked TileLang selection;
+            ignored here — the fused NPU kernel scores all queries in one
+            launch, and non-``None`` values are rejected upstream by
+            ``_validate_query_chunk_size``.
 
     Returns:
         ``[S, 1, K]`` int32 tensor. Invalid slots padded with -1.

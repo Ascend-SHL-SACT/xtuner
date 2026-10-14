@@ -252,7 +252,12 @@ class SequenceContext:
                     new_cu_seq_lens = self.cu_seq_lens_q.clone()
                     new_cu_seq_lens[-1] += new_padding
                 else:
-                    new_cu_seq_lens = torch.ones(self.cu_seq_lens_q.numel() + 1, dtype=torch.int32, device=self.device)
+                    # Stay on the original cu's device: the collator keeps cu on
+                    # host, and downstream consumers (mtp roll, cu_list) assume
+                    # host residency -- device=self.device would silently flip it.
+                    new_cu_seq_lens = torch.ones(
+                        self.cu_seq_lens_q.numel() + 1, dtype=torch.int32, device=self.cu_seq_lens_q.device
+                    )
                     new_cu_seq_lens[: self.cu_seq_lens_q.numel()] = self.cu_seq_lens_q.clone()
                     new_cu_seq_lens[-1] = self.cu_seq_lens_q[-1] + new_padding
             else:
