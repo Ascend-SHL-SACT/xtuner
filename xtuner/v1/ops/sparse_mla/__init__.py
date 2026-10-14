@@ -97,6 +97,8 @@ def get_kpool_topk_indices(backend: KPoolIndexerBackend) -> KPoolTopKIndicesProt
         from .kpool_npu import npu_kpool_topk_indices
 
         return npu_kpool_topk_indices
+    if backend == "tilelang_cooperative":
+        return functools.partial(kpool_topk_indices, scorer="cooperative")
     raise ValueError(f"Unsupported KPool indexer backend: {backend}")
 
 

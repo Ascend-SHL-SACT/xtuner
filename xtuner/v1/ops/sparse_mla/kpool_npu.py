@@ -54,7 +54,8 @@ from torch import Tensor
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.ops.comm import gather_for_sequence_parallel
 
-from .kpool import _visible_tail_tokens, build_pools, kpool_output_width
+from . import kpool
+from .kpool import _visible_tail_tokens, build_pool_index, build_pools, kpool_output_width
 
 
 try:
@@ -90,6 +91,21 @@ _KPOOL_META_CACHE: weakref.WeakKeyDictionary[
     SequenceContext, dict[tuple[int, int, torch.device], tuple[Tensor, Tensor, Tensor]]
 ] = weakref.WeakKeyDictionary()
 
+# ``build_pool_index`` is a pure function of the packed-sequence lengths, so its result is
+# reused once per (context, pool size, seq_len, device) instead of rebuilt on every indexer
+# call: at 128K the live path rebuilds it 384 times per training step (24 kpool layers x 16
+# micro-batches) against only ~32 distinct inputs, and every rebuild is a ~2 ms serial AiCPU
+# host-op chain (SearchSorted, IndexPut[N,4], Cumsum, ...). Keyed weakly by the SequenceContext
+# so entries die with the micro-batch; ``device`` joins the key because ``SequenceContext.to()``
+# mutates the context in place (same contract as ``_KPOOL_META_CACHE`` above).
+# ``XTUNER_SPARSE_MLA_POOL_INDEX_CACHE`` (default on, ``0`` off) is the A/B lever. The cached
+# int64 tensor is shared read-only: ``build_pools`` only reads it (the mask/clamp/gather chain
+# is out-of-place) and hands its callers a fresh ``.to(torch.int32)`` copy, so in-place edits
+# of that copy cannot corrupt the cache.
+_POOL_INDEX_CACHE: weakref.WeakKeyDictionary[SequenceContext, dict[tuple[int, int, torch.device], Tensor]] = (
+    weakref.WeakKeyDictionary()
+)
+
 
 @torch.no_grad()
 def npu_kpool_topk_indices(
@@ -106,6 +122,8 @@ def npu_kpool_topk_indices(
     always_select_tail: bool = True,
     alignment: int = 512,
     query_chunk_size: int | None = None,
+    balance_sp: bool = False,
+    sp_full_pool_work_ratio: float = 0.5,
 ) -> Tensor:
     """NPU KPool indexer top-k: build pools (A), score + top-k per document segment (B),
     expand back to token ids + tail (C).
@@ -130,10 +148,19 @@ def npu_kpool_topk_indices(
             (``torch_npu`` uses 1 -- the kernel takes any index width).
         query_chunk_size (int | None): Eager-fallback query-chunk bound; ignored by the fused
             kernel, which self-bounds through its tile picker.
+        balance_sp (bool): SP work-balancing knob shared with the TileLang backends; not
+            implemented on the NPU path (rejected explicitly when set).
+        sp_full_pool_work_ratio (float): Balancing split ratio; unused while
+            ``balance_sp`` is False.
 
     Returns:
         Tensor: ``[S, 1, kpool_output_width(index_topk, index_kpool, alignment)]`` int32.
     """
+    if balance_sp:
+        raise NotImplementedError(
+            "npu_kpool_topk_indices does not implement SP work balancing yet; keep "
+            "indexer_balance_sp=False (the default) for the torch_npu backend."
+        )
     assert index_topk % index_kpool == 0
     # SP: queries stay sharded; the key side gathers *before* pooling, because a pool can
     # straddle the shard seam (see build_pools).
@@ -245,6 +272,47 @@ def npu_kpool_topk_indices(
     return out.unsqueeze(1)
 
 
+def _pool_index_cache_on() -> bool:
+    return os.environ.get("XTUNER_SPARSE_MLA_POOL_INDEX_CACHE", "1") == "1"
+
+
+def _cached_pool_index(seq_ctx: SequenceContext, seq_len: int, index_kpool: int, device: torch.device) -> Tensor:
+    """``build_pool_index`` behind the per-context pool-index cache (``_POOL_INDEX_CACHE``).
+
+    Args:
+        seq_ctx (SequenceContext): Packed-sequence metadata (document boundaries).
+        seq_len (int): Whole-sequence token count (pools always cover the whole sequence).
+        index_kpool (int): Pool size.
+        device (torch.device): Target device for the built tensor.
+
+    Returns:
+        Tensor: ``pool_index``, shape ``[P, index_kpool]`` int64 -- the shared read-only
+        cached tensor on a hit, a freshly built one otherwise.
+    """
+    if not _pool_index_cache_on():
+        return build_pool_index(seq_ctx, seq_len, index_kpool, device)
+    cache = _POOL_INDEX_CACHE.get(seq_ctx)
+    if cache is None:
+        cache = {}
+        _POOL_INDEX_CACHE[seq_ctx] = cache
+    key = (index_kpool, seq_len, torch.device(device))
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    pool_index = build_pool_index(seq_ctx, seq_len, index_kpool, device)
+    cache[key] = pool_index
+    return pool_index
+
+
+# Wiring: install the per-context cache over ``kpool.build_pool_index`` (whose signature stays
+# untouched) so every caller -- ``build_pools`` (both the reference and the NPU backend) and
+# direct calls -- reuses it, matching the pre-merge behavior where the cache lived inside
+# ``kpool.build_pool_index`` itself. ``_cached_pool_index`` resolves the plain
+# ``build_pool_index`` name above -- the original pure builder captured by the from-import
+# before this rebind -- so the wrapper does not recurse into itself.
+kpool.build_pool_index = _cached_pool_index
+
+
 def _segment_ranges(
     seq_ctx: SequenceContext, query_len: int, index_kpool: int
 ) -> list[tuple[int, int, int, int, int]]:
@@ -304,7 +372,7 @@ def _expand_meta(
     if cache is None:
         cache = {}
         _KPOOL_META_CACHE[seq_ctx] = cache
-    # device joins the key (as in kpool.py's _POOL_INDEX_CACHE): SequenceContext.to() mutates
+    # device joins the key (as in _POOL_INDEX_CACHE above): SequenceContext.to() mutates
     # the context in place, so a moved context must not hit entries built on the old device.
     key = (index_kpool, query_len, torch.device(device))
     hit = cache.get(key)
