@@ -172,6 +172,13 @@ try:
         ) -> tuple[torch.Tensor, torch.Tensor | None]:
             if weight is None:
                 weight, bias = self.materialize_weight_bias()
+            # fp32_keys_pattern keeps the conv masters fp32 (unrounded replicated gradients);
+            # every conv kernel -- the fla surface, and the Ascend C op, which hard-rejects
+            # mixed x/weight dtypes with errno 161002 -- contracts on the activation dtype.
+            if weight.dtype != x.dtype:
+                weight = weight.to(x.dtype)
+            if bias is not None and bias.dtype != x.dtype:
+                bias = bias.to(x.dtype)
             return causal_conv1d(
                 x=x,
                 weight=weight,

@@ -155,10 +155,15 @@ class NoPEDSAMLAConfig(MLAConfig):
     index_kpool: int = 4
     index_kpool_always_select_tail: bool = True
     indexer_types: list[str] | None = None
-    # Production default: FlashMLA fwd (native 512 head_dim) + cuDNN bwd (no dim hardcoding) --
-    # equivalent to Automodel's cudnn_sparse_attention; doesn't need the TileLang tail_dim=0 fix
-    # (design doc 3.5.2). "tilelang" needs that kernel fix and is not implemented yet (F5.b).
-    sparse_mla_backend: Literal["torch", "flash_mla_cudnn", "tilelang", "torch_npu"] = "flash_mla_cudnn"
+    # Class default is the head-count-safe reference backend, not the production one: the
+    # flash_mla_cudnn validator above requires 64-aligned query heads, so a flash_mla_cudnn
+    # default would make `Glm53TextMoEConfig.from_hf` raise for the 32-head GLM-5.3-Flash
+    # checkpoint before the entry-point config can override the backend. Real entry points
+    # select the backend explicitly (sft_glm53.py: SPARSE_MLA_BACKEND env, defaulting to
+    # flash_mla_cudnn there = FlashMLA fwd (native 512 head_dim) + cuDNN bwd, equivalent to
+    # Automodel's cudnn_sparse_attention; doesn't need the TileLang tail_dim=0 fix, design
+    # doc 3.5.2). "tilelang" needs that kernel fix and is not implemented yet (F5.b).
+    sparse_mla_backend: Literal["torch", "flash_mla_cudnn", "tilelang", "torch_npu"] = "torch"
     # Independent of `sparse_mla_backend` above, which is `flash_mla_cudnn` here and is not
     # even a valid indexer backend -- inheriting it would never have worked.
     indexer_backend: KPoolIndexerBackend = "tilelang"
