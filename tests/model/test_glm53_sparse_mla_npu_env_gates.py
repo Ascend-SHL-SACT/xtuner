@@ -18,7 +18,7 @@ from torch import Tensor
 
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model.moe.glm53.nope_dsa_mla import NoPEDSAMultiLatentAttention
-from xtuner.v1.ops.sparse_mla import get_kpool_topk_indices, get_sparse_mla, kpool
+from xtuner.v1.ops.sparse_mla import get_kpool_topk_indices, get_sparse_mla, kpool, kpool_npu
 from xtuner.v1.ops.sparse_mla.protocol import KPoolIndexerBackend, SparseMLABackend, SparseMLAOutputs
 
 
@@ -195,6 +195,11 @@ class TestSfaRopePaddedDispatch:
 
 
 class TestPoolIndexCacheLever:
+    def test_cache_installed_over_kpool_build_pool_index(self) -> None:
+        """Wiring: importing kpool_npu installs the cached builder over ``kpool.build_pool_index``
+        (whose own signature in kpool.py stays untouched)."""
+        assert kpool.build_pool_index is kpool_npu._cached_pool_index
+
     def test_lever_off_recomputes_each_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Cache off: repeated calls rebuild (fresh object each time) with identical values."""
         monkeypatch.setenv("XTUNER_SPARSE_MLA_POOL_INDEX_CACHE", "0")
@@ -211,7 +216,7 @@ class TestPoolIndexCacheLever:
         monkeypatch.setenv("XTUNER_SPARSE_MLA_POOL_INDEX_CACHE", "0")
         ctx = _make_ctx([5, 9])
         kpool.build_pool_index(ctx, 14, 4, DEVICE)
-        assert ctx not in kpool._POOL_INDEX_CACHE
+        assert ctx not in kpool_npu._POOL_INDEX_CACHE
 
     def test_lever_on_default_reuses_object(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Cache on (default): repeated calls return the same shared read-only tensor."""
