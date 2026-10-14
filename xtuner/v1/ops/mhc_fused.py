@@ -8,7 +8,7 @@ points. Components:
 - **Norm + mix projection** (:func:`mhc_norm_linear`): replaces the eager
   ``flatten(2).float()`` -> ``rms_norm`` (fp32) -> ``F.linear(flat, fn)``
   chain in ``hc_pre``. The eager chain materialises a ``[T, H*D]`` fp32 copy
-  (268 MB at the production shape) re-read through three more full-row kernels;
+  (256 MB at the production shape) re-read through three more full-row kernels;
   the fused path keeps the row in bf16 storage and never materialises the
   normalised activations, using two algebraic identities to stay MMA-shaped:
   ``mixes = (x @ fn.T) * rstd`` (the unweighted RMSNorm rescale is a per-row
@@ -26,7 +26,7 @@ points. Components:
   instances, ~13 s/step, across the 45 mHC sites of the 30B at the 128K
   training shape). MindSpeed-MM runs this fused op unconditionally on NPU
   whenever the kernel imports, and the pre-merge GLM-5.3 implementation did the
-  same (it is the ``run81`` 128K anchor numerics). Numerics vs the eager chain:
+  same. Numerics vs the eager chain:
   the fused comb path applies one extra eps-stabilised row normalisation
   instead of ``softmax(-1) + eps`` (MindSpeed's own fused-op exception), and
   the sigmoid/exp elementwise results agree to fp32 ULP. The ``hc_scale`` /
@@ -49,8 +49,8 @@ points. Components:
   ``hc_post`` fallback in the pre-merge implementation's batched-matmul form.
 
 Residual differences vs the eager chains are limited to reduction orders
-(rms / mix-projection / along-D) -- the approved fused-op exceptions the 128K
-``run81`` anchor (llm_loss 12.14300537) was trained with -- plus one rounding
+(rms / mix-projection / along-D) -- the approved fused-op exceptions -- plus
+one rounding
 placement: the norm-linear path never materialises the bf16-rounded normalized
 activations the eager chain feeds into the projection (it scales the fp32 MMA
 accumulator by ``rstd`` instead), so its ``mixes``/``d_x``/``d_w`` deviate by up
@@ -66,6 +66,22 @@ them):
 
 - ``XTUNER_MHC_NORM_LINEAR_FUSED`` (default 1; ``0`` = eager rms_norm + F.linear
   chain): :func:`mhc_norm_linear`.
+- ``XTUNER_MHC_NORM_LINEAR_SPLIT`` (default 1; ``0`` = one mix kernel): splits
+  the fused forward into a cube-only GEMM kernel plus an AIV scale kernel,
+  removing the compiler-injected cross-half sync_block/workspace handshake from
+  the L0C live range (the L0C read/write-conflict crash class, bit-exact).
+  Applies only when the token-row count is a multiple of ``_T_TILE=64``; other
+  shapes fall back to the fused mix kernel with a one-shot print.
+- ``XTUNER_MHC_NORM_LINEAR_BWD_SPLIT`` (default 1; ``0`` = fused mix backward
+  kernels): splits the backward the same way -- a cube-only ``d_fn`` GEMM whose
+  raw fp32 output is cast to bf16 by ``copy_``, and a cube-only ``d_x`` GEMM
+  materialising the full ``[T, N]`` fp32 product (256 MB at the production
+  shape; the fused kernel recomputes it chunk-wise) consumed by an AIV kernel
+  that replicates both fused passes. Bit-exact, same ``T % _T_TILE=64`` gate
+  with fallback to the fused mix backward kernels. The op-level parity evidence
+  covers the MIX=24 bf16 production family only; first use of either split
+  prints its (tokens, n, mix, dtype) so any other shape family is visible in
+  run logs.
 - ``XTUNER_MHC_SINKHORN_FUSED`` (default 1; ``0`` = eager split-sinkhorn chain).
 - ``XTUNER_HC_COMBINE_FUSED`` / ``XTUNER_HC_COLLAPSE_FUSED`` (default 1; ``0`` = the
   matmul-form / eager-sum fallbacks): :func:`hc_combine` / :func:`hc_collapse`.
@@ -80,8 +96,8 @@ is a no-op (clamped blockify replay miscompiles at training shapes). The
 combine/collapse group resolves the cap on first use with the NaN-sentinel
 probe ``_probe_max_progs`` and falls back to ``_MAX_PROGS_FALLBACK`` should a
 binary flip to aicore mode; the norm-linear launches and the sinkhorn kernels
-carry no runtime probe (offline probe record / anchor-validated MindSpeed-port
-grids -- see the constants comment and ``SinkhornFunction.forward``).
+carry no runtime probe (see the constants comment and
+``SinkhornFunction.forward``).
 """
 
 from __future__ import annotations
@@ -110,7 +126,9 @@ __all__ = [
     "HC_COLLAPSE_FUSED",
     "HC_COMBINE_FUSED",
     "HC_POST_FUSED",
+    "MHC_NORM_LINEAR_BWD_SPLIT",
     "MHC_NORM_LINEAR_FUSED",
+    "MHC_NORM_LINEAR_SPLIT",
     "MHC_SINKHORN_FUSED",
     "hc_collapse",
     "hc_combine",
@@ -118,17 +136,20 @@ __all__ = [
     "mhc_norm_linear",
 ]
 
-# All five mHC env gates are defined here, read once at import, and share one
-# contract: value ``0`` selects that layer's eager/HEAD-reference fallback, any other
-# value (including unset) keeps the fused path -- the all-fused configuration is the
-# run81 128K anchor and the production default, and setting all five to ``0``
-# restores the complete HEAD numerics. The decoder layer
+# All seven mHC env gates are defined here, read once at import, and share one
+# contract: value ``0`` selects that layer's fallback -- the eager/HEAD-reference
+# chain, or the pre-split fused mix kernels for the two split gates; any other
+# value (including unset) keeps the fused path. The all-fused configuration is
+# the production default, and setting all seven to ``0`` restores the complete
+# HEAD numerics. The decoder layer
 # (xtuner.v1.module.decoder_layer.mhc) imports the flags and wires them into its
 # dispatch conditions. Note ``XTUNER_HC_POST_FUSED`` refers to the *formulation-level*
 # fusion (batched matmul vs HEAD's broadcast-multiply + reduce-sum chain, ~16x less
 # traffic); the triton combine kernel on top of it is gated separately by
 # ``XTUNER_HC_COMBINE_FUSED``.
 MHC_NORM_LINEAR_FUSED = os.environ.get("XTUNER_MHC_NORM_LINEAR_FUSED", "1") != "0"
+MHC_NORM_LINEAR_SPLIT = os.environ.get("XTUNER_MHC_NORM_LINEAR_SPLIT", "1") != "0"
+MHC_NORM_LINEAR_BWD_SPLIT = os.environ.get("XTUNER_MHC_NORM_LINEAR_BWD_SPLIT", "1") != "0"
 MHC_SINKHORN_FUSED = os.environ.get("XTUNER_MHC_SINKHORN_FUSED", "1") != "0"
 HC_COMBINE_FUSED = os.environ.get("XTUNER_HC_COMBINE_FUSED", "1") != "0"
 HC_COLLAPSE_FUSED = os.environ.get("XTUNER_HC_COLLAPSE_FUSED", "1") != "0"
@@ -143,41 +164,40 @@ _T_TILE = 64  # token rows per MMA tile
 _K_TILE = 128  # feature (reduction) chunk per MMA tile
 _DX_K2_TILE = 512  # feature chunk of the d_x store pass (see _mhc_dx_kernel)
 _DFN_D_TILE = 512  # feature tile of the d_fn reduction
-# Persistent-grid cap for the norm-linear and combine/collapse kernels (a
-# shared module constant; the combine/collapse group additionally resolves it
-# on first use via the NaN-sentinel probe below). With
-# TRITON_ALL_BLOCKS_PARALLEL=1 the Ascend triton launcher clamps blockNum to the
+# Persistent-grid cap for the aiv-mode kernels (rstd here; the combine/collapse
+# group additionally resolves it on first use via the NaN-sentinel probe below).
+# With TRITON_ALL_BLOCKS_PARALLEL=1 the Ascend triton launcher clamps blockNum to the
 # physical core count and replays the overflow blocks inside each core; that replay
-# miscompiled these kernels on the 64K shape (step-1 forward NaN, bisected to
-# mhc_norm_linear: healthy with the fused path off, NaN with only it fused) at
-# grids past 24 in the original single-program-per-tile form. The in-kernel
-# strided loop added then keeps per-row/per-tile math unchanged, and the
-# miscompile has not reproduced under it: all four norm-linear kernels re-probed
-# at grid=48 with NaN-prefilled outputs at T=8192 and T=65536 are NaN-free and
-# bitwise-equal to grid=24 (0930 probe; combine/collapse and conv-bwd have run
-# 48 since).
-# The cap only widens the rstd kernel's parallelism (1.94x); fwd/dx are
-# tl.dot-bound and unchanged at 48.
+# miscompiles these kernels at training shapes. The in-kernel strided loop
+# (pid-strided over rows/tiles) keeps the per-row/per-tile math unchanged and
+# restores full coverage, so any grid up to the physical block count is safe. 48 is
+# the aiv physical block count, making the clamp a no-op; the cap only widens the
+# rstd kernel's parallelism (1.94x vs 24).
 #
 # Unlike the combine/collapse kernels (probed below) and causal_conv1d, the
-# norm-linear launches carry NO runtime NaN-sentinel probe: the cap rests on
-# the offline 0930 probe record above plus TRITON_ALWAYS_COMPILE=1 in the
-# launch script. If a future CANN/torch_npu upgrade flips one of these
-# binaries to aicore mode, dropped blocks would leave uninitialized rstd rows
-# (silent NaN mixes) with no automatic degrade -- re-run the offline grid=48
-# probe after any toolchain upgrade and keep this comment current.
+# norm-linear launches carry NO runtime NaN-sentinel probe: if a future
+# CANN/torch_npu upgrade flips one of these binaries to aicore mode, dropped
+# blocks would leave uninitialized rstd rows (silent NaN mixes) with no automatic
+# degrade -- re-run the offline grid probe after any toolchain upgrade.
 _MAX_PROGS = 48
 _PROD_HC = 4  # MindSpeed wrapper contract: the fused mHC kernels specialise hc_mult=4
 # Upper bound on the mix-projection output width MIX = (2 + hc_mult) * hc_mult: the
 # forward/backward kernels allocate a [BLOCK_T=64, MIX_PAD] fp32 accumulator, and past
-# MIX ~= 5120 BiShengIR fails to compile with a UB overflow (hard crash at MIX=8192,
-# live-verified) instead of the graceful eager fallback the gate promises. 128 covers
-# hc_mult <= 10; production is 24 (hc_mult=4).
+# MIX ~= 5120 BiShengIR fails to compile with a UB overflow (hard crash) instead of
+# the graceful eager fallback the gate promises. 128 covers hc_mult <= 10; production
+# is 24 (hc_mult=4).
 _MAX_MIX = 128
 _BLOCK_D = 1024  # feature tile of the collapse per-token row loops ([HC, BLOCK_D] <= 4096)
 _MAX_PROGS_FALLBACK = 24  # long-running production cap (aicore physical block count)
 _TRITON_MAX_PROGS: list[int | None] = [None]  # probe-resolved cap; None -> _MAX_PROGS
-_LOG_STATE: dict[str, bool] = {"combine": False, "collapse": False}  # one-shot engagement prints
+_LOG_STATE: dict[str, bool] = {
+    "combine": False,
+    "collapse": False,
+    "split_engaged": False,
+    "bwd_split_engaged": False,
+    "split_fallback": False,
+    "bwd_split_fallback": False,
+}  # one-shot engagement prints
 _COMBINE_BLOCK_T = 8  # token rows per combine tile ([BLOCK_T, BLOCK_D] fp32 tiles)
 _COMBINE_BLOCK_D = 256  # feature tile of the combine kernels (14 live tiles ~= 112 KB UB)
 
@@ -212,11 +232,10 @@ def _mhc_rstd_kernel(
     EPS,
     BLOCK_D: tl.constexpr,
 ):
-    # Anchor form (bit-exact with the pre-19:33 kernel): one token row per
-    # strided iteration, 1D [BLOCK_D] sum-of-squares with the unrolled
-    # static_range chunk loop and num_warps=4. The 2D-row-tile variant changed
-    # the tl.sum reduction tree and moved the 64K loss off the 12.36008358
-    # anchor; the persistent grid is kept (blockify-replay guard).
+    # One token row per strided iteration, 1D [BLOCK_D] sum-of-squares with the
+    # unrolled static_range chunk loop and num_warps=4. Do not switch to a 2D
+    # row-tile form: it changes the tl.sum reduction tree (different summation
+    # order). The persistent grid is kept (blockify-replay guard).
     pid = tl.program_id(0)
     nprogs = tl.num_programs(0)
     d_off = tl.arange(0, BLOCK_D)
@@ -263,6 +282,180 @@ def _mhc_fwd_kernel(
             acc * inv[:, None],
             mask=t_mask[:, None] & j_mask[None, :],
         )
+
+
+@triton.jit
+def _mhc_fwd_dot_kernel(
+    x_ptr,
+    w_ptr,
+    y_raw_ptr,
+    T,
+    N: tl.constexpr,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # Cube-only half of the split forward (XTUNER_MHC_NORM_LINEAR_SPLIT=1):
+    # identical K-loop and load masks to _mhc_fwd_kernel but stores the raw
+    # fp32 accumulator unmasked, so the compiler emits a single AIC function
+    # with no mix split and therefore no cross-half sync_block/workspace
+    # handshake inside the L0C live range. Requires T % BLOCK_T == 0 (checked
+    # at the call site) so the maskless store covers every valid row.
+    pid = tl.program_id(0)
+    nprogs = tl.num_programs(0)
+    j_off = tl.arange(0, MIX_PAD)
+    j_mask = j_off < MIX
+    for blk in range(pid, tl.cdiv(T, BLOCK_T), nprogs):
+        t_off = blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        t_mask = t_off < T
+        t64 = t_off[:, None].to(tl.int64)
+        acc = tl.zeros([BLOCK_T, MIX_PAD], dtype=tl.float32)
+        for k0 in range(0, N, BLOCK_K):
+            k_off = k0 + tl.arange(0, BLOCK_K)
+            xv = tl.load(x_ptr + t64 * N + k_off[None, :], mask=t_mask[:, None], other=0.0)
+            wv = tl.load(w_ptr + j_off[:, None].to(tl.int64) * N + k_off[None, :], mask=j_mask[:, None], other=0.0)
+            acc += tl.dot(xv, tl.trans(wv))
+        tl.store(y_raw_ptr + t64 * MIX_PAD + j_off[None, :], acc)
+
+
+@triton.jit
+def _mhc_scale_kernel(
+    y_raw_ptr,
+    rstd_ptr,
+    y_ptr,
+    T,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+):
+    # AIV half of the split forward: y[t, j] = y_raw[t, j] * rstd[t] for j < MIX,
+    # same fp32 multiply the fused kernel's epilogue performs (bit-exact).
+    # Persistent grid per the blockify-replay guard convention.
+    pid = tl.program_id(0)
+    nprogs = tl.num_programs(0)
+    j_off = tl.arange(0, MIX_PAD)
+    j_mask = j_off < MIX
+    for row in range(pid, T, nprogs):
+        inv = tl.load(rstd_ptr + row)
+        row64 = row.to(tl.int64)  # type: ignore[attr-defined] # triton: row is a device-side loop index
+        acc = tl.load(y_raw_ptr + row64 * MIX_PAD + j_off)
+        tl.store(y_ptr + row64 * MIX + j_off, acc * inv, mask=j_mask)
+
+
+@triton.jit
+def _mhc_dfn_dot_kernel(
+    dm_scaled_ptr,
+    x_ptr,
+    dw_raw_ptr,
+    T,
+    N: tl.constexpr,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Cube-only half of the split d_fn backward (XTUNER_MHC_NORM_LINEAR_BWD_SPLIT=1):
+    # identical D-tile / T-loop structure and accumulation order as _mhc_dfn_kernel,
+    # but it consumes the AIV-precomputed bf16 ``dm_scaled = (dm * rstd).to(bf16)``
+    # and stores the raw fp32 accumulator unmasked, so the compiler emits a single
+    # AIC function with no mix split and therefore no cross-half sync_block/workspace
+    # handshake inside the L0C live range. Requires T % BLOCK_T == 0 (checked at the
+    # call site); the [MIX_PAD, N] fp32 raw output is cast to bf16 by ``copy_`` at
+    # the call site (same RTNE rounding as the fused kernel's masked store cast).
+    pid = tl.program_id(0)
+    nprogs = tl.num_programs(0)
+    j_off = tl.arange(0, MIX_PAD)
+    j_mask = j_off < MIX
+    for blk in range(pid, N // BLOCK_D, nprogs):
+        d_off = blk * BLOCK_D + tl.arange(0, BLOCK_D)
+        acc = tl.zeros([MIX_PAD, BLOCK_D], dtype=tl.float32)
+        for t0 in range(0, T, BLOCK_T):
+            t_off = t0 + tl.arange(0, BLOCK_T)
+            t64 = t_off[:, None].to(tl.int64)
+            dm = tl.load(dm_scaled_ptr + t64 * MIX + j_off[None, :], mask=j_mask[None, :], other=0.0)
+            xv = tl.load(x_ptr + t64 * N + d_off[None, :])
+            acc += tl.dot(tl.trans(dm), xv)
+        tl.store(dw_raw_ptr + j_off[:, None].to(tl.int64) * N + d_off[None, :], acc)
+
+
+@triton.jit
+def _mhc_dx_dot_kernel(
+    dm_ptr,
+    w_ptr,
+    g_ptr,
+    T,
+    N: tl.constexpr,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K2: tl.constexpr,
+):
+    # Cube-only half of the split d_x backward (XTUNER_MHC_NORM_LINEAR_BWD_SPLIT=1):
+    # emits the rank-MIX product ``g = dm_b @ w`` as a full [T, N] fp32 buffer --
+    # the exact dot the fused kernel recomputes chunk-wise in both passes (the
+    # reduction runs over MIX, so the tile width is bit-free). Loads the
+    # AIV-precomputed bf16 ``dm_b`` and stores the fp32 accumulator unmasked, so
+    # the compiler emits a single AIC function with no cross-half handshake inside
+    # the L0C live range. Requires T % BLOCK_T == 0 (checked at the call site).
+    pid = tl.program_id(0)
+    nprogs = tl.num_programs(0)
+    j_off = tl.arange(0, MIX_PAD)
+    j_mask = j_off < MIX
+    for blk in range(pid, tl.cdiv(T, BLOCK_T), nprogs):
+        t_off = blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        t64 = t_off[:, None].to(tl.int64)
+        dm_b = tl.load(dm_ptr + t64 * MIX + j_off[None, :], mask=j_mask[None, :], other=0.0)
+        for k0 in range(0, N, BLOCK_K2):
+            k_off = k0 + tl.arange(0, BLOCK_K2)
+            wv = tl.load(w_ptr + j_off[:, None].to(tl.int64) * N + k_off[None, :], mask=j_mask[:, None], other=0.0)
+            g = tl.dot(dm_b, wv)
+            tl.store(g_ptr + t64 * N + k_off[None, :], g)
+
+
+@triton.jit
+def _mhc_dx_apply_kernel(
+    g_ptr,
+    x_ptr,
+    rstd_ptr,
+    dx_ptr,
+    T,
+    N: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_K2: tl.constexpr,
+):
+    # AIV half of the split d_x backward: consumes the cube kernel's [T, N] fp32
+    # ``g`` buffer and replicates both fused-kernel passes -- pass 1 sums
+    # ``g * x`` over BLOCK_K chunks (this chunk width fixes the ``s`` reduction
+    # order, see _mhc_dx_kernel), pass 2 stores ``dx = g * inv - x * scale``.
+    # Pass 2 is elementwise so its chunk width is bit-free: unlike the fused
+    # kernel (whose ``g`` comes from the L0C accumulator), both ``g`` and ``x``
+    # are UB-resident global loads here and BiShengIR double-buffers them, so
+    # 512-wide fp32 tiles overflow the UB budget -- the launch site passes 128.
+    # All reads/writes are plain global-memory traffic; no cube work, no L0C.
+    pid = tl.program_id(0)
+    nprogs = tl.num_programs(0)
+    for blk in range(pid, tl.cdiv(T, BLOCK_T), nprogs):
+        t_off = blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        t64 = t_off[:, None].to(tl.int64)
+        inv = tl.load(rstd_ptr + t_off)
+        # pass 1: s = <g, x> over the full row (same BLOCK_K sum tree as the fused kernel)
+        s = tl.zeros([BLOCK_T], dtype=tl.float32)
+        for k0 in range(0, N, BLOCK_K):
+            k_off = k0 + tl.arange(0, BLOCK_K)
+            g = tl.load(g_ptr + t64 * N + k_off[None, :])
+            xv = tl.load(x_ptr + t64 * N + k_off[None, :]).to(tl.float32)
+            s += tl.sum(g * xv, axis=1)
+        scale = s * inv * inv * inv / N
+        # pass 2: dx = g * inv - x * scale
+        for k0 in range(0, N, BLOCK_K2):
+            k_off = k0 + tl.arange(0, BLOCK_K2)
+            g = tl.load(g_ptr + t64 * N + k_off[None, :])
+            xv = tl.load(x_ptr + t64 * N + k_off[None, :]).to(tl.float32)
+            tl.store(
+                dx_ptr + t64 * N + k_off[None, :],
+                (g * inv[:, None] - xv * scale[:, None]).to(dx_ptr.dtype.element_ty),
+            )
 
 
 @triton.jit
@@ -316,12 +509,11 @@ def _mhc_dx_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_K2: tl.constexpr,
 ):
-    # BLOCK_K (pass 1) must match the anchor reduction order: the per-chunk
-    # ``tl.sum(g * xv, axis=1)`` tree over BLOCK_K columns sets the bit-exact
-    # summation order of ``s`` (a 512-wide pass 1 moves the 64K loss off the
-    # 12.36008358 anchor; verified by NPU microbench). Pass 2 only recomputes
-    # ``g`` and stores elementwise, so its width is bit-free -- 512 there is
-    # ~27% faster than 128 at the production shape.
+    # BLOCK_K (pass 1) fixes the bit-exact summation order: the per-chunk
+    # ``tl.sum(g * xv, axis=1)`` tree over BLOCK_K columns defines the reduction
+    # order of ``s`` (widening pass 1 to 512 changes the result). Pass 2 only
+    # recomputes ``g`` and stores elementwise, so its width is bit-free -- 512
+    # there is ~27% faster than 128 at the production shape.
     pid = tl.program_id(0)
     nprogs = tl.num_programs(0)
     j_off = tl.arange(0, MIX_PAD)
@@ -398,9 +590,31 @@ class _MhcNormLinearFn(torch.autograd.Function):
             x2d, rstd, tokens, N=n, EPS=eps, BLOCK_D=_RSTD_D_BLOCK, num_warps=4
         )
         y = torch.empty((tokens, mix), dtype=torch.float32, device=x2d.device)
-        _mhc_fwd_kernel[(min(triton.cdiv(tokens, _T_TILE), _MAX_PROGS),)](
-            x2d, w, y, rstd, tokens, N=n, MIX=mix, MIX_PAD=mix_pad, BLOCK_T=_T_TILE, BLOCK_K=_K_TILE, num_warps=4
-        )
+        if MHC_NORM_LINEAR_SPLIT and tokens % _T_TILE == 0:
+            if not _LOG_STATE["split_engaged"]:
+                _LOG_STATE["split_engaged"] = True
+                print(
+                    f"[glm53] mhc_norm_linear fwd split engaged: tokens={tokens}, n={n}, mix={mix}, dtype={w.dtype}",
+                    flush=True,
+                )
+            y_raw = torch.empty((tokens, mix_pad), dtype=torch.float32, device=x2d.device)
+            _mhc_fwd_dot_kernel[(min(triton.cdiv(tokens, _T_TILE), _MAX_PROGS),)](
+                x2d, w, y_raw, tokens, N=n, MIX=mix, MIX_PAD=mix_pad, BLOCK_T=_T_TILE, BLOCK_K=_K_TILE, num_warps=4
+            )
+            _mhc_scale_kernel[(min(tokens, _MAX_PROGS),)](
+                y_raw, rstd, y, tokens, MIX=mix, MIX_PAD=mix_pad, num_warps=4
+            )
+        else:
+            if MHC_NORM_LINEAR_SPLIT and not _LOG_STATE["split_fallback"]:
+                _LOG_STATE["split_fallback"] = True
+                print(
+                    f"[glm53] mhc_norm_linear split engaged but tokens={tokens} not a multiple of "
+                    f"{_T_TILE}; falling back to the fused mix kernel",
+                    flush=True,
+                )
+            _mhc_fwd_kernel[(min(triton.cdiv(tokens, _T_TILE), _MAX_PROGS),)](
+                x2d, w, y, rstd, tokens, N=n, MIX=mix, MIX_PAD=mix_pad, BLOCK_T=_T_TILE, BLOCK_K=_K_TILE, num_warps=4
+            )
         ctx.save_for_backward(x2d, w, rstd)  # type: ignore[attr-defined]
         return y
 
@@ -416,40 +630,111 @@ class _MhcNormLinearFn(torch.autograd.Function):
         mix = w.shape[0]
         mix_pad = max(triton.next_power_of_2(mix), 16)
         dm = dmixes.reshape(tokens, mix).contiguous()
+        split_bwd = MHC_NORM_LINEAR_BWD_SPLIT and tokens % _T_TILE == 0
+        if split_bwd and not _LOG_STATE["bwd_split_engaged"]:
+            _LOG_STATE["bwd_split_engaged"] = True
+            print(
+                f"[glm53] mhc_norm_linear bwd split engaged: tokens={tokens}, n={n}, mix={mix}, dtype={w.dtype}",
+                flush=True,
+            )
+        if MHC_NORM_LINEAR_BWD_SPLIT and not split_bwd and not _LOG_STATE["bwd_split_fallback"]:
+            _LOG_STATE["bwd_split_fallback"] = True
+            print(
+                f"[glm53] mhc_norm_linear bwd split engaged but tokens={tokens} not a multiple of "
+                f"{_T_TILE}; falling back to the fused mix backward kernels",
+                flush=True,
+            )
         d_w = None
         if ctx.needs_input_grad[1]:  # type: ignore[attr-defined]
-            d_w = torch.empty_like(w)
-            _mhc_dfn_kernel[(min(n // _DFN_D_TILE, _MAX_PROGS),)](
-                x2d,
-                dm,
-                rstd,
-                d_w,
-                tokens,
-                N=n,
-                MIX=mix,
-                MIX_PAD=mix_pad,
-                BLOCK_T=_T_TILE,
-                BLOCK_D=_DFN_D_TILE,
-                num_warps=8,
-            )
+            if split_bwd:
+                # Split d_fn backward: the AIV-precomputed bf16 (dm * rstd) feeds a
+                # cube-only GEMM whose raw fp32 output is cast by ``copy_`` (same
+                # RTNE rounding as the fused kernel's masked store cast).
+                dm_scaled = (dm * rstd[:, None]).to(w.dtype)
+                dw_raw = torch.empty((mix_pad, n), dtype=torch.float32, device=x2d.device)
+                _mhc_dfn_dot_kernel[(min(n // _DFN_D_TILE, _MAX_PROGS),)](
+                    dm_scaled,
+                    x2d,
+                    dw_raw,
+                    tokens,
+                    N=n,
+                    MIX=mix,
+                    MIX_PAD=mix_pad,
+                    BLOCK_T=_T_TILE,
+                    BLOCK_D=_DFN_D_TILE,
+                    num_warps=8,
+                )
+                d_w = torch.empty_like(w)
+                d_w.copy_(dw_raw[:mix])
+            else:
+                d_w = torch.empty_like(w)
+                _mhc_dfn_kernel[(min(n // _DFN_D_TILE, _MAX_PROGS),)](
+                    x2d,
+                    dm,
+                    rstd,
+                    d_w,
+                    tokens,
+                    N=n,
+                    MIX=mix,
+                    MIX_PAD=mix_pad,
+                    BLOCK_T=_T_TILE,
+                    BLOCK_D=_DFN_D_TILE,
+                    num_warps=8,
+                )
         d_x = None
         if ctx.needs_input_grad[0]:  # type: ignore[attr-defined]
-            d_x = torch.empty_like(x2d)
-            _mhc_dx_kernel[(min(triton.cdiv(tokens, _T_TILE), _MAX_PROGS),)](
-                x2d,
-                w,
-                dm,
-                rstd,
-                d_x,
-                tokens,
-                N=n,
-                MIX=mix,
-                MIX_PAD=mix_pad,
-                BLOCK_T=_T_TILE,
-                BLOCK_K=_K_TILE,
-                BLOCK_K2=_DX_K2_TILE,
-                num_warps=4,
-            )
+            if split_bwd:
+                # Split d_x backward: a cube-only GEMM materialises the full [T, N]
+                # fp32 ``g = dm_b @ w`` (256 MB at the production shape; the fused
+                # kernel recomputes it chunk-wise), then an AIV kernel applies both
+                # fused-kernel passes over the buffer with identical chunk widths
+                # and reduction orders.
+                dm_b = dm.to(w.dtype)
+                g_raw = torch.empty((tokens, n), dtype=torch.float32, device=x2d.device)
+                _mhc_dx_dot_kernel[(min(triton.cdiv(tokens, _T_TILE), _MAX_PROGS),)](
+                    dm_b,
+                    w,
+                    g_raw,
+                    tokens,
+                    N=n,
+                    MIX=mix,
+                    MIX_PAD=mix_pad,
+                    BLOCK_T=_T_TILE,
+                    BLOCK_K2=_DX_K2_TILE,
+                    num_warps=4,
+                )
+                d_x = torch.empty_like(x2d)
+                _mhc_dx_apply_kernel[(min(triton.cdiv(tokens, _T_TILE), _MAX_PROGS),)](
+                    g_raw,
+                    x2d,
+                    rstd,
+                    d_x,
+                    tokens,
+                    N=n,
+                    BLOCK_T=_T_TILE,
+                    BLOCK_K=_K_TILE,
+                    # elementwise pass: 512-wide fp32 g/xv tiles double-buffer past
+                    # the UB budget (see the kernel comment); the width is bit-free
+                    BLOCK_K2=_K_TILE,
+                    num_warps=4,
+                )
+            else:
+                d_x = torch.empty_like(x2d)
+                _mhc_dx_kernel[(min(triton.cdiv(tokens, _T_TILE), _MAX_PROGS),)](
+                    x2d,
+                    w,
+                    dm,
+                    rstd,
+                    d_x,
+                    tokens,
+                    N=n,
+                    MIX=mix,
+                    MIX_PAD=mix_pad,
+                    BLOCK_T=_T_TILE,
+                    BLOCK_K=_K_TILE,
+                    BLOCK_K2=_DX_K2_TILE,
+                    num_warps=4,
+                )
         return d_x, d_w, None
 
 
