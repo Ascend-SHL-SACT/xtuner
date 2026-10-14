@@ -16,8 +16,9 @@ DSAIndexerBackend = Literal[
 # reference path, "tilelang" is the only production kernel today -- unlike GLM-5.2's per-token
 # DSAIndexerBackend, there's no cudnn_dsa/flash_mla/deep_gemm_fp8/cute_dsl KPool kernel.
 # "torch_npu" adds the Ascend backend (fused lightning scoring on NPU, chunked-eager fallback
-# elsewhere).
-KPoolIndexerBackend = Literal["torch", "tilelang", "torch_npu"]
+# elsewhere). "tilelang_cooperative" is cooperative BF16 scoring + DeepSelect and retains the
+# original TileLang backend.
+KPoolIndexerBackend = Literal["torch", "tilelang", "tilelang_cooperative", "torch_npu"]
 
 
 class SparseMLAOutputs(NamedTuple):
@@ -102,4 +103,6 @@ class KPoolTopKIndicesProtocol(Protocol):
         always_select_tail: bool = True,
         alignment: int = 512,
         query_chunk_size: int | None = None,
+        balance_sp: bool = False,
+        sp_full_pool_work_ratio: float = 0.5,
     ) -> torch.Tensor: ...

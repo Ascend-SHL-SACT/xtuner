@@ -28,9 +28,10 @@ FFN sub-blocks with this ``hc_pre`` / sub_block / ``hc_post`` pattern.
 import os
 
 import torch
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from torch import Tensor
 
+from xtuner.v1.ops.fp32_linear import fp32_linear
 from xtuner.v1.utils.compile import maybe_compile
 
 
@@ -102,6 +103,8 @@ class MHCConfig(BaseModel):
             anchor in tests).
         hc_eps (float): Stabilizer used inside the Sinkhorn normalization.
         hc_sinkhorn_iters (int): Number of Sinkhorn iterations.
+        projection_block_size (int): Fixed fp32 GEMM row count for the mixing
+            projection (``0`` keeps the native token-row count).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -109,6 +112,7 @@ class MHCConfig(BaseModel):
     hc_mult: int
     hc_eps: float = 1e-6
     hc_sinkhorn_iters: int = 20
+    projection_block_size: int = Field(default=0, ge=0)
 
 
 def hc_split_sinkhorn(
@@ -181,6 +185,7 @@ def hc_pre(
     iters: int,
     eps: float,
     norm_eps: float = 1e-6,
+    projection_block_size: int = 0,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Reduce ``hc_mult`` streams down to one, returning the reduced state and
     the ``post``/``comb`` weights that the matching :func:`hc_post` call will
@@ -205,6 +210,8 @@ def hc_pre(
         iters (int): Sinkhorn iterations.
         eps (float): Sinkhorn stabilizer.
         norm_eps (float): RMS-norm stabilizer applied before projecting to ``mixes``.
+        projection_block_size (int): Fixed fp32 GEMM row count for the eager mixing
+            projection (``0`` keeps the native token-row count).
 
     Returns:
         tuple[Tensor, Tensor, Tensor]:
@@ -227,13 +234,12 @@ def hc_pre(
     if fused_mixes is not None:
         mixes: Tensor = fused_mixes.view(shape[0], shape[1], -1)
     else:
-        # HF's `Glm5NextTextUnweightedRMSNorm` rescales in fp32 (no learned weight), then the
-        # `fn` projection runs on the *input* dtype and only the sinkhorn split is upcast --
-        # matching `F.linear(flat_normed, hc_fn.to(dtype)).float()` below.
-        flat_normed = torch.nn.functional.rms_norm(x_flat.float(), (x_flat.size(-1),), weight=None, eps=norm_eps).to(
-            dtype
-        )
-        mixes = torch.nn.functional.linear(flat_normed, hc_fn.to(dtype)).float()
+        # HF keeps both the unweighted norm and mixing projection in fp32 (F6.3: a BF16
+        # projection can round differently when SP changes the number of token rows,
+        # perturbing the residual streams before attention even runs); fp32_linear keeps
+        # the GEMM row geometry SP-independent when projection_block_size is set.
+        flat_normed = torch.nn.functional.rms_norm(x_flat.float(), (x_flat.size(-1),), weight=None, eps=norm_eps)
+        mixes = fp32_linear(flat_normed, hc_fn, block_size=projection_block_size)
 
     if _hc_split_sinkhorn_fused is not None and _MHC_SINKHORN_FUSED and hc_mult == 4 and x_flat.device.type == "npu":
         pre, post, comb = _hc_split_sinkhorn_fused(mixes, hc_scale, hc_base, hc_mult, iters, eps)

@@ -43,8 +43,8 @@ from xtuner.v1.module.grouped_linear.moe_group_linear import (
 )
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_act_fn, get_gated_act_fn
-from xtuner.v1.ops.moe.npu import fused_a2a_gmm
 from xtuner.v1.ops.fp32_linear import fp32_linear
+from xtuner.v1.ops.moe.npu import fused_a2a_gmm
 from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
