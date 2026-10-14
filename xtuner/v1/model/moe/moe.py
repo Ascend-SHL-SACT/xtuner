@@ -4,6 +4,7 @@ import os
 import types
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Callable, Literal, Self, Sequence, TypedDict, cast
+from weakref import WeakKeyDictionary
 
 import torch
 import torch.distributed as dist
@@ -195,6 +196,87 @@ class MoEConfig(TransformerConfig):
 def use_moe_ep_compile_cfg(config: MoEConfig) -> bool:
     # 中文注释：ExpertTP 也会跨 rank 进入 dispatcher 通信段，compile 边界应和 EP 路径一致。
     return config.ep_size > 1 or config.expert_tp_size > 1
+
+
+def nonpad_index_and_count(seq_ctx_list: list[SequenceContext]) -> tuple[torch.Tensor, int]:
+    """Build the concatenated non-padding index vector and its token count.
+
+    ``SequenceContext.mask`` is "all True except the last ``num_padding`` positions" by
+    construction (the tail slice in the mask property is its only writer), so the valid
+    positions of the concatenated mask are the per-context leading
+    ``[start, start + T - num_padding)`` ranges. Deriving them from host metadata keeps
+    this path free of ``torch.nonzero``'s mandatory host-device sync (it must read the
+    mask to size its output: 14x/3.4 s per profiled step, up to 831 ms per call, on
+    mind-12 run12) and is bit-identical: both produce the same ascending int64 index
+    sequence. ``non_pad_token`` falls out of the same pass: the final offset is the
+    total token count, and padding never lands inside any ``[start, seg_end)``.
+
+    Args:
+        seq_ctx_list (list[SequenceContext]): The per-context sequence metadata; every
+            context must carry ``input_ids`` or ``inputs_embeds``.
+
+    Returns:
+        tuple[torch.Tensor, int]: The int64 non-padding token index vector (on the
+        contexts' device) and the non-padding token count.
+    """
+    nonpad_parts: list[torch.Tensor] = []
+    offset = 0
+    num_padding_total = 0
+    for ctx in seq_ctx_list:
+        ref = ctx.input_ids if ctx.input_ids is not None else ctx.inputs_embeds
+        assert ref is not None, "seq_ctx carries neither input_ids nor inputs_embeds"
+        t_len = int(ref.shape[1])
+        seg_end = offset + t_len - int(ctx.num_padding)
+        nonpad_parts.append(torch.arange(offset, seg_end, dtype=torch.int64, device=ref.device))
+        offset += t_len
+        num_padding_total += int(ctx.num_padding)
+    non_pad_token = offset - num_padding_total
+    nonpad_indices = torch.cat(nonpad_parts) if len(nonpad_parts) > 1 else nonpad_parts[0]
+    return nonpad_indices, non_pad_token
+
+
+# Sub-meshes derived in ``scale_and_reduce_grad`` are deterministic per (parent mesh,
+# replicate-dim names), but ``DeviceMesh.__getitem__``/``_flatten`` rebuild them from
+# scratch on every call (pure host-side work on torch 2.9.1; measured 1128
+# rebuilds/step at 30B/16-NPU). Cache the derived meshes instead.
+# XTUNER_MOE_FLAT_MESH_CACHE=0 restores the per-call rebuild.
+#
+# Lifetime note: entries are process-lifetime in practice, NOT garbage-collected with
+# the parent -- deriving a sub-mesh strongly pins the parent in torch's global mesh
+# registry (``_MeshResources.child_to_root_mapping``), so the weak key only covers the
+# never-derived parent. The cache is bounded by the small number of distinct
+# (parent mesh, replicate-dims) pairs, and it assumes the world process group is not
+# destroyed and re-created within the process: a re-created world whose new mesh
+# compares value-equal to an old one would hit a stale entry holding a dead group.
+_FLAT_REPLICATE_MESH_CACHE: WeakKeyDictionary[DeviceMesh, dict[tuple[str, ...], DeviceMesh]] = WeakKeyDictionary()
+_MOE_FLAT_MESH_CACHE = os.environ.get("XTUNER_MOE_FLAT_MESH_CACHE", "1") == "1"
+
+
+def _flat_replicate_mesh(mesh: DeviceMesh, replicate_dim_names: tuple[str, ...]) -> DeviceMesh:
+    # Lock-free get->create->insert: benign under the GIL (worst case an equivalent entry
+    # is derived twice). The only caller runs on the main training thread.
+    per_mesh = _FLAT_REPLICATE_MESH_CACHE.get(mesh)
+    if per_mesh is None:
+        per_mesh = {}
+        _FLAT_REPLICATE_MESH_CACHE[mesh] = per_mesh
+    flat_mesh = per_mesh.get(replicate_dim_names)
+    if flat_mesh is not None:
+        return flat_mesh
+    # `DeviceMesh.get_group()` only supports a single mesh dimension, so calling it
+    # directly on a multi-dim sub-mesh raises RuntimeError. `_flatten()` collapses all
+    # Replicate dims into a 1D mesh whose process group covers every rank across those
+    # dimensions, allowing a single all_reduce regardless of how many Replicate dims
+    # exist.
+    if len(replicate_dim_names) > 1:
+        flat_mesh = mesh[replicate_dim_names]._flatten()
+    else:
+        # In the case that only one replicate dim, in pt2.8 _flatten is worked due to a bug.
+        # in pt2.9.1 this bug is fixed and _flatten will raise error when the mesh is already 1D,
+        # which means replicate_dim_names represents an existing single mesh dimension
+        # so we directly get the submesh without flatten in this case.
+        flat_mesh = mesh[replicate_dim_names[0]]
+    per_mesh[replicate_dim_names] = flat_mesh
+    return flat_mesh
 
 
 class MoE(BaseModel):
@@ -754,11 +836,10 @@ class MoE(BaseModel):
             # Activation offload resizes saved tensors after D2H. A chunk view
             # cannot release its shared embedding storage independently.
             hidden_states_list = [hidden_states.clone() for hidden_states in hidden_states_list]
-        cat_mask = torch.cat([ctx.mask for ctx in seq_ctx_list], dim=1)
         # Hoisted out of the per-layer accumulate path: mask is constant across layers,
         # so the non-pad index lookup runs once per forward instead of once per (layer, ctx).
-        nonpad_indices = torch.nonzero(cat_mask, as_tuple=True)[1]
-        non_pad_token = nonpad_indices.numel()
+        nonpad_indices, non_pad_token = nonpad_index_and_count(seq_ctx_list)
+        mask_device = nonpad_indices.device
 
         # Initialize output containers
         output: dict = {}
@@ -770,7 +851,7 @@ class MoE(BaseModel):
             [{} for _ in range(len(seq_ctx_list))] if keep_router else []
         )
         balancing_ctx, z_ctx = self._extract_aux_loss_ctx(loss_ctx_list)
-        num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, cat_mask.device)
+        num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, mask_device)
 
         for seq_ctx in seq_ctx_list:
             self._mark_dynamic(seq_ctx)
@@ -816,7 +897,10 @@ class MoE(BaseModel):
                 seq_ctx=mtp_seq_ctx_list,
             )
 
-            mtp_losses = torch.tensor(0.0, device=DEVICE)
+            # Accumulate from the first loss tensor (no host-built 0.0 seed): the CPU->NPU
+            # scalar H2D parks the host at the tail of the stream queue. 0.0 + x is
+            # IEEE-exact, so the sum stays bit-identical in the same order.
+            mtp_losses: torch.Tensor | None = None
             has_mtp_loss = False
             for micro_batch_idx, (loss_ctx_dict, mtp_outputs) in enumerate(zip(loss_ctx_list, mtp_outputs_per_mb)):
                 mtp_loss_ctx_list = loss_ctx_dict.get("mtp")
@@ -835,15 +919,24 @@ class MoE(BaseModel):
                         (target_hidden_states, draft_hidden_states),
                         cast(MTPE2ETVLossContext, mtp_tv_loss_ctx),
                     )
-                    mtp_losses += mtp_loss
+                    # None-start with an explicit fp32 accumulator (.float() is a no-op on
+                    # fp32 inputs): reproduces the historical fp32-seeded sum without
+                    # relying on the first loss tensor already being fp32.
+                    mtp_losses = mtp_loss.float() if mtp_losses is None else mtp_losses + mtp_loss.float()
                     has_mtp_loss = True
                 elif mtp_loss_ctx_list is not None:
-                    micro_batch_mtp_losses = torch.tensor(0.0, device=DEVICE)
+                    micro_batch_mtp_losses: torch.Tensor | None = None
                     for mtp_hidden, mtp_ctx in zip(mtp_outputs, mtp_loss_ctx_list):
                         mtp_loss, _ = self.lm_head(mtp_hidden["hidden_states"], cast(MTPLossContext, mtp_ctx))
-                        micro_batch_mtp_losses += mtp_loss
+                        micro_batch_mtp_losses = (
+                            mtp_loss.float()
+                            if micro_batch_mtp_losses is None
+                            else micro_batch_mtp_losses + mtp_loss.float()
+                        )
 
-                    mtp_losses += micro_batch_mtp_losses / len(mtp_loss_ctx_list)
+                    assert micro_batch_mtp_losses is not None, "mtp loss loop never ran"
+                    mb_mean = micro_batch_mtp_losses / len(mtp_loss_ctx_list)
+                    mtp_losses = mb_mean if mtp_losses is None else mtp_losses + mb_mean
                     has_mtp_loss = True
 
             if has_mtp_loss:
@@ -886,6 +979,7 @@ class MoE(BaseModel):
                         world_size=z_world_size,
                     )
 
+                assert mtp_losses is not None
                 output["mtp_loss"] = mtp_losses * self.config.mtp_config.loss_scaling_factor
 
         # Apply final norm to all micro-batches
@@ -1129,6 +1223,7 @@ class MoE(BaseModel):
                 )
                 draft_hidden_states.append(mtp_hidden_states)
 
+            mtp_losses: torch.Tensor
             if mtp_tv_loss_ctx is not None:
                 # One joint call is required: the acceptance products in Eq. 13
                 # couple all recurrent MTP steps.
@@ -1138,11 +1233,17 @@ class MoE(BaseModel):
                 )
             else:
                 assert mtp_loss_ctx_list is not None
-                mtp_losses = torch.tensor(0.0, device=DEVICE)
+                # Accumulate from the first loss tensor (no host-built 0.0 seed): the CPU->NPU
+                # scalar H2D parks the host at the tail of the stream queue. The explicit
+                # fp32 accumulator (.float() is a no-op on fp32 inputs) reproduces the
+                # historical fp32-seeded sum without relying on the first loss tensor
+                # already being fp32.
+                acc: torch.Tensor | None = None
                 for mtp_hidden_states, mtp_ctx in zip(draft_hidden_states, mtp_loss_ctx_list):
                     mtp_loss, _ = self.lm_head(mtp_hidden_states, cast(MTPLossContext, mtp_ctx))
-                    mtp_losses += mtp_loss
-                mtp_losses = mtp_losses / len(mtp_loss_ctx_list)
+                    acc = mtp_loss.float() if acc is None else acc + mtp_loss.float()
+                assert acc is not None
+                mtp_losses = acc / len(mtp_loss_ctx_list)
 
             # Both objectives are normalized over MTP depth internally; scale once.
             scaled_mtp_loss = mtp_losses * self.config.mtp_config.loss_scaling_factor  # type: ignore
@@ -1667,21 +1768,11 @@ class MoE(BaseModel):
             if not replicate_dim_names:
                 continue
 
-            # `DeviceMesh.get_group()` only supports a single mesh dimension,
-            # so calling it directly on a multi-dim sub-mesh raises RuntimeError.
-            # `_flatten()` collapses all Replicate dims into a 1D mesh whose
-            # process group covers every rank across those dimensions, allowing
-            # a single all_reduce regardless of how many Replicate dims exist.
-            replica_mesh = self.world_mesh
-            if (
-                len(replicate_dim_names) == len(param.placements)
-                and replica_mesh is not None
-                and param.device_mesh.size() < replica_mesh.size()
-            ):
-                # Non-expert parameters are replicated on EP/ETP before FSDP. If
-                # ignored by FSDP, they also remain replicated over its DP dims,
-                # although the parameter still carries only the EP/ETP submesh.
-                flat_mesh = replica_mesh._flatten() if replica_mesh.ndim > 1 else replica_mesh
+            # `_flat_replicate_mesh` (cache hit) or the torch sub-mesh builders below
+            # collapse all Replicate dims into a 1D mesh whose process group covers
+            # every rank across those dimensions, so one all_reduce suffices.
+            if _MOE_FLAT_MESH_CACHE:
+                flat_mesh = _flat_replicate_mesh(param.device_mesh, replicate_dim_names)
             elif len(replicate_dim_names) > 1:
                 flat_mesh = param.device_mesh[replicate_dim_names]._flatten()
             else:

@@ -13,7 +13,6 @@ from xtuner.v1.utils.device import get_device
 # from xtuner.v1.profiler.prober import ProberList
 from .base_loss_ctx import BaseLossConfig, BaseLossContext, BaseLossKwargs
 from .chunk_loss import ChunkLoss
-from .liger_npu import _ensure_liger_npu
 from .utils import sp_gather, sp_split
 
 
@@ -110,21 +109,14 @@ class LMHeadLossContext(BaseLossContext):
     def __init__(self, loss_cfg: CELossConfig, loss_kwargs: CELossKwargs):
         super().__init__(loss_cfg, loss_kwargs)
 
-        self._liger_is_npu = False
         if loss_cfg.mode == "liger":
-            self._liger_is_npu = hasattr(torch, "npu") and torch.npu.is_available()
-            if self._liger_is_npu:
-                _ensure_liger_npu()
-            from liger_kernel.transformers.fused_linear_cross_entropy import (
-                LigerFusedLinearCrossEntropyLoss,
-            )
+            # Device-dispatched FLCE: NPU uses the in-package implementation
+            # (xtuner.v1.loss.get_flce_loss_cls), CUDA uses liger_kernel's
+            # stock class. reduction stays 'sum' on both devices.
+            from xtuner.v1.loss import get_flce_loss_cls
 
-            # NPU: reduction='none' so FLCE returns per-token loss_1d, which
-            # _patch_liger_ascend_fwd overwrites with torch CE (ascend triton
-            # miscomputes it multi-rank) and the no-weight backward reads for
-            # lse. GPU keeps upstream 'sum' -- cuda kernel is correct, no patch.
-            self.liger_loss_fct = LigerFusedLinearCrossEntropyLoss(
-                reduction="none" if self._liger_is_npu else "sum",
+            self.liger_loss_fct = get_flce_loss_cls()(
+                reduction="sum",
                 accum_dtype=torch.float32,
             )
         else:
@@ -212,13 +204,17 @@ class LMHeadLossContext(BaseLossContext):
         shifted_labels = shifted_labels.flatten()
         loss_weight = loss_weight.flatten()
 
-        rank_grad_tokens = (shifted_labels != self.loss_cfg.ignore_idx).sum()
-        if rank_grad_tokens == 0:
-            loss = logits.sum() * 0
-        else:
-            loss = F.cross_entropy(logits, shifted_labels, reduction="none", ignore_index=self.loss_cfg.ignore_idx)
-            # Step 2.b in the loss calculation: sum the loss over all tokens
-            loss = (loss * loss_weight).sum()
+        # The historical ``if rank_grad_tokens == 0`` branch required a device->host bool
+        # conversion here -- one host sync per chunk, ~256 per training step across the CE and
+        # MTP chunk loops, each parked behind the stream queue. It is replaceable without
+        # changing any value: ``cross_entropy`` emits an exact 0.0 for every ignored label
+        # (the same path the historical else-branch exercised on every real step), so an
+        # all-ignored chunk sums to 0.0 -- the same value ``logits.sum() * 0`` produced --
+        # and normal rows keep their labels and weights, so the loss and its gradient are
+        # bit-identical on both branches.
+        loss = F.cross_entropy(logits, shifted_labels, reduction="none", ignore_index=self.loss_cfg.ignore_idx)
+        # Step 2.b in the loss calculation: sum the loss over all tokens
+        loss = (loss * loss_weight).sum()
 
         return loss, (logits, {})
 
@@ -259,8 +255,6 @@ class LMHeadLossContext(BaseLossContext):
             # step 2.b in the loss calculation: sum the loss over all tokens, then multiply the loss weight (i.e. divide by the global_denominator)
             loss = self.liger_loss_fct(head_weight, hidden_states, shifted_labels)
             # ProberList.record_tensor(loss, "[lm_head.ce_loss][before calibration]loss")
-            if self._liger_is_npu:  # NPU: reduction='none' -> per-token; sum to scalar
-                loss = loss.sum()
             mask = loss_weight != 0
             # w equals to 1/global_denominator on normal shards. clamp(min=1)
             # guards the all-padding SP-shard where mask.sum()==0 would give

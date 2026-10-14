@@ -35,6 +35,43 @@ from xtuner.v1.ops.fp32_linear import fp32_linear
 from xtuner.v1.utils.compile import maybe_compile
 
 
+try:  # fused NPU mHC kernels (triton-ascend); absent on CPU / reference boxes
+    # All five mHC env gates live in xtuner.v1.ops.mhc_fused (single home); the two
+    # dispatch-site flags are consumed at this module's conditions below.
+    from xtuner.v1.ops.mhc_fused import (
+        HC_POST_FUSED as _HC_POST_FUSED,
+    )
+    from xtuner.v1.ops.mhc_fused import (
+        MHC_SINKHORN_FUSED as _MHC_SINKHORN_FUSED,
+    )
+    from xtuner.v1.ops.mhc_fused import (
+        _hc_post_eager_matmul,
+    )
+    from xtuner.v1.ops.mhc_fused import (
+        hc_collapse as _hc_collapse,
+    )
+    from xtuner.v1.ops.mhc_fused import (
+        hc_combine as _hc_combine,
+    )
+    from xtuner.v1.ops.mhc_fused import (
+        hc_split_sinkhorn_fused as _hc_split_sinkhorn_fused,
+    )
+    from xtuner.v1.ops.mhc_fused import (
+        mhc_norm_linear as _mhc_norm_linear,
+    )
+except ImportError:  # pragma: no cover - triton-less environments
+    _mhc_norm_linear = None  # type: ignore[assignment]
+    _hc_post_eager_matmul = None  # type: ignore[assignment]
+    _hc_split_sinkhorn_fused = None  # type: ignore[assignment]
+    _hc_combine = None  # type: ignore[assignment]
+    _hc_collapse = None  # type: ignore[assignment]
+    # mhc_fused failed to import: every fused branch these two flags gate first
+    # requires an entry point that is None above, so the flags collapse to their
+    # defaults without re-parsing the env (behavior-identical on this path).
+    _HC_POST_FUSED = True
+    _MHC_SINKHORN_FUSED = True
+
+
 __all__ = ["MHCConfig", "hc_split_sinkhorn", "hc_pre", "hc_post"]
 
 # Opt-in switch for the DeepSeek TileKernels ``mhc`` backend (Hopper TileLang; see
@@ -43,6 +80,15 @@ __all__ = ["MHCConfig", "hc_split_sinkhorn", "hc_pre", "hc_post"]
 # a known-correct eager/Triton path for an unverifiable one. Left as a documented gap (see
 # doc/progress.md F4) rather than silently wired to a nonexistent module.
 _USE_MHC_KERNELS = os.getenv("XTUNER_USE_MHC_KERNELS", "0") == "1"
+
+# Debug-only parity escape for NPU: XTUNER_HC_POST_FUSED=0 restores HEAD's HF
+# broadcast form (_hc_post_eager) for regression bisecting / HF parity debugging. The
+# default NPU numerics are deliberately the matmul form (_hc_post_eager_matmul, run81
+# anchor; approved 1.9e-4 loss deviation from the broadcast form) -- without this
+# switch no env combination reproduces HEAD bit-for-bit on NPU. The broadcast form
+# costs ~14 s/step at the 30B shape (materializes the [B, S, H, H, D] intermediate);
+# never set 0 for production runs. The flag is defined in xtuner.v1.ops.mhc_fused and
+# imported above.
 
 
 class MHCConfig(BaseModel):
@@ -57,6 +103,8 @@ class MHCConfig(BaseModel):
             anchor in tests).
         hc_eps (float): Stabilizer used inside the Sinkhorn normalization.
         hc_sinkhorn_iters (int): Number of Sinkhorn iterations.
+        projection_block_size (int): Fixed fp32 GEMM row count for the mixing
+            projection (``0`` keeps the native token-row count).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -162,6 +210,8 @@ def hc_pre(
         iters (int): Sinkhorn iterations.
         eps (float): Sinkhorn stabilizer.
         norm_eps (float): RMS-norm stabilizer applied before projecting to ``mixes``.
+        projection_block_size (int): Fixed fp32 GEMM row count for the eager mixing
+            projection (``0`` keeps the native token-row count).
 
     Returns:
         tuple[Tensor, Tensor, Tensor]:
@@ -171,16 +221,38 @@ def hc_pre(
     """
     shape, dtype = x.size(), x.dtype
     x_flat = x.flatten(2)
-    # HF keeps both the unweighted norm and mixing projection in fp32. A BF16
-    # projection can round differently when SP changes the number of token rows,
-    # perturbing the residual streams before attention even runs.
-    flat_normed = torch.nn.functional.rms_norm(x_flat.float(), (x_flat.size(-1),), weight=None, eps=norm_eps)
-    mixes = fp32_linear(flat_normed, hc_fn, block_size=projection_block_size)
+    # NPU fused path (the pre-merge GLM-5.3 implementation's default, i.e. the run81 128K
+    # anchor numerics): bf16 norm+projection via the rstd-factoring identity -- never
+    # materialises the [T, H*D] fp32 normed copy -- plus the on-chip split-Sinkhorn (the
+    # eager chain issues ~5 tiny kernels per Sinkhorn iteration, ~700K instances/step).
+    # Both ops fall back internally (``None`` return / device+hc_mult gate) and the eager
+    # chain below is the CPU reference; the readout is the fused triton collapse by
+    # default (as run81), with XTUNER_HC_COLLAPSE_FUSED=0 falling back to eager.
+    fused_mixes = None
+    if _mhc_norm_linear is not None and x_flat.device.type == "npu":
+        fused_mixes = _mhc_norm_linear(x_flat.reshape(-1, x_flat.size(-1)), hc_fn.to(dtype), norm_eps)
+    if fused_mixes is not None:
+        mixes: Tensor = fused_mixes.view(shape[0], shape[1], -1)
+    else:
+        # HF keeps both the unweighted norm and mixing projection in fp32 (F6.3: a BF16
+        # projection can round differently when SP changes the number of token rows,
+        # perturbing the residual streams before attention even runs); fp32_linear keeps
+        # the GEMM row geometry SP-independent when projection_block_size is set.
+        flat_normed = torch.nn.functional.rms_norm(x_flat.float(), (x_flat.size(-1),), weight=None, eps=norm_eps)
+        mixes = fp32_linear(flat_normed, hc_fn, block_size=projection_block_size)
 
-    pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps)
+    if _hc_split_sinkhorn_fused is not None and _MHC_SINKHORN_FUSED and hc_mult == 4 and x_flat.device.type == "npu":
+        pre, post, comb = _hc_split_sinkhorn_fused(mixes, hc_scale, hc_base, hc_mult, iters, eps)
+    else:
+        pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps)
 
     # Weighted reduce over the hc_mult axis: y[..., d] = sum_h pre[..., h] * x[..., h, d].
-    y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=-2)
+    # Fused triton path by default (XTUNER_HC_COLLAPSE_FUSED=1); its eager fallback is
+    # the same expression, so the =0 fallback is numerically identical to HEAD.
+    if _hc_collapse is not None:
+        y = _hc_collapse(pre, x_flat.view(shape))
+    else:
+        y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=-2)
     return y.to(dtype), post, comb
 
 
@@ -222,6 +294,25 @@ def hc_post(x: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
             "has not been ported to this branch yet (see doc/progress.md F4). Unset the env "
             "var to use the default Triton-fused / eager hc_post."
         )
+    if residual.device.type == "npu":
+        # Device gate must be explicit: under torch_npu's transfer_to_npu hook, NPU tensors
+        # report ``is_cuda == True``, which would route Ascend onto the CUDA-only Triton
+        # kernel below and die in BiShengIR (UB overflow compiling _hc_post_bwd_dred_kernel
+        # on 910C), so the NPU dispatch must return before the CUDA gate is evaluated.
+        if not _HC_POST_FUSED:
+            # Parity escape hatch (see the module-level env note): HEAD's HF broadcast
+            # form, slow but bit-comparable against non-NPU reference runs.
+            return _hc_post_eager(x, residual, post, comb)
+        # Fused triton combine by default (XTUNER_HC_COMBINE_FUSED=1, net device-time
+        # win); XTUNER_HC_COMBINE_FUSED=0 falls back to the matmul form in
+        # xtuner.v1.ops.mhc_fused.
+        if _hc_combine is not None:
+            return _hc_combine(post, comb, x, residual)
+        if _hc_post_eager_matmul is not None:
+            return _hc_post_eager_matmul(x, residual, post, comb)
+        # mhc_fused failed to import (triton-less NPU box): fall back to the pure-torch
+        # broadcast form, which is NPU-safe and bit-comparable against HEAD.
+        return _hc_post_eager(x, residual, post, comb)
     if residual.is_cuda and residual.dtype == torch.bfloat16 and _hc_post_fused_available():
         from xtuner.v1.ops.hc_post import hc_post_fused
 

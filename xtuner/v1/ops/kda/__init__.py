@@ -16,6 +16,11 @@ def _hf_impl_enabled() -> bool:
 
 
 def get_fused_kda_gate_fn():
+    from .npu_backend import fused_kda_gate as _npu_fused_kda_gate
+    from .npu_backend import npu_impl_selected
+
+    if npu_impl_selected():
+        return _npu_fused_kda_gate
     if _hf_impl_enabled():
         from fla.ops.kda.gate import fused_kda_gate as _fla_fused_kda_gate
 
@@ -26,6 +31,11 @@ def get_fused_kda_gate_fn():
 
 
 def get_causal_conv1d_fn():
+    from .npu_backend import causal_conv1d as _npu_causal_conv1d
+    from .npu_backend import npu_impl_selected
+
+    if npu_impl_selected():
+        return _npu_causal_conv1d
     if _hf_impl_enabled():
         from fla.modules.conv.causal_conv1d import causal_conv1d as _fla_causal_conv1d
 
@@ -36,6 +46,11 @@ def get_causal_conv1d_fn():
 
 
 def get_chunk_kda_fn():
+    from .npu_backend import chunk_kda as _npu_chunk_kda
+    from .npu_backend import npu_impl_selected
+
+    if npu_impl_selected():
+        return _npu_chunk_kda
     if _hf_impl_enabled():
         from fla.ops.kda import chunk_kda as _fla_chunk_kda
 

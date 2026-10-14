@@ -44,6 +44,7 @@ from xtuner.v1.utils.init_weight import init_params
 # topk-index buffer width must match what that backend's kernel expects.
 _SPARSE_MLA_ALIGNMENT: dict[str, int] = {
     "torch": 1,
+    "torch_npu": 1,
     "flash_mla_cudnn": 512,
     "tilelang": 64,
 }
@@ -154,15 +155,20 @@ class NoPEDSAMLAConfig(MLAConfig):
     index_kpool: int = 4
     index_kpool_always_select_tail: bool = True
     indexer_types: list[str] | None = None
-    # Production default: FlashMLA fwd (native 512 head_dim) + cuDNN bwd (no dim hardcoding) --
-    # equivalent to Automodel's cudnn_sparse_attention; doesn't need the TileLang tail_dim=0 fix
-    # (design doc 3.5.2). "tilelang" needs that kernel fix and is not implemented yet (F5.b).
-    sparse_mla_backend: Literal["torch", "flash_mla_cudnn", "tilelang"] = "flash_mla_cudnn"
+    # Class default is the head-count-safe reference backend, not the production one: the
+    # flash_mla_cudnn validator above requires 64-aligned query heads, so a flash_mla_cudnn
+    # default would make `Glm53TextMoEConfig.from_hf` raise for the 32-head GLM-5.3-Flash
+    # checkpoint before the entry-point config can override the backend. Real entry points
+    # select the backend explicitly (sft_glm53.py: SPARSE_MLA_BACKEND env, defaulting to
+    # flash_mla_cudnn there = FlashMLA fwd (native 512 head_dim) + cuDNN bwd, equivalent to
+    # Automodel's cudnn_sparse_attention; doesn't need the TileLang tail_dim=0 fix, design
+    # doc 3.5.2). "tilelang" needs that kernel fix and is not implemented yet (F5.b).
+    sparse_mla_backend: Literal["torch", "flash_mla_cudnn", "tilelang", "torch_npu"] = "torch"
     # Independent of `sparse_mla_backend` above, which is `flash_mla_cudnn` here and is not
     # even a valid indexer backend -- inheriting it would never have worked.
+    indexer_backend: KPoolIndexerBackend = "tilelang"
     # Opt in with "tilelang_cooperative" for cooperative BF16 scoring + DeepSelect.
     # Requires SM90+, BF16 Q/K with 32 heads x 128, and an installed DeepSelect module.
-    indexer_backend: KPoolIndexerBackend = "tilelang"
     # Bound logits memory with query chunks; cooperative scoring reuses FP32 scratch.
     indexer_topk_query_chunk_size: int | None = Field(default=1024, gt=0)
     # Enable SP balancing to redistribute causal scoring queries with neighbor P2P.
@@ -326,7 +332,16 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
         else:
             topk_ids = self.indexer(hidden_states, q_resid, seq_ctx)
 
-        out = self.sparse_mla_func(query_states, key_states, topk_ids, self.softmax_scale, value_dim=self.kv_lora_rank)
+        if self.sparse_mla_backend != "torch_npu":
+            out = self.sparse_mla_func(
+                query_states, key_states, topk_ids, self.softmax_scale, value_dim=self.kv_lora_rank
+            )
+        else:
+            # npu_sparse_mla consumes seq_ctx for its packed per-segment causal masking;
+            # tilelang's entry has no seq_ctx parameter, so it cannot be passed unconditionally.
+            out = self.sparse_mla_func(
+                query_states, key_states, topk_ids, self.softmax_scale, value_dim=self.kv_lora_rank, seq_ctx=seq_ctx
+            )
         raw_output = torch.einsum("shm,hdm->shd", out.raw_output, w_vc)
         raw_output = raw_output.reshape(bsz, seq_len, self.num_attention_heads * self.v_head_dim).contiguous()
         projected_output = self.o_proj(raw_output)

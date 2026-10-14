@@ -2,6 +2,8 @@ import torch
 from torch.distributed._functional_collectives import all_to_all_single_autograd as _all_to_all_single_autograd
 from torch.distributed.device_mesh import DeviceMesh
 
+from xtuner.v1.ops.comm.ulysses_dispatch import a2a_async_enabled, ulysses_scatter_heads_blocking
+
 
 def ulysses_all_to_all(
     input: torch.Tensor,
@@ -27,6 +29,9 @@ def ulysses_all_to_all(
     Note:
         The scatter dimension must be evenly divisible by the group size.
     """
+    if a2a_async_enabled() and input.shape[0] == 1 and scatter_dim == 1 and gather_dim == 2:
+        return ulysses_scatter_heads_blocking(input, mesh.get_group())
+
     world_size = mesh.size()
     split_size = input.size(scatter_dim) // world_size
     input_split_sizes = [split_size] * world_size
