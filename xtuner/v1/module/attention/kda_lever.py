@@ -7,7 +7,11 @@ the lever bodies live here. Each lever is a kill switch: setting its env to
 and every
 lever is bit-identical in the values it produces -- they only move *when the
 host waits*, *which copy does the layout work*, or *who recomputes a
-derivation*.
+derivation*. The one hardwired exception is the g/beta consumption-point finish
+in ``sp_deferred_projections`` (its env gate was removed after an on-box A/B):
+``SP_A2A_DEFER=0`` is its only fallback, and that blocking path is
+value-correct but deliberately keeps the fla_npu ``input_guard`` clone tax
+(~0.7 s/step at 16 NPU).
 
 - ``SP_A2A_DEFER`` (``XTUNER_KDA_SP_A2A_DEFER``, default ``1``):
   ``sp_deferred_projections`` / ``sp_deferred_output`` issue each Ulysses a2a
@@ -26,7 +30,12 @@ derivation*.
   the q/k/v a2a results are consumed with the single-copy seq-major finish
   (``finish_ulysses_dim1_seq_major``) instead of the head-major finish +
   ``transpose(1, 2).contiguous()`` pair -- same values, one permutation copy
-  saved forward and one saved backward per conv.
+  saved forward and one saved backward per conv. g/beta's consumption points
+  use the same seq-major finish unconditionally (no flag): the head-major
+  finish's transposed view reaches the chunk kernel as a non-contiguous
+  tensor that fla_npu's ``input_guard`` clones on every call (two 64 MiB
+  clones per KDA layer invocation at the training shapes, ~650-840 ms/step
+  wall-clock at 16 NPU when present).
 - ``PARAM_CACHE`` (``XTUNER_KDA_PARAM_CACHE``, default ``1``):
   ``cached_gate_param`` skips re-deriving the fp32 form of long-lived
   forget-gate parameters on every call (~2.4k materialize chains per training
@@ -243,9 +252,11 @@ def sp_deferred_projections(
     q = _finish_short_conv(attn.q_conv1d, dq, sp_rank, sp_size, cu_seqlens)
     k = _finish_short_conv(attn.k_conv1d, dk, sp_rank, sp_size, cu_seqlens)
     v = _finish_short_conv(attn.v_conv1d, dv, sp_rank, sp_size, cu_seqlens)
-    g_raw = finish_ulysses_dim1(*dg)
-    g_raw = g_raw.transpose(1, 2).view(batch_size, seq_len * sp_size, attn.num_heads // sp_size, attn.head_dim)
-    beta = finish_ulysses_dim1(*dbeta).transpose(1, 2).sigmoid()  # (B, L, H/sp)
+    # Contiguous by construction; the head-major finish's transposed view would be
+    # cloned by the chunk kernel's input_guard on every call (see module docstring).
+    g_raw = finish_ulysses_dim1_seq_major(dg[0], dg[1])
+    g_raw = g_raw.view(batch_size, seq_len * sp_size, attn.num_heads // sp_size, attn.head_dim)
+    beta = finish_ulysses_dim1_seq_major(dbeta[0], dbeta[1]).sigmoid()  # (B, L, H/sp)
     return q, k, v, g_raw, beta
 
 
