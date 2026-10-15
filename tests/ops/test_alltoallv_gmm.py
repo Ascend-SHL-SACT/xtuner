@@ -29,6 +29,10 @@ caught — a symmetric/uniform input would mask both.
 5. ``TestFusedRecomputeRegression`` — finite-grads gate for the activation-checkpoint recompute path
    (the a2a-nan fix). Wraps ``fused_dispatch_mlp_combine`` in an outer reentrant checkpoint,
    recreating the whole-decoder re-issue that nanned in the 13B run52 reproducer.
+6. ``TestFusedRecvTokensHook`` — CPU-only contract gate (no distributed init): the fused
+   orchestrator must fire ``recv_tokens_hook`` with ``sum(recv_counts)`` — the received routed-row
+   count the dispatcher path reports and the step-end EP-load reduction consumes; its absence
+   crashed every rank at the first MoE forward (``_ep_load_reduce`` got a 0-length dispatch column).
 
 Run, e.g. (``DistributedTestBase`` is torch's ``MultiProcessTestCase`` — a single pytest process
 spawns the NPU ranks itself, so invoke directly, NOT under ``torchrun``; torchrun double-spawns and
@@ -52,6 +56,7 @@ from torch.testing._internal.common_distributed import DistributedTestBase
 from xtuner.v1.module.dispatcher.torch_all2all import TorchAll2AllDispatcher
 from xtuner.v1.ops import unpermute
 from xtuner.v1.ops.act_fn import get_act_fn
+from xtuner.v1.ops.moe.npu import fused_a2a_gmm
 from xtuner.v1.ops.moe.npu.fused_a2a_gmm import (
     AlltoallvPermuteGmm,
     _compute_counts,
@@ -495,3 +500,65 @@ class TestFusedRecomputeRegression(DistributedTestBase):
         for name, grad in (("dHidden", hidden.grad), ("dW1", w1.grad), ("dW2", w2.grad)):
             assert grad is not None, f"{name} is None"
             assert torch.isfinite(grad).all(), f"{name} has nan/inf (max={grad.abs().max()})"
+
+
+class TestFusedRecvTokensHook:
+    """Contract gate: the fused path must drive ``recv_tokens_hook`` like the dispatcher path.
+
+    The fused branch in ``MoEDecoderLayer._pre_moe_forward`` returns before ``dispatcher.dispatch``,
+    so nothing fired ``recv_tokens_hook``; ``_ep_recv_tokens`` stayed empty and the step-end EP-load
+    reduction crashed on every rank (``aclnnAmax EZ1001: Expected reducution dim 2 to have non-zero
+    size`` — ``_ep_load_reduce``'s ``view`` got a 0-length dispatch column). The fix fires the hook
+    inside ``fused_dispatch_mlp_combine`` with ``sum(recv_counts)`` — the same received routed-row
+    count the dispatcher path reports as ``post_dispatched["hidden_states"].shape[0]``. These tests
+    pin the contract with the counts and the two autograd ops stubbed (CPU-only, no distributed
+    init; the CANN kernels are never invoked).
+    """
+
+    @staticmethod
+    def _stub_ops(monkeypatch):
+        # ``apply`` returns its first argument, so the orchestrator runs end-to-end and the
+        # activation is the identity of the stub's pass-through.
+        stub = type("_StubGmm", (), {"apply": staticmethod(lambda x, *args, **kwargs: x)})
+        monkeypatch.setattr(fused_a2a_gmm, "AlltoallvPermuteGmm", stub)
+        monkeypatch.setattr(fused_a2a_gmm, "GmmUnpermuteAlltoallv", stub)
+
+    def test_hook_receives_total_recv_counts(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            fused_a2a_gmm,
+            "_compute_counts",
+            lambda topk_ids, n_routed_experts, ep_group: ([3, 4], [2, 5], [7]),
+        )
+        self._stub_ops(monkeypatch)
+        out = fused_a2a_gmm.fused_dispatch_mlp_combine(
+            hidden_states=torch.zeros(4, 8),
+            w1=torch.zeros(2, 8, 8),
+            w2=torch.zeros(2, 8, 8),
+            act_fn=lambda x, split_dim=-1: x,
+            topk_ids=torch.zeros(4, 2, dtype=torch.long),
+            n_routed_experts=2,
+            ep_group=None,
+            recv_tokens_hook=calls.append,
+        )
+        assert calls == [7]
+        assert out.shape == (4, 8)
+
+    def test_hook_optional(self, monkeypatch):
+        monkeypatch.setattr(
+            fused_a2a_gmm,
+            "_compute_counts",
+            lambda topk_ids, n_routed_experts, ep_group: ([0, 0], [0, 0], [0]),
+        )
+        self._stub_ops(monkeypatch)
+        out = fused_a2a_gmm.fused_dispatch_mlp_combine(
+            hidden_states=torch.zeros(4, 8),
+            w1=torch.zeros(2, 8, 8),
+            w2=torch.zeros(2, 8, 8),
+            act_fn=lambda x, split_dim=-1: x,
+            topk_ids=torch.zeros(4, 2, dtype=torch.long),
+            n_routed_experts=2,
+            ep_group=None,
+            recv_tokens_hook=None,
+        )
+        assert out.shape == (4, 8)
