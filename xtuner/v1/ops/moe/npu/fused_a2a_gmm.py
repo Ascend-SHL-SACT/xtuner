@@ -33,7 +33,7 @@ activation + the shared-experts/post-moe merge around ``fused_dispatch_mlp_combi
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 import torch
 import torch.distributed as dist
@@ -330,6 +330,7 @@ def fused_dispatch_mlp_combine(
     topk_ids: torch.Tensor,
     n_routed_experts: int,
     ep_group: dist.ProcessGroup,
+    recv_tokens_hook: Callable[[int], None] | None = None,
 ) -> torch.Tensor:
     """Run the fused dispatch + FC1 + activation + FC2 + combine alltoallv.
 
@@ -346,6 +347,10 @@ def fused_dispatch_mlp_combine(
         topk_ids (torch.Tensor): per-token routed expert ids ``[n_local, topk]``.
         n_routed_experts (int): global expert count.
         ep_group (dist.ProcessGroup): the expert-parallel process group.
+        recv_tokens_hook (Callable[[int], None] | None): optional per-dispatch hook invoked with the
+            total received routed-row count (``sum(recv_counts)`` -- the same value the dispatcher
+            path reports as ``post_dispatched["hidden_states"].shape[0]``). Also fires on the
+            activation-checkpoint recompute; the MoE layer's hook filters replays itself.
 
     Returns:
         torch.Tensor: the combined hidden states ``[n_local, hidden]``, in the input's sort order.
@@ -368,6 +373,8 @@ def fused_dispatch_mlp_combine(
         w1_fwd = w1.transpose(1, 2).contiguous()
         w2_fwd = w2.transpose(1, 2).contiguous()
     send_counts, recv_counts, group_list = _compute_counts(topk_ids, n_routed_experts, ep_group)
+    if recv_tokens_hook is not None:
+        recv_tokens_hook(sum(recv_counts))
     gate_up_out = AlltoallvPermuteGmm.apply(hidden_states, w1, w1_fwd, ep_group, send_counts, recv_counts, group_list)
     intermediate = act_fn(gate_up_out, split_dim=-1)
     combined = GmmUnpermuteAlltoallv.apply(intermediate, w2, w2_fwd, ep_group, send_counts, recv_counts, group_list)
@@ -398,8 +405,8 @@ def fused_forward(
 
     Args:
         decoder_layer (MoEDecoderLayer): the calling layer (supplies the FSDP2-local expert weights,
-            the MoE activation, the shared-experts forward, the post-moe merge, and the routed-expert
-            count -- the existing private helpers, called unchanged).
+            the MoE activation, the shared-experts forward, the post-moe merge, the routed-expert
+            count, and the per-dispatch ``recv_tokens_hook`` -- the existing helpers, called unchanged).
         router_results (RouterResults): router outputs (``topk_ids``/``topk_weights``/``logits``/
             ``router_weights``).
         pre_dispatched (PreDispatchResult): the ``TorchAll2AllDispatcher.dispatch_preprocess`` output
@@ -431,6 +438,7 @@ def fused_forward(
         topk_ids=router_results["topk_ids"],
         n_routed_experts=decoder_layer.n_routed_experts,
         ep_group=ep_group,
+        recv_tokens_hook=decoder_layer.recv_tokens_hook,
     )
     combined_hidden_states = unpermute(
         combined_hidden,
