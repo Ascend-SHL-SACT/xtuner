@@ -10,7 +10,12 @@ collective 数值与胶水一致，只有等待点不同，因此输出/梯度�
   ``f_b_proj(f_a_proj)`` 的 transpose；beta 为 ``b_proj.float().transpose``——**sigmoid 不前移**，
   a2a 输入是 sigmoid 前的 fp32 raw 值）；随后 q/k/v 依次经 ``_finish_short_conv``
   （``finish_ulysses_dim1`` 围栏 + ``transpose(1,2).contiguous`` + weight/bias 按 sp_rank chunk +
-  conv），g/beta 在消费点围栏（beta 再 ``transpose(1,2).sigmoid()``）；gate → core 之后 issue out
+  conv——此为 ``DIRECT_CONV=0`` legacy 形态，默认 ``DIRECT_CONV=1`` 走
+  ``finish_ulysses_dim1_seq_major`` 单拷贝），g/beta 在消费点围栏（无条件的单拷贝
+  ``finish_ulysses_dim1_seq_major``，
+  beta 再 ``sigmoid()``；head-major finish + ``transpose(1,2).sigmoid()`` 的 legacy 分支已随
+  ``XTUNER_KDA_SP_A2A_DIRECT_GATE`` env 一并删除）；
+  gate → core 之后 issue out
   一发，``_gate_output`` 之后在 o_norm 消费点围栏。
 - DEFER=0：blocking 调度——``_sp_short_conv`` 的 ``_all_to_all_conv_pre_{q,k,v}`` / ``_all_to_all_g``
   / ``_all_to_all_beta`` / ``_all_to_all_out`` 每个 a2a issue 后立即 fence（逐 collective 阻塞），
@@ -61,8 +66,9 @@ TestKdaSpFinishShortConv（2-rank gloo spawn）
     test_finish_short_conv_matches_blocking_post_fence_recipe: ``_finish_short_conv`` 的 fence 后
         尾段（token-major 转置 + weight/bias 按 sp_rank chunk + conv）与阻塞路径逐位一致。
 TestKdaSpDeferFlagHandling（主进程 1-rank gloo）
-    test_flag_selects_schedule_branches: 模块常量 True → 6 issue + 6 fence、0 次阻塞 wrapper；
-        False → 反之（6 次 wrapper）。
+    test_flag_selects_schedule_branches: 模块常量 DEFER/CONV True → 6 issue + 6 fence
+        （q/k/v/g/beta 走 seq-major、out 走 head-major）、0 次阻塞 wrapper；DEFER False → 反之
+        （6 次 wrapper）。
 TestKdaSpDeferEnvDefault
     test_env_default_resolves_to_deferred: 子进程验证 env 未设 → 常量为 True；"0" → False。
 """
@@ -414,23 +420,32 @@ def _run_schedule(
 ) -> _RunSnapshot:
     """以给定调度跑一次前向+梯度并快照（``async_env=None`` 表示 pop 掉 ASYNC env）。"""
     kda_lever.SP_A2A_DEFER = defer
-    if async_env is None:
-        os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
-    else:
-        os.environ["XTUNER_KDA_SP_A2A_ASYNC"] = async_env
-    _reset_records()
-    out, grads = _forward_grad(module, hidden_local, seq_ctx, go)
-    return {
-        "projected": out["projected_output"],
-        "raw": out["raw_output"],
-        "grads": grads,
-        "conv_in": list(_CONV_INPUTS),
-        "conv_out": list(_CONV_OUTPUTS),
-        "conv_w": list(_CONV_WEIGHTS),
-        "conv_b": list(_CONV_BIASES),
-        "core_in": list(_CORE_INPUTS),
-        "core_out": list(_CORE_OUTPUTS),
-    }
+    # 逐位对照须覆盖 seq-major finish 路径：钉住 DIRECT_CONV，防止带 =0
+    # 环境变量的机器把 DEFER=1 侧静默退回 legacy（fence 计数断言查不出值差异）。
+    # Save/restore keeps the pin self-contained (spawned workers exit right after this
+    # runs today; a future in-process caller would otherwise leak it into later tests).
+    _pinned_direct_conv = kda_lever.SP_A2A_DIRECT_CONV
+    kda_lever.SP_A2A_DIRECT_CONV = True
+    try:
+        if async_env is None:
+            os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
+        else:
+            os.environ["XTUNER_KDA_SP_A2A_ASYNC"] = async_env
+        _reset_records()
+        out, grads = _forward_grad(module, hidden_local, seq_ctx, go)
+        return {
+            "projected": out["projected_output"],
+            "raw": out["raw_output"],
+            "grads": grads,
+            "conv_in": list(_CONV_INPUTS),
+            "conv_out": list(_CONV_OUTPUTS),
+            "conv_w": list(_CONV_WEIGHTS),
+            "conv_b": list(_CONV_BIASES),
+            "core_in": list(_CORE_INPUTS),
+            "core_out": list(_CORE_OUTPUTS),
+        }
+    finally:
+        kda_lever.SP_A2A_DIRECT_CONV = _pinned_direct_conv
 
 
 def _equal_maybe_none(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
@@ -711,7 +726,8 @@ def _recording_finish(recv: torch.Tensor, work: object, out_shape: torch.Size) -
 
 
 def _recording_finish_seq_major(recv: torch.Tensor, work: object) -> torch.Tensor:
-    # DIRECT_CONV=1（默认）时 q/k/v 的 _finish_short_conv 走单拷贝 seq-major finish。
+    # DIRECT_CONV=1（默认）时 q/k/v 的 _finish_short_conv、g/beta 的消费点（无条件）
+    # 走单拷贝 seq-major finish。
     _FLAG_FENCES.append("finish_seq")
     return _REAL_FINISH_SEQ_MAJOR(recv, work)
 
@@ -813,7 +829,7 @@ class TestKdaSpFinishShortConv:
 
 
 class TestKdaSpDeferFlagHandling:
-    """模块常量 ``_KDA_SP_A2A_DEFER`` 的分支选择（主进程 1-rank gloo，world==1 a2a 早退）。"""
+    """调度 lever 常量（DEFER/DIRECT_CONV）的分支选择（主进程 1-rank gloo，world==1 a2a 早退）。"""
 
     def test_flag_selects_schedule_branches(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         dist.init_process_group("gloo", store=dist.FileStore(str(tmp_path / "gloo_store"), 1), rank=0, world_size=1)
@@ -834,8 +850,9 @@ class TestKdaSpDeferFlagHandling:
             out = module.forward_for_sp(hidden, seq_ctx)
             assert out["projected_output"].shape == (1, _S_LOC, _HIDDEN)
             assert len(_FLAG_ISSUES) == 6, _FLAG_ISSUES  # q / k / v / g / beta / out
-            # q/k/v 经 _finish_short_conv（DIRECT_CONV=1 → seq-major），g/beta/out 经 dim1 finish。
-            assert sorted(_FLAG_FENCES) == sorted(["finish_seq"] * 3 + ["finish"] * 3), _FLAG_FENCES
+            # q/k/v 走 seq-major finish（DIRECT_CONV=1 默认）、g/beta 无条件走 seq-major finish，
+            # out 走 head-major finish。
+            assert sorted(_FLAG_FENCES) == sorted(["finish_seq"] * 5 + ["finish"] * 1), _FLAG_FENCES
             assert _FLAG_BLOCKING == [], _FLAG_BLOCKING
 
             monkeypatch.setattr(kda_lever, "SP_A2A_DEFER", False)
