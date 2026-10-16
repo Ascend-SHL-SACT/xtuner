@@ -1,7 +1,10 @@
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from typing import Any
 
 import torch
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.optim.adam import adam as torch_adam
 
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module
@@ -59,6 +62,98 @@ class SwapAdamW(torch.optim.AdamW):
         self._swap_d2h_event: "torch.cuda.Event | None" = None
         self._init_swap_states()
 
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Load optimizer state and rebind the pinned CPU state map.
+
+        ``Optimizer.load_state_dict`` replaces ``self.state`` entries with fresh
+        tensors, while the swap hot paths read m/v from
+        ``_param_to_cpu_states_map`` (pinned buffers built at construction);
+        without a rebind a checkpoint resume silently restarts m/v from zeros.
+
+        Args:
+            state_dict (Mapping[str, Any]): optimizer state to load.
+        """
+        super().load_state_dict(state_dict)
+        self._rebind_cpu_states()
+
+    def wrap_cpu_states_for_dcp(self, optim_state_dict: dict[str, Any]) -> None:
+        """Wrap the pinned CPU m/v state values as DTensors for DCP save/load.
+
+        ``get_optimizer_state_dict`` passes the swap optimizer's plain pinned
+        CPU buffers through unchanged, so ``dcp.save`` sees an identical
+        (offset-0, local-size) chunk on every rank and the global dedup keeps
+        only one rank's shard -- multi-rank checkpoints silently lose all other
+        ranks' m/v. Wrapping each buffer as a DTensor over its parameter's mesh
+        and placements (zero-copy: the DTensor local IS the pinned buffer)
+        gives DCP the global coordinates it needs, and ``dcp.load`` reshards
+        straight into the buffers. Non-DTensor parameters and values that are
+        not swap buffers (e.g. ``step``, ``None``) are left untouched.
+
+        Args:
+            optim_state_dict (dict[str, Any]): the optimizer part of a DCP
+                state dict as built by ``get_optimizer_state_dict``.
+        """
+        buffers = self._iter_pinned_buffers()
+        wrap_targets: dict[int, DTensor] = {id(buf): param for param, buf in buffers}
+        state = optim_state_dict.get("state", {})
+        for entry in state.values():
+            if not isinstance(entry, dict):
+                continue
+            for key, value in entry.items():
+                if not isinstance(value, torch.Tensor) or isinstance(value, DTensor):
+                    continue
+                param = wrap_targets.get(id(value))
+                if param is None:
+                    continue
+                # DTensor.__new__ instead of DTensor.from_local: from_local
+                # converts the local tensor to the mesh device type, which would
+                # copy the pinned CPU buffer onto the device (and break the
+                # load-side in-place reshard into the buffer). The raw
+                # constructor wraps the buffer zero-copy with the parameter's
+                # real mesh/placements, which is all DCP planning needs.
+                spec = DTensorSpec(
+                    mesh=param.device_mesh,
+                    placements=tuple(param.placements),
+                    tensor_meta=TensorMeta(shape=param.shape, stride=param.stride(), dtype=value.dtype),
+                )
+                entry[key] = DTensor(value, spec, requires_grad=False)
+
+    def unwrap_cpu_states_after_dcp_load(self, optim_state_dict: dict[str, Any]) -> None:
+        """Restore plain pinned buffers as the values of a DCP-loaded optimizer state dict.
+
+        ``dcp.load`` reshards into the wrapped DTensors' locals in place -- and
+        those locals ARE the pinned CPU buffers -- so unwrapping puts the
+        already-filled buffers back as plain values before
+        ``set_optimizer_state_dict`` hands them to ``load_state_dict`` (torch's
+        optimizer load rejects mixed plain/DTensor copies).
+
+        Args:
+            optim_state_dict (dict[str, Any]): the optimizer part of a DCP
+                state dict after ``dcp.load``.
+        """
+        buffer_ids = {id(buf) for _, buf in self._iter_pinned_buffers()}
+        state = optim_state_dict.get("state", {})
+        for entry in state.values():
+            if not isinstance(entry, dict):
+                continue
+            for key, value in entry.items():
+                # _local_tensor (not to_local()): to_local routes through an
+                # autograd view under grad mode, so it is not the buffer object.
+                local = getattr(value, "_local_tensor", None)
+                if isinstance(local, torch.Tensor) and id(local) in buffer_ids:
+                    entry[key] = local
+
+    def _iter_pinned_buffers(self) -> Iterator[tuple[DTensor, torch.Tensor]]:
+        for group in self.param_groups:
+            for param in group["params"]:
+                cpu_state = self._param_to_cpu_states_map.get(param)
+                if cpu_state is None or not isinstance(param, DTensor):
+                    continue
+                for key in self._state_keys:
+                    buf = cpu_state.get(key)
+                    if isinstance(buf, torch.Tensor):
+                        yield param, buf
+
     @staticmethod
     def _to_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
         if hasattr(tensor, "to_local"):
@@ -109,6 +204,31 @@ class SwapAdamW(torch.optim.AdamW):
                 self._param_to_cpu_states_map[param] = cpu_state
 
         DEVICE_MODULE.synchronize()
+
+    def _rebind_cpu_states(self) -> None:
+        # Copy loaded m/v back into the pinned construction-time buffers and
+        # point self.state at the same buffers (single source of truth).
+        # copy_ handles dtype casts (an fp32 checkpoint loaded in bf16 mode is
+        # rounded into the bf16 buffers). Keys absent from the checkpoint are
+        # zeroed to match stock AdamW's fresh-state semantics.
+        for group in self.param_groups:
+            for param in group["params"]:
+                cpu_state = self._param_to_cpu_states_map.get(param)
+                if cpu_state is None:
+                    continue
+                param_state = self.state[param]
+                for key in self._state_keys:
+                    buf = cpu_state[key]
+                    if buf is None:
+                        continue
+                    loaded = param_state.get(key)
+                    if loaded is None:
+                        buf.zero_()
+                    else:
+                        if loaded.device.type != "cpu":
+                            loaded = loaded.to(device="cpu")
+                        buf.copy_(loaded)
+                    param_state[key] = buf
 
     @torch.no_grad()
     def step(self, closure=None):
