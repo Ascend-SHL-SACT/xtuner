@@ -390,6 +390,12 @@ class TrainEngine:
         if save_optimizer:
             with profile_time_and_memory("[DCP Collect Optimizer State Dict]"):
                 state_dict["optimizer"] = get_optimizer_state_dict(self.model, self.optimizer, options=options)
+                # Swap optimizers hold m/v as plain pinned CPU buffers; wrap them
+                # as DTensors so DCP saves per-rank chunks in global coordinates
+                # instead of deduping identical offset-0 chunks into one shard.
+                wrap = getattr(self.optimizer, "wrap_cpu_states_for_dcp", None)
+                if wrap is not None:
+                    wrap(state_dict["optimizer"])
 
         return state_dict
 
@@ -567,6 +573,13 @@ class TrainEngine:
 
             if not load_optimizer:
                 return
+
+            # dcp.load resharded into the wrapped DTensors' locals (the swap
+            # optimizer's pinned CPU buffers); restore plain values before the
+            # optimizer-level load, which rejects mixed plain/DTensor copies.
+            unwrap = getattr(self.optimizer, "unwrap_cpu_states_after_dcp_load", None)
+            if unwrap is not None:
+                unwrap(state_dict["optimizer"])
 
             optimizer_state_dict = state_dict["optimizer"]
             if not load_states:
