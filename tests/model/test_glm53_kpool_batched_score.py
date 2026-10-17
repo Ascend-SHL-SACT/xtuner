@@ -53,6 +53,10 @@ TestLightningIndexerScoreInto（NPU）
         ``out``/``valid`` 下，``[0, P)`` 列与连续参考 ``lightning_indexer_score`` 逐位一致、pad 列
         写 ``finfo.min``、发射宽度之外的列保留 7.0 预填。
     test_early_return_leaves_prefill_untouched: rows==0 或 num_pools<=0 早退，不触碰预填。
+TestKpoolBatchedSelInt32（NPU）
+    test_batched_expand_chain_keeps_masked_fill_on_int32: 批量路径下用 TorchDispatchMode 拦截原地
+        ``masked_fill_``（展开链唯一一处），锁定其输入为 int32——topk 的 int64 id 若未在调用点 cast，
+        会把 ``tok`` 整条链顶成 int64，``masked_fill_`` 在 910C 上跌 AI_CPU（~20 s/步）。
 """
 
 from typing import Any
@@ -60,6 +64,7 @@ from typing import Any
 import pytest
 import torch
 from torch import Tensor
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.ops.sparse_mla import kpool, kpool_npu
@@ -787,3 +792,54 @@ class TestLightningIndexerScoreInto:
         lightning_indexer_score_into(q[:0], keys, weights[:0], valid[:0], out[:0], pools, head_dim**-0.5)
         lightning_indexer_score_into(q, keys, weights, valid, out, 0, head_dim**-0.5)
         assert torch.equal(out, torch.full((4, width), 7.0, device=DEVICE))
+
+
+class _MaskedFillDtypeSpy(TorchDispatchMode):
+    """记录 ``masked_fill``/``masked_fill_`` 调用的 (算子名, 输入 dtype) 的 dispatch 模式。
+
+    其余算子原样透传。区分原地/非原地：展开链的 ``tok.masked_fill_`` 是 batched 路径唯一的
+    原地调用；``_visible_tail_tokens`` 有一个合法的非原地 int64 ``masked_fill``（``[S, kpool-1]``
+    小缓冲、随后立即 ``.to(torch.int32)``），不属于本回归的范围。
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, torch.dtype]] = []
+
+    def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:  # noqa: D102
+        name = str(func)
+        if "masked_fill" in name:
+            # ``aten.masked_fill_.Scalar`` 含下划线、非原地 ``aten.masked_fill.Scalar`` 不含。
+            self.calls.append((name, args[0].dtype))
+        return func(*args, **(kwargs or {}))
+
+
+class TestKpoolBatchedSelInt32:
+    """批量路径 ``sel_all`` 的 int32 契约回归。
+
+    ``_score_and_topk_batched`` 交还的 topk id 是 int64；未 cast 时类型提升把整条算术展开链
+    （``tok`` [S, select_k, kpool]）顶成 int64，``masked_fill_`` 在 910C 上没有 int64 AICORE
+    kernel，跌到 AI_CPU ~40 GB/s（~20 s/步）。修复 = 调用点 ``.to(torch.int32)``——id 与
+    ``_SEL_PAD``（1<<26）均在 int32 值域内，输出契约（``out`` 本就是 int32）不变。
+    """
+
+    @_requires_accelerator
+    @_requires_fused_indexer
+    @pytest.mark.gpu
+    def test_batched_expand_chain_keeps_masked_fill_on_int32(
+        self, monkeypatch: pytest.MonkeyPatch, batched_spy: list[bool]
+    ) -> None:
+        """批量分支跑通时，展开链上不允许出现 int64 ``masked_fill``。"""
+        doc_lens = [2045, 3]  # max_pools == select_k，恰走批量分支（同边界派发测试的布局）
+        index_topk, index_kpool = 2048, 4
+        ctx = _make_ctx(doc_lens)
+        inputs = _make_inputs(doc_lens, seed=25, index_kpool=index_kpool)
+
+        spy = _MaskedFillDtypeSpy()
+        with spy:
+            out = _run_topk(monkeypatch, inputs, ctx, batched=True, index_topk=index_topk, index_kpool=index_kpool)
+
+        assert batched_spy == [True], "test must exercise the batched branch"
+        assert out.dtype == torch.int32, "the documented output contract is int32"
+        inplace = [dt for name, dt in spy.calls if "masked_fill_" in name]
+        assert inplace, "the expand chain must run its in-place masked_fill_ at least once"
+        assert inplace == [torch.int32], spy.calls
