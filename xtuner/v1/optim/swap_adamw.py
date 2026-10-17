@@ -40,6 +40,13 @@ class SwapAdamW(torch.optim.AdamW):
         fused: bool | None = None,
         swap_optimizer_times: int = 16,
     ):
+        # fused/capturable require device-side step tensors; the swap paths keep
+        # states on pinned CPU and force CPU fp32 step scalars. Fail at
+        # construction instead of a deep device error on the first step.
+        if fused:
+            raise ValueError("SwapAdamW does not support fused=True: step uses CPU fp32 step scalars.")
+        if capturable:
+            raise ValueError("SwapAdamW does not support capturable=True: step uses CPU step tensors.")
         super().__init__(
             params,
             lr=lr,
@@ -61,6 +68,25 @@ class SwapAdamW(torch.optim.AdamW):
         self._swap_copy_stream: "torch.cuda.Stream | None" = None
         self._swap_d2h_event: "torch.cuda.Event | None" = None
         self._init_swap_states()
+        # Guards add_param_group: groups added after construction would bypass
+        # the CPU state map and be silently skipped by both step paths.
+        self._swap_initialized = True
+
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
+        """Reject post-construction parameter group additions.
+
+        SwapAdamW builds the pinned CPU state map once at construction; groups
+        added afterwards would be silently skipped by both step paths.
+
+        Args:
+            param_group (dict[str, Any]): the parameter group to add.
+        """
+        if getattr(self, "_swap_initialized", False):
+            raise NotImplementedError(
+                "SwapAdamW does not support add_param_group after construction: new parameters "
+                "would be silently skipped by the CPU state map."
+            )
+        super().add_param_group(param_group)
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Load optimizer state and rebind the pinned CPU state map.
@@ -163,7 +189,11 @@ class SwapAdamW(torch.optim.AdamW):
     def _init_swap_states(self) -> None:
         # XTUNER_SWAP_BF16_STATE=1: keep m/v as bf16 on CPU to halve PCIe transfer.
         # Dispatches to step_overlap, which upcasts to fp32 for adam.
+        # Knobs are read once at construction; the per-step hot path never reads
+        # environment variables.
         self._swap_bf16_state = int(os.environ.get("XTUNER_SWAP_BF16_STATE", "0")) == 1
+        self._swap_d2h_overlap = int(os.environ.get("XTUNER_SWAP_D2H_OVERLAP", "0")) == 1
+        self._swap_nchunks = max(1, int(os.environ.get("XTUNER_SWAP_OVERLAP_NCHUNKS", "16")))
         _state_dtype = torch.bfloat16 if self._swap_bf16_state else None
         for group in self.param_groups:
             for param in group["params"]:
@@ -171,35 +201,41 @@ class SwapAdamW(torch.optim.AdamW):
 
         swap_num = sum(self._to_local_tensor(main_param).numel() for main_param in self._param_to_group_map)
         self.swap_numel = swap_num // self._swap_optimizer_times
-        swap_memory = swap_num * 8 / 1024 / 1024
+        first_param = next(iter(self._param_to_group_map), None)
+        elem_size = 2 if _state_dtype is not None else (first_param.element_size() if first_param is not None else 4)
+        swap_memory = swap_num * 2 * elem_size / 1024 / 1024
         logger.info(
             f"[Rank {DEVICE_MODULE.current_device()}] swap optimizer param num: {swap_num},  "
-            f"param size: {swap_memory}MB\n",
+            f"m+v size: {swap_memory}MB\n",
             end="",
         )
 
         for group in self.param_groups:
             for param in group["params"]:
-                cpu_state_dtensor = self.state[param]
+                param_state = self.state[param]
                 cpu_state: dict[str, torch.Tensor | None] = {}
                 amsgrad = bool(self._param_to_group_map[param]["amsgrad"])
                 local_param = self._to_local_tensor(param)
 
                 for key in self._state_keys:
                     if key == "max_exp_avg_sq" and not amsgrad:
-                        cpu_state_dtensor[key] = None
+                        param_state[key] = None
                         cpu_state[key] = None
                     else:
+                        # Create zeros directly on CPU: zeros_like on device would
+                        # transiently hold an extra device-sized buffer, plus a
+                        # D2H copy and a second copy into the pinned tensor.
                         cpu_tensor = torch.zeros_like(
-                            local_param, dtype=_state_dtype, memory_format=torch.preserve_format
-                        )
-                        cpu_tensor = cpu_tensor.to(device="cpu", non_blocking=True)
-                        cpu_tensor = cpu_tensor.pin_memory()
-                        cpu_state_dtensor[key] = cpu_tensor
+                            local_param,
+                            dtype=_state_dtype,
+                            device="cpu",
+                            memory_format=torch.preserve_format,
+                        ).pin_memory()
+                        param_state[key] = cpu_tensor
                         cpu_state[key] = cpu_tensor
 
                 # Keep per-parameter step semantics consistent with torch.optim.AdamW.
-                cpu_state_dtensor["step"] = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+                param_state["step"] = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
                 self._param_to_cpu_states_map[param] = cpu_state
 
@@ -232,14 +268,13 @@ class SwapAdamW(torch.optim.AdamW):
 
     @torch.no_grad()
     def step(self, closure=None):
-        # Dispatch to step_overlap when any overlap/bf16 knob is set; each is
-        # independent (XTUNER_SWAP_BF16_STATE / D2H_OVERLAP / H2D_OVERLAP) and
-        # they may be combined or used alone. All off -> stock serial path.
-        if (
-            int(os.environ.get("XTUNER_SWAP_D2H_OVERLAP", "0"))
-            or int(os.environ.get("XTUNER_SWAP_H2D_OVERLAP", "0"))
-            or int(os.environ.get("XTUNER_SWAP_BF16_STATE", "0"))
-        ):
+        # Dispatch to step_overlap when any overlap/bf16 knob is set (read once
+        # at construction). All off -> stock serial path. The former
+        # XTUNER_SWAP_H2D_OVERLAP prefetch is removed: its H2D targets were
+        # allocated on the copy stream -- device blocks allocated on a side
+        # stream are never reused by the NPU allocator -- making it a verified
+        # fragmentation source.
+        if self._swap_d2h_overlap or self._swap_bf16_state:
             from .swap_adamw_overlap import step_overlap
 
             return step_overlap(self, closure)
