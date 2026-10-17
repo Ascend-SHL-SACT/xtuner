@@ -1,41 +1,59 @@
-"""Copy-stream H2D/D2H overlap for SwapAdamW.step (no persistent device
+"""Copy-stream D2H overlap for SwapAdamW.step (no persistent device
 buffer).
 
-Dispatched from swap_adamw.step when any of XTUNER_SWAP_BF16_STATE,
-XTUNER_SWAP_D2H_OVERLAP, or XTUNER_SWAP_H2D_OVERLAP is set. m/v stream between
-pinned CPU and a fresh per-step device temp; nothing is kept on device across
-steps, so swap still saves the m/v device footprint.
+Dispatched from swap_adamw.step when XTUNER_SWAP_D2H_OVERLAP or
+XTUNER_SWAP_BF16_STATE is set; the knobs are read once at optimizer
+construction (the per-step hot path never reads environment variables). m/v
+stream between pinned CPU and a fresh per-step device temp; nothing is kept on
+device across steps, so swap still saves the m/v device footprint.
 
 Knobs (independent, combinable):
-  XTUNER_SWAP_BF16_STATE=1   m/v bf16 on host/PCIe; upcast fp32 on device before
-                              adam; the post-adam fp32->bf16 downcast runs on the
-                              HOST (D2H fp32->fp32 to a pinned scratch, then a
-                              daemon worker casts scratch->bf16 cpu m/v on the
-                              CPU, overlapping device fwd+bwd). Never a device
-                              cast temp: a copy-stream-allocated temp is never
-                              reused by NPU's allocator (the fragmentation source).
+  XTUNER_SWAP_BF16_STATE=1   m/v stored as bf16 on host; H2D upcasts bf16->fp32
+                             on device before adam (PCIe up-direction halved);
+                             the post-adam D2H is fp32->fp32 into a pinned fp32
+                             scratch (PCIe down-direction NOT halved), then a
+                             daemon worker casts scratch->bf16 cpu m/v on the
+                             CPU, overlapping device fwd+bwd. Never a device
+                             cast temp: a copy-stream-allocated temp is never
+                             reused by NPU's allocator (the fragmentation source).
   XTUNER_SWAP_D2H_OVERLAP=1  D2H writeback on a copy stream (gated by an
-                              adam-done event), overlapping next chunk + next
-                              step's fwd+bwd (step-end event).
-  XTUNER_SWAP_H2D_OVERLAP=1  H2D on a copy stream one chunk ahead, overlapping
-                              the current chunk's adam + D2H.
+                             adam-done event), overlapping next chunk + next
+                             step's fwd+bwd (step-end event).
 
-With no knob set, swap_adamw.step takes its stock serial path. Chunking
-(XTUNER_SWAP_OVERLAP_NCHUNKS, default 16) bounds per-chunk in-flight memory.
+The former XTUNER_SWAP_H2D_OVERLAP prefetch (H2D one chunk ahead on the copy
+stream) is removed: its target temps were allocated ON the copy stream, and
+device blocks allocated on a side stream are never reused by the NPU
+allocator (a verified fragmentation source), so that allocation form is
+forbidden. If prefetch is ever needed, it must allocate targets on the
+default stream and order the consumer with an event.
+
+Stream topology: two streams touch the pinned
+cpu m/v buffers. The default stream reads them (H2D) and runs adam; the
+optimizer-private copy stream writes them (D2H). Cross-step ordering is the
+``d2h_ev`` chain: recorded on the copy stream after the step's last D2H,
+waited on the default stream before the next step's first H2D (primed by the
+first step's lazy-init record, so the first wait is a no-op). Intra-step
+chunks touch disjoint
+pinned buffers, so no intra-step wait is needed. The fp32 adam temps are
+default-allocated and only read by the copy stream (``record_stream``) -- the
+reclaimable pattern (allocated on default, read on copy).
+
+Copy-path census: in the current production process this private stream is
+the only live PCIe copy path (muon_swap's stream is not constructed in adamw
+mode; the activation-offload NPU path belongs to a different model and is
+absent here; SP-MLA offload copies on the default stream). Should a second
+copy path be enabled (e.g. activation offload), the streams must be shared --
+exactly one writer per pinned buffer is what keeps the ``d2h_ev`` ordering
+above sound.
 
 Memory notes (verified): max_memory is set by fwd/bwd and is invariant across
 swap knobs (optimizer temps are chunked and fit in freed-activation space).
 reserved_memory varies with allocator-pool fragmentation: any device block
 allocated ON the copy stream is never reused (climbs toward the device limit);
 record_stream'd blocks (allocated on default, read on copy) are reclaimable.
-So D2H-overlap alone is mild (only the fp32 adam temp is record_stream'd);
-H2D-overlap (prefetch blocks allocated on the copy stream) fragments hard.
-Host-casting the bf16 downcast removes the one copy-stream-allocated D2H block;
-the H2D-prefetch block cannot be relocated (the cross-stream write itself taints
-regardless of alloc stream -- relocating it fragments worse, not better).
+So D2H-overlap is mild (only the fp32 adam temp is record_stream'd).
 """
 
-import os
 import queue
 import threading
 from collections.abc import Callable
@@ -64,7 +82,7 @@ def _get_host_scratch(optimizer, e: dict) -> dict:
     if key not in scratch:
 
         def pin(t: torch.Tensor) -> torch.Tensor:
-            return torch.empty(t.shape, dtype=torch.float32, device="cpu").pin_memory()
+            return torch.empty(t.shape, dtype=torch.float32, device="cpu", pin_memory=True)
 
         d = {"m": pin(e["cpu_exp_avg"]), "v": pin(e["cpu_exp_avg_sq"])}
         if e["amsgrad"]:
@@ -151,7 +169,7 @@ def step_overlap(
     optimizer: "SwapAdamW",
     closure: Callable[[], torch.Tensor] | None = None,
 ) -> torch.Tensor | None:
-    """Run the swap step with optional copy-stream H2D/D2H overlap.
+    """Run the swap step with copy-stream D2H overlap.
 
     Args:
         optimizer (SwapAdamW): the wrapped optimizer.
@@ -165,9 +183,9 @@ def step_overlap(
         with torch.enable_grad():
             loss = closure()
 
-    bf16 = bool(int(os.environ.get("XTUNER_SWAP_BF16_STATE", "0")))
-    d2h_ov = bool(int(os.environ.get("XTUNER_SWAP_D2H_OVERLAP", "0")))
-    h2d_ov = bool(int(os.environ.get("XTUNER_SWAP_H2D_OVERLAP", "0")))
+    # Knobs were read once at optimizer construction (hot path never reads env).
+    bf16 = optimizer._swap_bf16_state
+    d2h_ov = optimizer._swap_d2h_overlap
 
     copy_s = getattr(optimizer, "_swap_copy_stream", None)
     if copy_s is None:
@@ -195,8 +213,7 @@ def step_overlap(
 
     params_list = [p for p in optimizer._param_to_group_map if p.grad is not None]
     n = len(params_list)
-    nchunks = max(1, int(os.environ.get("XTUNER_SWAP_OVERLAP_NCHUNKS", "16")))
-    nchunks = min(nchunks, n)
+    nchunks = min(optimizer._swap_nchunks, n)
 
     def chunk_slice(ci: int) -> list:
         lo = round(ci * n / nchunks)
@@ -261,11 +278,13 @@ def step_overlap(
             if gid not in groups:
                 groups[gid] = [group, [], [], [], [], [], []]
             slot = groups[gid]
+            # exp_avg/exp_avg_sq/max are plain device temps from h2d_chunk;
+            # only param/grad can be DTensor shells and need to_local.
             slot[1].append(optimizer._to_local_tensor(e["param"]))
             slot[2].append(optimizer._to_local_tensor(e["param"].grad))
-            slot[3].append(optimizer._to_local_tensor(e["exp_avg"]))
-            slot[4].append(optimizer._to_local_tensor(e["exp_avg_sq"]))
-            slot[5].append(optimizer._to_local_tensor(e["max"]) if e["max"] is not None else None)
+            slot[3].append(e["exp_avg"])
+            slot[4].append(e["exp_avg_sq"])
+            slot[5].append(e["max"])
             slot[6].append(e["step_tensor"])
         for slot in groups.values():
             g = slot[0]
@@ -318,38 +337,8 @@ def step_overlap(
             else:
                 _d2h_plain(entries, default_s)
 
-    # Pipeline driver. With h2d_ov, each chunk's H2D is launched one chunk ahead
-    # on copy_s so it overlaps the previous chunk's adam + D2H. The matching
-    # h2d_done event is waited on the default stream before adam.
-    next_entries: list | None = None
-    next_h2d_ev = None
-    if h2d_ov and nchunks > 0:
-        with DEVICE_MODULE.stream(copy_s):
-            next_entries = h2d_chunk(chunk_slice(0))
-        next_h2d_ev = DEVICE_MODULE.Event()
-        with DEVICE_MODULE.stream(copy_s):
-            next_h2d_ev.record()
-
     for ci in range(nchunks):
-        if h2d_ov:
-            entries = next_entries
-            default_s.wait_event(next_h2d_ev)
-            if ci + 1 < nchunks:
-                with DEVICE_MODULE.stream(copy_s):
-                    next_entries = h2d_chunk(chunk_slice(ci + 1))
-                next_h2d_ev = DEVICE_MODULE.Event()
-                with DEVICE_MODULE.stream(copy_s):
-                    next_h2d_ev.record()
-            else:
-                next_entries = None
-                next_h2d_ev = None
-        else:
-            entries = h2d_chunk(chunk_slice(ci))
-
-        # With h2d_ov, next_entries is None only for the chunk past the loop end;
-        # every in-loop read hits a chunk produced by the prologue or the previous
-        # iteration, so entries is always a list here.
-        assert entries is not None
+        entries = h2d_chunk(chunk_slice(ci))
         adam_chunk(entries)
         d2h_chunk(entries)
 

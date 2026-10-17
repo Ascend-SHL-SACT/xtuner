@@ -898,7 +898,7 @@ def _hc_split_sinkhorn_kernel_part2(
     # reduction here is token-local (row_max over axis=2, col_sum/row_sum over
     # axis=1, never across tokens) and the stores are masked, so the garbage
     # cannot escape a padded row. Adding an explicit ``other=`` would deviate
-    # from the anchor port -- re-verify the run81 bit-exact anchors first.
+    # from the MindSpeed port -- re-verify the bit-exact numerics first.
     comb = tl.load(comb_tmp_ptr + pid_comb_off + lin[None, :], mask=pid_mask[:, None])
     comb = comb.reshape(group, hc_mult, BLOCK_ALIGN)
 
@@ -1200,8 +1200,8 @@ def _hc_split_sinkhorn_backward_kernel_part2(
 
 
 def _padded_comb_buffer(rows: int, hc_mult: int, block_align: int, ref: Tensor, fill: float, slot: str) -> Tensor:
-    """Return a cached ``[rows, hc_mult, block_align]`` buffer with pad
-    columns pre-filled with ``fill``.
+    """Return a cached ``[rows, hc_mult, block_align]`` buffer with pad columns
+    pre-filled with ``fill``.
 
     The caller rewrites only the leading ``hc_mult`` columns (slice copy), so
     the pad columns keep their fill value forever and the per-call ``F.pad``
@@ -1254,7 +1254,7 @@ def _comb_scratch_buffer(shape: tuple[int, ...], ref: Tensor) -> Tensor:
 
 
 class SinkhornFunction(torch.autograd.Function):
-    """mHC split + Sinkhorn projection as two fused triton kernels."""
+    """MHC split + Sinkhorn projection as two fused triton kernels."""
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -1303,9 +1303,9 @@ class SinkhornFunction(torch.autograd.Function):
         # Grid sizes at the documented production shape (B=1, S=8192 -> BS=8192):
         # part1 grid = cdiv(8192, 256) = 32, part2 grid = cdiv(8192, 32) = 256.
         # Neither is capped/probed here: both binaries are verbatim MindSpeed
-        # ports whose grid extents are anchor-validated on this fleet
-        # (run81/107/145 bit-exact at grid=256), and 32 <= 48 physical vector
-        # cores. Revisit both groups if the per-rank S grows.
+        # ports whose grid extents are validated bit-exact on this fleet, and
+        # 32 <= 48 physical vector cores. Revisit both groups if the per-rank S
+        # grows.
         group_part1 = 256
         group_part2 = 32
 
@@ -1959,7 +1959,8 @@ def _probe_max_progs(device: torch.device) -> int:
 
 
 def _resolve_max_progs(device: torch.device) -> None:
-    """Lazily fill ``_TRITON_MAX_PROGS[0]`` from the one-shot NaN-sentinel probe."""
+    """Lazily fill ``_TRITON_MAX_PROGS[0]`` from the one-shot NaN-sentinel
+    probe."""
     if _TRITON_MAX_PROGS[0] is None:
         try:
             _TRITON_MAX_PROGS[0] = _probe_max_progs(device)
@@ -2176,7 +2177,8 @@ def hc_combine(
 
 
 def hc_collapse(pre: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
-    """Collapse streams into the sublayer input ``collapsed = Σₖ preₖ · streamₖ``.
+    """Collapse streams into the sublayer input ``collapsed = Σₖ preₖ ·
+    streamₖ``.
 
     Args:
         pre (torch.Tensor): Collapse weights ``[B, S, H]`` (fp32 mHC mixes).
@@ -2206,17 +2208,15 @@ def _hc_post_eager_matmul(x: Tensor, residual: Tensor, post: Tensor, comb: Tenso
     mix through a broadcast-multiply + reduce-sum and never fuses on this tree (the Triton
     kernel is CUDA-only and BiShengIR cannot compile it on 910C), so every call materializes a
     ``[B, S, H, H, D]`` fp32 intermediate -- 1.07 GB per call at the 30B training shape
-    (``S=8192, H=4, D=2048``), ~14 s/step of pure Mul/BroadcastTo/ReduceSum traffic in the
-    128K profile, with the same again in backward. The pre-merge GLM-5.3 implementation
-    (which trained this model end to end on 910C, run81 anchor) evaluated the identical math
-    as ``post * x + matmul(comb^T, residual)``: batched-matmul (K=H, tensor-core) with only
-    ``[B, S, H, D]`` intermediates, ~16x less traffic.
+    (``S=8192, H=4, D=2048``), ~14 s/step of pure Mul/BroadcastTo/ReduceSum traffic, with
+    the same again in backward. The pre-merge implementation evaluated the identical
+    math as ``post * x + matmul(comb^T, residual)``: batched-matmul (K=H, tensor-core) with
+    only ``[B, S, H, D]`` intermediates, ~16x less traffic.
 
     Precision: bf16 matmul rounds the mixed result once (fp32 accumulate inside the kernel)
     where the HF chain rounds after the fp32 sum; the fp32-accumulate order along H also
     differs. This is the pre-merge implementation's approved fused-op precision exception --
-    the 128K anchor losses agree to 1.9e-4 across the two forms (run81 12.14300537 vs
-    run92 12.14281273).
+    the 128K-shape losses agree to ~2e-4 across the two forms.
     """
     return post.to(residual.dtype).unsqueeze(-1) * x.unsqueeze(-2) + torch.matmul(
         comb.to(residual.dtype).transpose(-1, -2), residual
