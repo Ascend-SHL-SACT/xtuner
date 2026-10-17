@@ -6,6 +6,7 @@ from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.loss import CELossConfig
 from xtuner.v1.model import get_model_config_from_hf
+from xtuner.v1.model.moe.glm52.indexer_chunk import resolve_indexer_topk_query_chunk_size
 from xtuner.v1.train import TrainerConfig
 from xtuner.v1.train.trainer import LoadCheckpointConfig
 
@@ -57,7 +58,17 @@ if hasattr(model_cfg.attention, "sparse_mla_backend"):
     if "INDEXER_BACKEND" in os.environ:
         # ``deep_gemm_fp8`` uses DeepGEMM's FP8 MQA path to match LMDeploy's
         # Indexer scoring contract.
-        model_cfg.attention.indexer_backend = os.environ["INDEXER_BACKEND"]
+        model_cfg.attention.indexer_backend = os.environ["INDEXER_BACKEND"].strip().lower()
+    # Otherwise the indexer keeps the config default; it no longer follows
+    # SPARSE_MLA_BACKEND, whose vocabulary is not the indexer's.
+    indexer_backend = model_cfg.attention.indexer_backend
+    # Keep the historical one-shot path for the PyTorch selector.  TileLang
+    # (including the cuDNN DSA and FlashMLA adapters) uses Slime's 8K query
+    # block by default; set INDEXER_TOPK_QUERY_CHUNK_SIZE=0/none to disable it
+    # for A/B tests.
+    model_cfg.attention.indexer_topk_query_chunk_size = resolve_indexer_topk_query_chunk_size(
+        os.environ.get("INDEXER_TOPK_QUERY_CHUNK_SIZE"), indexer_backend
+    )
 
 cache_dir = os.path.join(work_dir, "jsonl_cache")
 cache_tag = os.environ.get("CACHE_TAG", f"glm52_{sample_max_length}")
