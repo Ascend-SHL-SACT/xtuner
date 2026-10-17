@@ -27,6 +27,7 @@ from xtuner.v1.ops.attn_imp import AttnOpOutputs, get_attn_impl_fn
 from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
 from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_device, get_torch_device_module
 from xtuner.v1.utils.init_weight import default_init_weights
+from xtuner.v1.utils.misc import clean_param_name
 
 from .glm53_config import Glm53VisionConfig
 
@@ -385,7 +386,11 @@ class Glm53VisionModel(BaseModel):
     @torch.no_grad()
     def init_weights(self) -> None:
         initialized = default_init_weights(self)
-        if missing := {name for name, _ in self.named_parameters()} - initialized:
+        # Compare against *cleaned* names: when random-init runs after fully_shard, the
+        # recompute-wrapped blocks carry the `_checkpoint_wrapped_module.` token that
+        # default_init_weights already strips from its claimed set -- keeping the raw
+        # names here would report every wrapped block param as uninitialized.
+        if missing := {clean_param_name(name) for name, _ in self.named_parameters()} - initialized:
             raise RuntimeError(f"{missing} is not initialized")
 
     @override
