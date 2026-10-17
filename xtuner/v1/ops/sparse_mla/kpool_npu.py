@@ -203,7 +203,13 @@ def npu_kpool_topk_indices(
                 # batched path for no correctness gain.
                 sel_all = _score_and_topk_batched(
                     q_local, pool_key, w_all_f, ranges, row_prefix, select_k, index_head_dim
-                )
+                ).to(torch.int32)
+                # ``topk`` hands back int64 ids; left as int64 they poison the shared expand
+                # below -- ``tok`` becomes a 2.1 GB int64 buffer and ``masked_fill_`` (no
+                # int64 AICORE kernel on 910C) drops to the AI_CPU at ~40 GB/s, ~56 ms per
+                # call, ~20 s per training step at 128K (run16 step-9 profile). The ids and
+                # ``_SEL_PAD`` (1<<26) are int32-safe by design; the degenerate/legacy
+                # buffers below are already int32, so this keeps every branch on one dtype.
             else:
                 # Degenerate workload (every document shorter than ``index_topk`` tokens, e.g.
                 # SFT over short samples): each row's visible prefix is below ``select_k``, so
