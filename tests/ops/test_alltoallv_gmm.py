@@ -33,6 +33,15 @@ caught — a symmetric/uniform input would mask both.
    orchestrator must fire ``recv_tokens_hook`` with ``sum(recv_counts)`` — the received routed-row
    count the dispatcher path reports and the step-end EP-load reduction consumes; its absence
    crashed every rank at the first MoE forward (``_ep_load_reduce`` got a 0-length dispatch column).
+7. ``TestPlanLocalExpertChunks`` — CPU-only: the >256-entry chunk planner (balanced split, cap
+   boundary, EP-over-cap error).
+8. ``TestFusedChunkedCountsContract`` — CPU-only: with ``E_global > 256`` the orchestrator must
+   issue per-chunk calls whose counts re-index the ``(source, chunk-expert)`` grid, fire the hook
+   once with the full total, and reassemble every row (no loss/duplication).
+9. ``TestFusedChunkedMatchesSingle`` — the >256 regression gate with the REAL kernels: forced
+   2-chunk vs unchunked ``fused_dispatch_mlp_combine`` on the same leaves, forward + grads, plus
+   an all-ranks-empty-chunk-0 case gating the per-chunk structural pad (all-zero outbound counts
+   hard-fail the op without it).
 
 Run, e.g. (``DistributedTestBase`` is torch's ``MultiProcessTestCase`` — a single pytest process
 spawns the NPU ranks itself, so invoke directly, NOT under ``torchrun``; torchrun double-spawns and
@@ -112,6 +121,24 @@ def _make_weights(
 def _topk_weights(n_local: int, device: torch.device) -> torch.Tensor:
     torch.manual_seed(777)
     return torch.softmax(torch.randn(n_local, TOPK, device=device, dtype=torch.float32), dim=-1).to(torch.bfloat16)
+
+
+def _chunk0_empty_topk_ids(n_local: int, device: torch.device, size_c: int, e_local: int) -> torch.Tensor:
+    """Route every token into chunk-1 local experts (``>= size_c``) → chunk 0 sends 0 rows.
+
+    Regression input for the chunked path's structural pad: with every rank's tokens off chunk 0,
+    that call's outbound count list is all zero on EVERY rank, which ``npu_alltoallv_gmm``
+    rejects (561002) unless the pad row is present. Falls back to the plain cycling ids when the
+    geometry has no chunk 1 (``e_local <= size_c``, e.g. ws=32 where ``e_local=1``).
+    """
+    base = torch.arange(n_local, device=device).unsqueeze(1)
+    offs = torch.arange(TOPK, device=device).unsqueeze(0)
+    mixed = (base + offs) % N_EXPERTS
+    if e_local <= size_c:
+        return mixed.to(torch.int64)
+    owner = mixed // e_local
+    local = size_c + (mixed + offs) % (e_local - size_c)
+    return (owner * e_local + local).to(torch.int64)
 
 
 def _assert_per_expert_close(
@@ -562,3 +589,258 @@ class TestFusedRecvTokensHook:
             recv_tokens_hook=None,
         )
         assert out.shape == (4, 8)
+
+
+class TestPlanLocalExpertChunks:
+    """CPU-only: the >256-entry chunk planner (``_plan_local_expert_chunks``).
+
+    GLM-5.3-Flash routes 288 experts at EP32 → 288 send/recv count entries, and the cluster CANN
+    tiling rejects lists over 256 (``grouped_mat_mul_allto_allv_tiling.cpp:350``, "The length of
+    recvCnts[288] should be in (0, 256]" — job-dyb-q35-xtuner-52). The planner must return one full
+    range within the cap, a balanced split over it, and refuse EP sizes that cannot fit at all.
+    """
+
+    def test_within_cap_single_chunk(self):
+        assert fused_a2a_gmm._plan_local_expert_chunks(8, 4) == [(0, 4)]
+
+    def test_cap_boundary_single_chunk(self):
+        # 32 * 8 = 256 entries exactly — still the unchunked path.
+        assert fused_a2a_gmm._plan_local_expert_chunks(32, 8) == [(0, 8)]
+
+    def test_over_cap_balanced(self):
+        # GLM-5.3-Flash shape: EP32 x 9 local experts → [5, 4], entries 160/128.
+        assert fused_a2a_gmm._plan_local_expert_chunks(32, 9) == [(0, 5), (5, 4)]
+
+    def test_over_cap_uneven(self):
+        # 64 * 7 = 448 entries; per-chunk max 4 → [4, 3], entries 256/192.
+        assert fused_a2a_gmm._plan_local_expert_chunks(64, 7) == [(0, 4), (4, 3)]
+
+    def test_ep_over_cap_raises(self):
+        # Each call needs at least ep_size entries, so EP > 256 cannot fit regardless of chunking.
+        with pytest.raises(ValueError, match="cap"):
+            fused_a2a_gmm._plan_local_expert_chunks(300, 1)
+
+
+class TestFusedChunkedCountsContract:
+    """CPU-only contract gate for the chunked orchestrator (``E_global > 256``, stubbed ops).
+
+    Per chunk the two autograd ops must receive the counts re-indexed onto the chunk's
+    ``(source, chunk-expert)`` grid — ``send_c[s * size_c + j] == send_counts[s * e_local + c0 + j]``
+    (and likewise recv) — PLUS the structural pad: +1 on this rank's own ``(source=self, j=0)``
+    entry (``ep_rank=0`` here), matching the pad row the orchestrator inserts into each chunk's
+    gathered rows and slices off the combine output. The weight slices cover exactly the chunk's
+    local experts, and the hook must still fire ONCE with the unchanged full total. The identity
+    stubs return the gathered rows unchanged, so the reassembled output must equal the input
+    row-for-row (no row lost or duplicated across chunks, pad included).
+    """
+
+    EP, E_LOCAL = 2, 200  # E_global = 400 > 256 → chunked; per-chunk max 128 → 2 chunks of 100
+
+    @staticmethod
+    def _make_stub(calls: list[tuple[str, tuple]], tag: str):
+        def _apply(x, *args):
+            calls.append((tag, args))
+            return x
+
+        return type("_StubGmm", (), {"apply": staticmethod(_apply)})
+
+    def test_chunked_counts_hook_and_reassembly(self, monkeypatch):
+        ep, e_local = self.EP, self.E_LOCAL
+        n_experts = ep * e_local
+        send_counts = [i % 4 + 1 for i in range(n_experts)]
+        recv_counts = [(s * e_local + j) % 5 for s in range(ep) for j in range(e_local)]
+        group_list = [sum(recv_counts[s * e_local + j] for s in range(ep)) for j in range(e_local)]
+        monkeypatch.setattr(
+            fused_a2a_gmm,
+            "_compute_counts",
+            lambda topk_ids, n_routed_experts, ep_group: (send_counts, recv_counts, group_list),
+        )
+        # The chunked branch reads the EP-group rank for the pad attribution; there is no
+        # distributed init here, so pin it to 0 (pad lands on each chunk's first local expert).
+        monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
+
+        calls: list[tuple[str, tuple]] = []
+        monkeypatch.setattr(fused_a2a_gmm, "AlltoallvPermuteGmm", self._make_stub(calls, "dispatch"))
+        monkeypatch.setattr(fused_a2a_gmm, "GmmUnpermuteAlltoallv", self._make_stub(calls, "combine"))
+
+        n_send = sum(send_counts)
+        hidden = torch.arange(n_send * 8, dtype=torch.float32).view(n_send, 8)
+        w1 = torch.zeros(e_local, 8, 8)
+        w2 = torch.zeros(e_local, 8, 8)
+        hook_calls: list[int] = []
+        out = fused_a2a_gmm.fused_dispatch_mlp_combine(
+            hidden_states=hidden,
+            w1=w1,
+            w2=w2,
+            act_fn=lambda x, split_dim=-1: x,
+            topk_ids=torch.zeros(1, 1, dtype=torch.long),
+            n_routed_experts=n_experts,
+            ep_group=None,
+            recv_tokens_hook=hook_calls.append,
+        )
+
+        # The hook fires once, with the unchanged full received-row total.
+        assert hook_calls == [sum(recv_counts)]
+        # Identity reassembly: every row returns exactly once (bijective gather + put).
+        assert out.shape == hidden.shape and torch.equal(out, hidden)
+
+        # Per-chunk op contract: 2 chunks of 100 local experts, counts re-indexed onto the
+        # (source, chunk-expert) grid, weights sliced to the chunk's local experts.
+        for tag in ("dispatch", "combine"):
+            chunk_calls = [args for t, args in calls if t == tag]
+            assert len(chunk_calls) == 2, f"{tag}: expected 2 chunk calls, got {len(chunk_calls)}"
+            for chunk_i, args in enumerate(chunk_calls):
+                weight, _w_fwd, _ep_group, send_c, recv_c, gl_c = args
+                c0 = chunk_i * 100
+                size_c = 100
+                assert weight.shape[0] == size_c and torch.equal(weight, w1[c0 : c0 + size_c])
+                ref_send = [send_counts[s * e_local + c0 + j] for s in range(ep) for j in range(size_c)]
+                ref_recv = [recv_counts[s * e_local + c0 + j] for s in range(ep) for j in range(size_c)]
+                ref_gl = group_list[c0 : c0 + size_c]
+                # Structural pad: ep_rank=0 → +1 on this rank's own (source=self, j=0) entry.
+                ref_send[0] += 1
+                ref_recv[0] += 1
+                ref_gl[0] += 1
+                assert send_c == ref_send, f"{tag} chunk {chunk_i}: send counts mis-indexed"
+                assert recv_c == ref_recv, f"{tag} chunk {chunk_i}: recv counts mis-indexed"
+                assert gl_c == ref_gl, f"{tag} chunk {chunk_i}: group_list mis-sliced"
+
+
+@pytest.mark.gpu
+class TestFusedChunkedMatchesSingle(DistributedTestBase):
+    """Forced chunking vs the unchunked fused call, REAL kernels, forward + grads (>256 gate).
+
+    Runs ``fused_dispatch_mlp_combine`` twice on the same leaves — unchunked, then with
+    ``_MAX_FUSED_COUNT_ENTRIES`` lowered to force the 2-chunk split — and compares the
+    unpermuted output and dHidden/dW1/dW2. Both sides run the same CANN ops over the same
+    per-expert row sets, so a wrong per-chunk (source, local-expert) count mapping, a
+    mis-gathered send block, or a reassembly order bug diverges by ~the value magnitudes, far
+    outside the tolerances.
+    """
+
+    @property
+    def world_size(self) -> int:
+        return int(os.getenv("XTUNER_TEST_WORLD_SIZE", "8"))
+
+    def _set_device(self) -> None:
+        if self.rank >= 0:
+            torch.npu.set_device(self.rank % torch.npu.device_count())
+
+    def test_chunked_forward_and_backward_match_single(self):
+        self._set_device()
+        self.create_pg("cuda")
+        ws = dist.get_world_size()
+        rank = dist.get_rank()
+        e_local = N_EXPERTS // ws
+        device = torch.device("cuda", rank % torch.npu.device_count())
+        dtype = torch.bfloat16
+        n_local = _n_local(rank)
+
+        torch.manual_seed(1234 + rank)
+        hidden0 = torch.randn(n_local, HIDDEN, device=device, dtype=dtype)
+        topk_ids = _cycling_topk_ids(n_local, device)
+        topk_weights = _topk_weights(n_local, device)
+        act_fn = get_act_fn("swiglu")
+        dispatcher = TorchAll2AllDispatcher(
+            n_routed_experts=N_EXPERTS, process_group=dist.group.WORLD, training_dtype="bf16"
+        )
+        pre = dispatcher.dispatch_preprocess(hidden_states=hidden0, topk_ids=topk_ids, topk_weights=topk_weights)
+
+        x_s = pre["hidden_states"].detach().clone().requires_grad_(True)
+        x_c = pre["hidden_states"].detach().clone().requires_grad_(True)
+        w1_s, w1_c = _make_weights(e_local, HIDDEN, 2 * INTER, device, seed=42 + rank)
+        w2_s, w2_c = _make_weights(e_local, INTER, HIDDEN, device, seed=99 + rank)
+
+        combined_s = fused_dispatch_mlp_combine(x_s, w1_s, w2_s, act_fn, topk_ids, N_EXPERTS, dist.group.WORLD)
+        out_s = unpermute(combined_s, pre["row_id_map"], probs=topk_weights)
+
+        # Force the split at any world size that allows it: cap EP·(e_local-1) so the planner must
+        # emit ≥ 2 chunks whenever e_local > 1 (ws=8 → [(0,2),(2,2)], ws=16 → [(0,1),(1,1)];
+        # ws=32 → e_local=1 cannot chunk since the smallest call already needs ep entries, so the
+        # A/B degenerates to single-vs-single). unittest-style ranks can't use the monkeypatch
+        # fixture.
+        old_cap = fused_a2a_gmm._MAX_FUSED_COUNT_ENTRIES
+        fused_a2a_gmm._MAX_FUSED_COUNT_ENTRIES = ws * max(1, e_local - 1)
+        try:
+            plan = fused_a2a_gmm._plan_local_expert_chunks(ws, e_local)
+            if e_local > 1:
+                assert len(plan) > 1, f"forced cap did not trigger chunking: {plan}"
+            if ws == 8:
+                assert plan == [(0, 2), (2, 2)]
+            combined_c = fused_dispatch_mlp_combine(x_c, w1_c, w2_c, act_fn, topk_ids, N_EXPERTS, dist.group.WORLD)
+        finally:
+            fused_a2a_gmm._MAX_FUSED_COUNT_ENTRIES = old_cap
+        out_c = unpermute(combined_c, pre["row_id_map"], probs=topk_weights)
+
+        torch.testing.assert_close(out_s.float(), out_c.float(), atol=FWD_ATOL, rtol=FWD_RTOL, msg="forward combined")
+
+        torch.manual_seed(31337)
+        grad_out = torch.randn(n_local, HIDDEN, device=device, dtype=dtype)
+        out_s.backward(grad_out)
+        out_c.backward(grad_out)
+
+        torch.testing.assert_close(x_s.grad.float(), x_c.grad.float(), atol=FULL_ATOL, rtol=FULL_RTOL, msg="dHidden")
+        torch.testing.assert_close(w1_s.grad.float(), w1_c.grad.float(), atol=FULL_ATOL, rtol=FULL_RTOL, msg="dW1")
+        torch.testing.assert_close(w2_s.grad.float(), w2_c.grad.float(), atol=FULL_ATOL, rtol=FULL_RTOL, msg="dW2")
+
+    def test_chunked_empty_send_chunk_padded(self):
+        """Regression: a chunk whose send rows are empty on every rank must not 561002-crash.
+
+        All tokens route into chunk-1 local experts, so chunk 0's outbound count list is all zero
+        on EVERY rank — the shape the op rejects without the structural pad. The unchunked call
+        tolerates the same routing, so both sides must still agree forward + grads.
+        """
+        self._set_device()
+        self.create_pg("cuda")
+        ws = dist.get_world_size()
+        rank = dist.get_rank()
+        e_local = N_EXPERTS // ws
+        device = torch.device("cuda", rank % torch.npu.device_count())
+        dtype = torch.bfloat16
+        n_local = _n_local(rank)
+
+        old_cap = fused_a2a_gmm._MAX_FUSED_COUNT_ENTRIES
+        forced_cap = ws * max(1, e_local - 1)
+        fused_a2a_gmm._MAX_FUSED_COUNT_ENTRIES = forced_cap
+        try:
+            size_c = fused_a2a_gmm._plan_local_expert_chunks(ws, e_local)[0][1]
+        finally:
+            fused_a2a_gmm._MAX_FUSED_COUNT_ENTRIES = old_cap
+        if e_local > 1:
+            assert size_c < e_local, "expected a chunk 1 to route into"
+
+        torch.manual_seed(1234 + rank)
+        hidden0 = torch.randn(n_local, HIDDEN, device=device, dtype=dtype)
+        topk_ids = _chunk0_empty_topk_ids(n_local, device, size_c, e_local)
+        topk_weights = _topk_weights(n_local, device)
+        act_fn = get_act_fn("swiglu")
+        dispatcher = TorchAll2AllDispatcher(
+            n_routed_experts=N_EXPERTS, process_group=dist.group.WORLD, training_dtype="bf16"
+        )
+        pre = dispatcher.dispatch_preprocess(hidden_states=hidden0, topk_ids=topk_ids, topk_weights=topk_weights)
+
+        x_s = pre["hidden_states"].detach().clone().requires_grad_(True)
+        x_c = pre["hidden_states"].detach().clone().requires_grad_(True)
+        w1_s, w1_c = _make_weights(e_local, HIDDEN, 2 * INTER, device, seed=42 + rank)
+        w2_s, w2_c = _make_weights(e_local, INTER, HIDDEN, device, seed=99 + rank)
+
+        combined_s = fused_dispatch_mlp_combine(x_s, w1_s, w2_s, act_fn, topk_ids, N_EXPERTS, dist.group.WORLD)
+        out_s = unpermute(combined_s, pre["row_id_map"], probs=topk_weights)
+
+        fused_a2a_gmm._MAX_FUSED_COUNT_ENTRIES = forced_cap
+        try:
+            combined_c = fused_dispatch_mlp_combine(x_c, w1_c, w2_c, act_fn, topk_ids, N_EXPERTS, dist.group.WORLD)
+        finally:
+            fused_a2a_gmm._MAX_FUSED_COUNT_ENTRIES = old_cap
+        out_c = unpermute(combined_c, pre["row_id_map"], probs=topk_weights)
+
+        torch.testing.assert_close(out_s.float(), out_c.float(), atol=FWD_ATOL, rtol=FWD_RTOL, msg="forward combined")
+
+        torch.manual_seed(31337)
+        grad_out = torch.randn(n_local, HIDDEN, device=device, dtype=dtype)
+        out_s.backward(grad_out)
+        out_c.backward(grad_out)
+
+        torch.testing.assert_close(x_s.grad.float(), x_c.grad.float(), atol=FULL_ATOL, rtol=FULL_RTOL, msg="dHidden")
+        torch.testing.assert_close(w1_s.grad.float(), w1_c.grad.float(), atol=FULL_ATOL, rtol=FULL_RTOL, msg="dW1")
+        torch.testing.assert_close(w2_s.grad.float(), w2_c.grad.float(), atol=FULL_ATOL, rtol=FULL_RTOL, msg="dW2")
