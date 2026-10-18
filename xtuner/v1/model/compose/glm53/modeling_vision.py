@@ -40,6 +40,7 @@ def _vision_embed_before_sp() -> bool:
     # Default 0: shard-then-embed. Set XTUNER_GLM53_VISION_EMBED_BEFORE_SP=1 for parity.
     return os.getenv("XTUNER_GLM53_VISION_EMBED_BEFORE_SP", "0") == "1"
 
+
 # The block forward is the whole ViT layer (norm -> attn -> norm -> clamped-SwiGLU MLP); compiling
 # it is what fuses the clamp/activation elementwise chain. `fullgraph=False`: the attention
 # dispatches into a kernel (flash/eager) that dynamo cannot trace through, and under SP the block
@@ -281,11 +282,22 @@ class Glm53VisionAttention(nn.Module):
             # slice of the heads but sees the whole sequence, so the attention below is exact
             # (GLM-5.3's vision attention is plain MHA -- q/k/v share `num_heads`, so unlike
             # qwen3_vl there is no GQA kv-repeat case to handle).
-            if self.num_heads % sp_size != 0:
+            # With sp_size > num_heads there are not enough heads to split, so every head is
+            # replicated `head_replica` times to fill the `sp_size` a2a slots (pure Ulysses
+            # topology, no sub-groups). The output pass keeps only the first replica of each
+            # head, so the duplicated slots receive zero upstream grad and every head is still
+            # counted exactly once in the backward.
+            if self.num_heads % sp_size != 0 and sp_size % self.num_heads != 0:
                 raise ValueError(
                     f"GLM-5.3-Flash vision SP needs num_heads ({self.num_heads}) divisible by "
-                    f"sp_size ({sp_size}) for the Ulysses head split."
+                    f"sp_size ({sp_size}) for the Ulysses head split, or sp_size divisible by "
+                    f"num_heads for the replicated-head split."
                 )
+            head_replica = 1 if sp_size <= self.num_heads else sp_size // self.num_heads
+            if head_replica > 1:
+                query_states = query_states.repeat_interleave(head_replica, dim=1)
+                key_states = key_states.repeat_interleave(head_replica, dim=1)
+                value_states = value_states.repeat_interleave(head_replica, dim=1)
             query_states, key_states, value_states = (
                 ulysses_all_to_all(states, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh)
                 for states in (query_states, key_states, value_states)
@@ -310,6 +322,10 @@ class Glm53VisionAttention(nn.Module):
             # The attention returns `[b, seq, heads, dim]`, so the same (scatter_dim, gather_dim)
             # literals undo the split above: scatter the sequence, gather the heads back.
             raw_output = ulysses_all_to_all(raw_output, scatter_dim=1, gather_dim=2, mesh=sequence_parallel_mesh)
+            if head_replica > 1:
+                # Keep the first replica of every head; the duplicated slots get zero upstream
+                # grad (exact duplicates only when dropout_p == 0).
+                raw_output = raw_output[:, :, ::head_replica]
         raw_output = raw_output[0].reshape(seq_length, -1).contiguous()
         projected_output = self.proj(raw_output)
         return {"projected_output": projected_output, **attn_op_outputs}
