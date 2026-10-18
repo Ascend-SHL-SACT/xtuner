@@ -9,6 +9,7 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 
 from xtuner.v1.data_proto import SequenceContext
+from xtuner.v1.ops.sparse_mla import kpool_npu
 from xtuner.v1.ops.sparse_mla.sequence_parallel_indexer import (
     balanced_query_partition,
     causal_work_prefix,
@@ -171,3 +172,123 @@ def _distributed_cpu_worker(rank, world_size, init_path):
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Requires the CPU Gloo backend")
 def test_neighbor_redistribution_and_packed_kpool_preserve_attention_ownership(tmp_path):
     mp.spawn(_distributed_cpu_worker, args=(4, str(tmp_path / "gloo_init")), nprocs=4, join=True)
+
+
+def _npu_path_balance_worker(rank, world_size, init_path):
+    """Drive ``npu_kpool_topk_indices`` with ``balance_sp=True`` on CPU/gloo.
+
+    On a CPU device the NPU backend takes its legacy per-segment torch scorer (the fused
+    triton path is NPU-gated), so the full production glue -- partition agreement, query
+    redistribution, balanced-ownership scoring through the redistributed shard context, id
+    restore, attention-owned expand -- runs end to end without an accelerator. The balanced
+    shard output must equal the unbalanced whole-sequence output sliced to this rank's
+    attention shard, bit for bit.
+    """
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size, init_method=f"file://{init_path}")
+    try:
+        mesh = init_device_mesh("cpu", (world_size,))
+        moved: list[bool] = []
+        real_redistribute = kpool_npu.redistribute_indexer_queries
+
+        def _counting_redistribute(*args, **kwargs):
+            moved.append(True)
+            return real_redistribute(*args, **kwargs)
+
+        kpool_npu.redistribute_indexer_queries = _counting_redistribute
+        # 16 indexer heads, as in production: the query alignment is 128 // heads, and a
+        # small alignment keeps the balanced boundaries from collapsing onto the uniform
+        # seams of these short packed sequences.
+        for cu_values in ((0, 64), (0, 5, 16, 64), (0, 1, 4, 17, 64)):
+            torch.manual_seed(87)
+            q = torch.randn(1, 64, 16, 8)
+            k = torch.randn(1, 64, 8)
+            gates = torch.randn_like(k)
+            weights = torch.randn(1, 64, 16)
+            ape = torch.randn(4, 8)
+            cu = torch.tensor(cu_values, dtype=torch.int32)
+            full_ctx = SequenceContext(
+                input_ids=torch.zeros(1, 64, dtype=torch.long),
+                cu_seq_lens_q=cu,
+                cu_seq_lens_k=cu,
+                max_length_q=64,
+                max_length_k=64,
+                device="cpu",
+            )
+            local_ctx = full_ctx.copy(sequence_parallel_mesh=mesh, shard_start=rank * 16, shard_size=16)
+            expected = kpool_npu.npu_kpool_topk_indices(
+                q, k, gates, weights, ape, full_ctx, index_head_dim=8, index_topk=8
+            )
+            for ratio in (0, 0.5):
+                actual = kpool_npu.npu_kpool_topk_indices(
+                    q[:, rank * 16 : (rank + 1) * 16],
+                    k[:, rank * 16 : (rank + 1) * 16],
+                    gates[:, rank * 16 : (rank + 1) * 16],
+                    weights[:, rank * 16 : (rank + 1) * 16],
+                    ape,
+                    local_ctx,
+                    index_head_dim=8,
+                    index_topk=8,
+                    balance_sp=True,
+                    sp_full_pool_work_ratio=ratio,
+                )
+                torch.testing.assert_close(actual, expected[rank * 16 : (rank + 1) * 16], atol=0, rtol=0)
+        # The single long document is the shape balancing exists for: its causal work grows
+        # monotonically along the sequence, so the partition must win its benefit gate and
+        # actually move rows on every rank.
+        assert moved, "balance_sp never redistributed any query rows"
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Requires the CPU Gloo backend")
+def test_npu_backend_balance_sp_preserves_attention_ownership(tmp_path):
+    mp.spawn(_npu_path_balance_worker, args=(4, str(tmp_path / "gloo_init")), nprocs=4, join=True)
+
+
+class TestKpoolExpandMetaHostMirror:
+    """The host prefix mirror in ``_expand_meta`` must equal the device ``row_prefix``.
+
+    The host mirror (a bisect over the same cumulative lengths the device tensors were built
+    from) bounds each launch's pool axis in ``_score_and_topk_batched``; the device
+    ``row_prefix`` drives the visibility mask and the slot validity test. A mismatch clamps
+    launches to the wrong width -- dropping visible columns (wrong selection) or scoring pad
+    columns (wasted work). Covers shard starts aligned with / straddling document boundaries,
+    single-row shards, and one long document.
+    """
+
+    @pytest.mark.parametrize(
+        "doc_lens,shard_start,query_len",
+        [
+            ([4096], 0, 4096),  # single long document, shard starts at its head
+            ([8192], 4096, 4096),  # second half of one long document
+            ([200, 3, 17, 64, 65, 1, 129, 300, 7, 77, 1040, 512], 1000, 1000),  # mixed small docs
+            ([300, 700], 300, 1),  # shard start exactly on a document boundary, one row
+            ([300, 700], 250, 100),  # shard start straddles a document's interior
+        ],
+    )
+    def test_prefix_host_equals_device_row_prefix(self, doc_lens: list[int], shard_start: int, query_len: int) -> None:
+        cu = [0]
+        for ln in doc_lens:
+            cu.append(cu[-1] + ln)
+        cu_q = torch.tensor(cu, dtype=torch.int32)
+        ctx = SequenceContext(
+            input_ids=None,
+            cu_seq_lens_q=cu_q,
+            cu_seq_lens_k=cu_q,
+            max_length_q=max(doc_lens),
+            max_length_k=max(doc_lens),
+            device="cpu",
+            shard_start=shard_start,
+            shard_size=query_len,
+        )
+        row_prefix, _row_doc_start, _slot_offsets, prefix_host = kpool_npu._expand_meta(
+            ctx, query_len, 4, torch.device("cpu")
+        )
+        assert len(prefix_host) == query_len
+        assert prefix_host == row_prefix.tolist()
+        # Closed-form spot check: visible pools of row r == (global token - doc start + 1) // kpool.
+        for r in (0, query_len // 2, query_len - 1):
+            tok = shard_start + r
+            doc = max(i for i, s in enumerate(cu[:-1]) if s <= tok)
+            assert prefix_host[r] == (tok - cu[doc] + 1) // 4
