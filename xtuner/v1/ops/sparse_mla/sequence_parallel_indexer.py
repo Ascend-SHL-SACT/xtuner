@@ -11,6 +11,7 @@ from torch import Tensor
 from torch.distributed.device_mesh import DeviceMesh
 
 from xtuner.v1.data_proto import SequenceContext
+from xtuner.v1.utils.device import get_device, get_torch_device_module
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,8 @@ def get_indexer_sp_partition(
             device = seq_ctx.cu_seq_lens_q.device
             if device.type != "cuda":
                 device = torch.device("cuda", torch.cuda.current_device())
+        elif dist.get_backend(group) == "hccl":
+            device = torch.device(get_device(), get_torch_device_module().current_device())
         valid = torch.tensor(int(local_valid), dtype=torch.int32, device=device)
         dist.all_reduce(valid, op=dist.ReduceOp.MIN, group=group)
         eligibility[key] = (local_signature, bool(valid.item()))

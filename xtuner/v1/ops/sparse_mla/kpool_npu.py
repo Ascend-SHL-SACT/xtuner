@@ -45,9 +45,11 @@ Apache-2.0) and lives in the guarded section at the bottom of this file.
 from __future__ import annotations
 
 import functools
+import math
 import os
 import weakref
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -56,6 +58,7 @@ from xtuner.v1.ops.comm import gather_for_sequence_parallel
 
 from . import kpool
 from .kpool import _visible_tail_tokens, build_pool_index, build_pools, kpool_output_width
+from .sequence_parallel_indexer import get_indexer_sp_partition, redistribute_indexer_queries
 
 
 try:
@@ -72,6 +75,18 @@ __all__ = ["npu_kpool_topk_indices"]
 # chain. Setting it to ``0`` restores the legacy per-segment path bit for bit.
 _BATCHED_SCORE = os.environ.get("XTUNER_GLM53_KPOOL_BATCHED_SCORE", "1") == "1"
 
+# SP work-balancing overrides for the indexer scorer (see ``npu_kpool_topk_indices``). The
+# launch scripts export both; unset keeps the caller's config values untouched.
+_ENV_BALANCE_SP: bool | None = (
+    None if (raw := os.environ.get("XTUNER_INDEXER_BALANCE_SP")) is None else raw.lower() in ("1", "true", "yes", "on")
+)
+_ENV_WORK_RATIO: float | None = None
+if (raw := os.environ.get("XTUNER_INDEXER_SP_WORK_RATIO")) is not None:
+    try:
+        _ENV_WORK_RATIO = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"XTUNER_INDEXER_SP_WORK_RATIO={raw!r} is not a valid float") from exc
+
 # Eager-fallback budget: at most 2**28 fp32 score elements per chunk (~1 GiB), matching the
 # pre-merge implementation's ``_score_chunk_elems``.
 _SCORE_CHUNK_ELEMS = 1 << 28
@@ -82,13 +97,16 @@ _SCORE_CHUNK_ELEMS = 1 << 28
 # stays inside int32.
 _SEL_PAD = 1 << 26
 
-# Batched-expand broadcast tensors per (context, kpool, query length, device). Keyed weakly by the
-# SequenceContext so the entries die with the micro-batch; the build pays exactly one
-# blocking H2D copy (the cumulative length list) per context instead of one per indexer
-# call -- a per-call H2D drains the deeply queued training stream on every call and
-# serialized host enqueueing against device execution (~45 s/step at 128K).
+# Batched-expand broadcast tensors per (context, kpool, query length, shard start, device).
+# Keyed weakly by the SequenceContext so the entries die with the micro-batch; the build pays
+# exactly one blocking H2D copy (the cumulative length list) per context instead of one per
+# indexer call -- a per-call H2D drains the deeply queued training stream on every call and
+# serialized host enqueueing against device execution (~45 s/step at 128K). The shard start
+# joins the key so the balanced-SP scoring shard (a different start per micro-batch, but the
+# same across all kpool layers of one micro-batch) reuses the original context's cache entry
+# instead of rebuilding -- and re-copying -- the device side 24x per step.
 _KPOOL_META_CACHE: weakref.WeakKeyDictionary[
-    SequenceContext, dict[tuple[int, int, torch.device], tuple[Tensor, Tensor, Tensor]]
+    SequenceContext, dict[tuple[int, int, torch.device, int], tuple[Tensor, Tensor, Tensor, list[int]]]
 ] = weakref.WeakKeyDictionary()
 
 # ``build_pool_index`` is a pure function of the packed-sequence lengths, so its result is
@@ -148,19 +166,15 @@ def npu_kpool_topk_indices(
             (``torch_npu`` uses 1 -- the kernel takes any index width).
         query_chunk_size (int | None): Eager-fallback query-chunk bound; ignored by the fused
             kernel, which self-bounds through its tile picker.
-        balance_sp (bool): SP work-balancing knob shared with the TileLang backends; not
-            implemented on the NPU path (rejected explicitly when set).
-        sp_full_pool_work_ratio (float): Balancing split ratio; unused while
-            ``balance_sp`` is False.
+        balance_sp (bool): Redistribute query scoring work with neighbor P2P (same
+            protocol as the TileLang backends), then restore attention ownership
+            before token expansion and tail selection.
+        sp_full_pool_work_ratio (float): Fixed per-query selection/launch estimate
+            relative to the full pool width. Must be finite and nonnegative.
 
     Returns:
         Tensor: ``[S, 1, kpool_output_width(index_topk, index_kpool, alignment)]`` int32.
     """
-    if balance_sp:
-        raise NotImplementedError(
-            "npu_kpool_topk_indices does not implement SP work balancing yet; keep "
-            "indexer_balance_sp=False (the default) for the torch_npu backend."
-        )
     assert index_topk % index_kpool == 0
     # SP: queries stay sharded; the key side gathers *before* pooling, because a pool can
     # straddle the shard seam (see build_pools).
@@ -177,15 +191,56 @@ def npu_kpool_topk_indices(
 
     select_k = index_topk // index_kpool
     w_all = weights.squeeze(0)
+    # Out-of-place scaling (matches kpool.py's reference path): ``.float()`` on an fp32 input
+    # is an alias, so an in-place ``mul_`` would compound the NH scaling into every consumer.
+    w_all_f = w_all.float() * (q_local.shape[1] ** -0.5)
 
-    ranges = _segment_ranges(seq_ctx, seq_len, index_kpool)
+    if _ENV_BALANCE_SP is not None:
+        balance_sp = _ENV_BALANCE_SP
+    if _ENV_WORK_RATIO is not None:
+        sp_full_pool_work_ratio = _ENV_WORK_RATIO
+    if not math.isfinite(sp_full_pool_work_ratio) or sp_full_pool_work_ratio < 0:
+        raise ValueError("sp_full_pool_work_ratio must be finite and nonnegative")
+
+    # SP work balancing: the causal score rectangle grows with the query's position, so under
+    # a uniform shard the last rank scores ~the full pool width while the first scores almost
+    # nothing, and the step is bound by the slowest rank. Equalize the estimated scoring work,
+    # score under the balanced ownership, then ship the selected pool ids back before the
+    # token expand -- attention itself keeps its uniform shard.
+    # The scoring shard shares the context's global cu lengths; under balance only the shard
+    # start moves (into the redistributed ownership). Passing the start explicitly instead of
+    # through a ``seq_ctx.copy()`` keeps the meta/segment builds on the original context's
+    # caches -- a copied context would miss the weakref caches and rebuild (with a blocking
+    # H2D of the cu lengths) on every one of the 384 calls/step.
+    score_shard_start: int | None = None
+    score_len = seq_len
+    partition = None
+    if balance_sp:
+        # Same query alignment as the TileLang "original" scorer: identical packed shapes
+        # must derive identical partitions on every backend.
+        index_n_heads = q_local.shape[1]
+        query_alignment = 128 // index_n_heads if 128 % index_n_heads == 0 else 1
+        partition = get_indexer_sp_partition(
+            seq_ctx,
+            index_kpool,
+            query_alignment,
+            round(pool_key.shape[0] * sp_full_pool_work_ratio),
+            query_len=seq_len,
+        )
+        if partition is not None:
+            assert sp_mesh is not None
+            q_local, w_all_f = redistribute_indexer_queries(
+                (q_local, w_all_f), partition.attention, partition.indexer, sp_mesh
+            )
+            score_shard_start = partition.indexer[sp_mesh.get_local_rank()]
+            score_len = q_local.shape[0]
+
+    ranges = _segment_ranges(seq_ctx, score_len, index_kpool, shard_start=score_shard_start)
     if ranges:
-        row_prefix, row_doc_start, slot_offsets = _expand_meta(seq_ctx, seq_len, index_kpool, device)
+        row_prefix, row_doc_start, slot_offsets, prefix_host = _expand_meta(
+            seq_ctx, score_len, index_kpool, device, shard_start=score_shard_start
+        )
 
-        # Out-of-place scaling (matches kpool.py's reference path): if a caller ever hands in a
-        # shared/cached fp32 weights tensor, ``.float()`` is a no-op alias and an in-place
-        # ``mul_`` would silently compound the NH scaling into every consumer.
-        w_all_f = w_all.float() * (q_local.shape[1] ** -0.5)
         max_pools = max(r[3] - r[2] for r in ranges)
         if _BATCHED_SCORE and lightning_indexer_score_into is not None and q_local.device.type == "npu":
             if select_k <= max_pools:
@@ -202,7 +257,7 @@ def npu_kpool_topk_indices(
                 # Do not tighten this to a per-document minimum -- mixed packs would lose the
                 # batched path for no correctness gain.
                 sel_all = _score_and_topk_batched(
-                    q_local, pool_key, w_all_f, ranges, row_prefix, select_k, index_head_dim
+                    q_local, pool_key, w_all_f, ranges, row_prefix, prefix_host, select_k, index_head_dim
                 ).to(torch.int32)
                 # ``topk`` hands back int64 ids; left as int64 they poison the shared expand
                 # below -- ``tok`` becomes a 2.1 GB int64 buffer and ``masked_fill_`` (no
@@ -229,7 +284,7 @@ def npu_kpool_topk_indices(
             # valid pool id, so the batched validity test below rejects them without a per-segment
             # mask. Everything after the loop -- validity, the arithmetic token expand and the
             # output write -- is then one broadcast per call instead of one chain per segment.
-            sel_all = torch.full((seq_len, select_k), _SEL_PAD, dtype=torch.int32, device=device)
+            sel_all = torch.full((score_len, select_k), _SEL_PAD, dtype=torch.int32, device=device)
             p_arange = torch.arange(max_pools, device=device)
             for row_lo, row_hi, pool_lo, pool_hi, _doc_start in ranges:
                 num_pools = pool_hi - pool_lo
@@ -250,6 +305,13 @@ def npu_kpool_topk_indices(
                 )
                 selected = index_scores.topk(min(select_k, num_pools), dim=-1).indices
                 sel_all[row_lo:row_hi, : selected.shape[-1]] = selected
+
+        if partition is not None:
+            # Ship the selected pool ids back to the attention owner; column ids are
+            # ownership-independent, but the expand below must use the attention shard's
+            # own row prefix / document starts.
+            (sel_all,) = redistribute_indexer_queries((sel_all,), partition.indexer, partition.attention, sp_mesh)
+            row_prefix, row_doc_start, slot_offsets, _prefix_host = _expand_meta(seq_ctx, seq_len, index_kpool, device)
 
         # Pool-id -> token-id expand, batched over the whole shard and *gather-free*: pool
         # ``p`` of document ``d`` -- a document-local column id ``c`` in ``sel_all`` --
@@ -320,7 +382,7 @@ kpool.build_pool_index = _cached_pool_index
 
 
 def _segment_ranges(
-    seq_ctx: SequenceContext, query_len: int, index_kpool: int
+    seq_ctx: SequenceContext, query_len: int, index_kpool: int, shard_start: int | None = None
 ) -> list[tuple[int, int, int, int, int]]:
     """Intersect the local query shard with the packed documents, in pool space.
 
@@ -329,6 +391,9 @@ def _segment_ranges(
             global and ``shard_start`` locates this rank's queries inside it.
         query_len (int): Number of local queries on this rank.
         index_kpool (int): Pool size.
+        shard_start (int | None): First global token id of the shard; ``None`` uses the
+            context's attention shard (``seq_ctx.shard_start``). Balanced-SP scoring passes
+            the redistributed start while keeping the context's global cu lengths.
 
     Returns:
         list[tuple[int, int, int, int, int]]: ``(row_lo, row_hi, pool_lo, pool_hi,
@@ -342,7 +407,8 @@ def _segment_ranges(
     # stream behind the freshly enqueued SP-gather + build_pools work (~26 ms per call,
     # 192 calls/step, ~5 s of device idle per step).
     cu = [int(v) for v in seq_ctx.cu_seq_lens_q_list]
-    shard_start = int(seq_ctx.shard_start)
+    if shard_start is None:
+        shard_start = int(seq_ctx.shard_start)
     shard_end = shard_start + query_len
 
     ranges: list[tuple[int, int, int, int, int]] = []
@@ -357,8 +423,8 @@ def _segment_ranges(
 
 
 def _expand_meta(
-    seq_ctx: SequenceContext, query_len: int, index_kpool: int, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor]:
+    seq_ctx: SequenceContext, query_len: int, index_kpool: int, device: torch.device, shard_start: int | None = None
+) -> tuple[Tensor, Tensor, Tensor, list[int]]:
     """Build (or fetch from cache) the batched-expand broadcast tensors.
 
     Args:
@@ -367,20 +433,31 @@ def _expand_meta(
         query_len (int): Number of local queries on this rank.
         index_kpool (int): Pool size.
         device (torch.device): Target device.
+        shard_start (int | None): First global token id of the shard; ``None`` uses the
+            context's attention shard (``seq_ctx.shard_start``). Balanced-SP scoring passes
+            the redistributed start, so its per-micro-batch shard reuses this context's
+            cached entry across all kpool layers instead of rebuilding per call.
 
     Returns:
-        tuple[Tensor, Tensor, Tensor]: ``(row_prefix, row_doc_start, slot_offsets)`` -- the
-        row's causal visible-pool count ``[query_len]`` int32, the row's document first
-        global token id ``[query_len]`` int32, and the in-pool slot offsets ``[kpool]``
-        int32. All pure device tensors built from one H2D copy of the cumulative lengths.
+        tuple[Tensor, Tensor, Tensor, list[int]]: ``(row_prefix, row_doc_start, slot_offsets,
+        prefix_host)`` -- the row's causal visible-pool count ``[query_len]`` int32, the row's
+        document first global token id ``[query_len]`` int32, the in-pool slot offsets
+        ``[kpool]`` int32, and ``row_prefix`` as plain host ints. All pure device tensors are
+        built from one H2D copy of the cumulative lengths; the host list is derived from the
+        same cumulative lengths without a device readback, so per-segment launch bounding in
+        :func:`_score_and_topk_batched` never syncs the training stream.
     """
     cache = _KPOOL_META_CACHE.get(seq_ctx)
     if cache is None:
         cache = {}
         _KPOOL_META_CACHE[seq_ctx] = cache
+    if shard_start is None:
+        shard_start = int(seq_ctx.shard_start)
     # device joins the key (as in _POOL_INDEX_CACHE above): SequenceContext.to() mutates
     # the context in place, so a moved context must not hit entries built on the old device.
-    key = (index_kpool, query_len, torch.device(device))
+    # The shard start joins it so balanced-SP scoring shards share this cache without
+    # colliding with the attention shard's entry.
+    key = (index_kpool, query_len, torch.device(device), shard_start)
     hit = cache.get(key)
     if hit is not None:
         return hit
@@ -393,13 +470,24 @@ def _expand_meta(
     # of that document (a document-local column id ``c`` in the slot buffer) covers tokens
     # ``doc_start_d + c * kpool + slot``, so these two row vectors plus the slot offsets are
     # all the expand needs.
-    row_tok = torch.arange(query_len, device=device, dtype=torch.int64) + int(seq_ctx.shard_start)
+    row_tok = torch.arange(query_len, device=device, dtype=torch.int64) + shard_start
     doc_of_row = torch.searchsorted(cu, row_tok, right=True) - 1
     row_doc_start = cu[doc_of_row].to(torch.int32)
     row_prefix = ((row_tok - cu[doc_of_row] + 1) // index_kpool).to(torch.int32)
     slot_offsets = torch.arange(index_kpool, device=device, dtype=torch.int32)
 
-    meta = (row_prefix, row_doc_start, slot_offsets)
+    # Host mirror of ``row_prefix`` (monotone within each document): the same arithmetic as
+    # the tensor above, kept as plain ints so the batched scorer can size per-segment launches
+    # from the cumulative lengths alone -- a device readback here would park the host behind
+    # the stream (see _segment_ranges' note on the ~26 ms stall). Vectorized over numpy: the
+    # balanced-SP path builds this for a second (redistributed) context on every call, and a
+    # per-row python loop would land that cost directly on the step's host path.
+    tok = np.arange(shard_start, shard_start + query_len, dtype=np.int64)
+    cu_arr = np.asarray(cu_host, dtype=np.int64)
+    doc = np.searchsorted(cu_arr, tok, side="right") - 1
+    prefix_host = ((tok - cu_arr[doc] + 1) // index_kpool).tolist()
+
+    meta = (row_prefix, row_doc_start, slot_offsets, prefix_host)
     cache[key] = meta
     return meta
 
@@ -410,6 +498,7 @@ def _score_and_topk_batched(
     w_all_f: Tensor,
     ranges: list[tuple[int, int, int, int, int]],
     row_prefix: Tensor,
+    prefix_host: list[int],
     select_k: int,
     index_head_dim: int,
 ) -> Tensor:
@@ -419,11 +508,17 @@ def _score_and_topk_batched(
     prefill of a whole-call ``[S, W]`` fp32 score buffer (``W`` = max segment pool count plus
     one tile of slack, so every segment's padded pool axis fits its rows), one whole-call
     visibility compare, one score launch per segment (``lightning_indexer_score_into`` writes
-    strided rows), and a single batched ``topk``. Padded pool columns read past a document's
-    real keys are zero-keyed and past every row's visible prefix, so they score as invalid;
-    the batched ``topk`` may therefore select pad-column ids for rows with fewer visible pools
-    than ``select_k``, and the caller's ``sel < row_prefix`` test rejects them exactly like
-    the legacy ``_SEL_PAD`` slot padding.
+    strided rows), and a single batched ``topk``. Each launch's pool axis is clamped to the
+    segment's widest row prefix, rounded up to a whole tile: the kernel computes every
+    ``[BS, BP]`` tile it is launched over and applies causal visibility only at the store, so
+    an unclamped launch burns full-tile compute on causally-invisible pool columns (a 128K
+    single-document pack scores ~9.6 s/step that way, run18). Skipped columns keep their
+    ``finfo.min`` prefill, so the ``topk`` sees exactly the scores the unclamped layout
+    produced. Padded pool columns read past a document's real keys are zero-keyed and past
+    every row's visible prefix, so they score as invalid; the batched ``topk`` may therefore
+    select pad-column ids for rows with fewer visible pools than ``select_k``, and the
+    caller's ``sel < row_prefix`` test rejects them exactly like the legacy ``_SEL_PAD`` slot
+    padding.
 
     Args:
         q_local (Tensor): Query rows ``[S, NH, D]``, contiguous.
@@ -432,6 +527,8 @@ def _score_and_topk_batched(
         ranges (list[tuple[int, int, int, int, int]]): ``(row_lo, row_hi, pool_lo, pool_hi,
             doc_start)`` per segment, from ``_segment_ranges``.
         row_prefix (Tensor): Per-row visible-pool prefix ``[S]`` int32.
+        prefix_host (list[int]): ``row_prefix`` as plain ints; bounds each launch's pool axis
+            without a device readback.
         select_k (int): Slot width (``index_topk // index_kpool``); must not exceed the largest
             segment's pool count so the batched topk width matches the legacy slot buffer.
         index_head_dim (int): Indexer head dimension (scale only).
@@ -450,7 +547,11 @@ def _score_and_topk_batched(
     # *every* row, not each row's own document size: ~2.2 GB fp32 scores_all + ~0.55 GB bool
     # visible_all per call at 128K/SP=8 (allocator-reused across the 192 calls/step; validated
     # by run145). The legacy per-segment path instead peaks at the largest rows_d x pools_d
-    # segment -- budget accordingly when planning 256K / SP-off / heterogeneous packs.
+    # segment -- budget accordingly when planning 256K / SP-off / heterogeneous packs. Under
+    # balanced-SP scoring S_local itself grows on the early ranks (128K single document,
+    # ratio 0.5, SP=8: rank 0 scores ~27K rows, 1.66x the uniform 16K, i.e. ~3.6 GB fp32 +
+    # 0.9 GB bool per call) -- size the headroom from the balanced row counts, not the
+    # uniform ones.
     scores_all = torch.full(
         (seq_len, width), float(torch.finfo(torch.float32).min), dtype=torch.float32, device=device
     )
@@ -465,13 +566,19 @@ def _score_and_topk_batched(
     pool_key_pad = torch.nn.functional.pad(pool_key, (0, 0, 0, _MAX_BLOCK_P - 1))
     scale = index_head_dim**-0.5
     for row_lo, row_hi, pool_lo, pool_hi, _doc_start in ranges:
+        # ``row_prefix`` is monotone within a document, so the segment's last row carries the
+        # widest visible prefix; rounding it up to a whole tile matches the kernel's
+        # tile-granular launch extent (``into`` pads ``num_pools`` the same way).
+        w = min(pool_hi - pool_lo, -(-prefix_host[row_hi - 1] // _MAX_BLOCK_P) * _MAX_BLOCK_P)
+        if w <= 0:
+            continue
         lightning_indexer_score_into(
             q_local[row_lo:row_hi],
             pool_key_pad[pool_lo:],
             w_all_f[row_lo:row_hi],
-            visible_all[row_lo:row_hi],
-            scores_all[row_lo:row_hi],
-            pool_hi - pool_lo,
+            visible_all[row_lo:row_hi, :w],
+            scores_all[row_lo:row_hi, :w],
+            w,
             scale,
         )
     return scores_all.topk(min(select_k, max_pools), dim=-1).indices
