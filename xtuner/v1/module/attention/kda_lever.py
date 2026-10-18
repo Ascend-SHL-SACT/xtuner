@@ -14,7 +14,9 @@ value-correct but deliberately keeps the fla_npu ``input_guard`` clone tax
 (~0.7 s/step at 16 NPU).
 
 - ``SP_A2A_DEFER`` (``XTUNER_KDA_SP_A2A_DEFER``, default ``1``):
-  ``sp_deferred_projections`` / ``sp_deferred_output`` issue each Ulysses a2a
+  ``sp_deferred_projections`` / ``sp_deferred_output`` (head split) and
+  ``sp_deferred_projections_replicated`` / ``sp_deferred_output_replicated``
+  (replicated heads, ``sp_size > num_heads``) issue each Ulysses a2a
   as soon as its input is projected and fence it at its consumer
   (``xtuner.v1.ops.comm.ulysses_dispatch``), so the five forward collectives
   share the wire instead of serializing behind per-call fences, and the
@@ -35,7 +37,10 @@ value-correct but deliberately keeps the fla_npu ``input_guard`` clone tax
   finish's transposed view reaches the chunk kernel as a non-contiguous
   tensor that fla_npu's ``input_guard`` clones on every call (two 64 MiB
   clones per KDA layer invocation at the training shapes, ~650-840 ms/step
-  wall-clock at 16 NPU when present).
+  wall-clock at 16 NPU when present). The replicated-head path consumes its
+  conv a2a with the seq-major finish under both schedules (its recv carries
+  exactly one head's D channels, so the fallback would only add a copy); its
+  kill switch is ``SP_A2A_DEFER=0``.
 - ``PARAM_CACHE`` (``XTUNER_KDA_PARAM_CACHE``, default ``1``):
   ``cached_gate_param`` skips re-deriving the fp32 form of long-lived
   forget-gate parameters on every call (~2.4k materialize chains per training
@@ -243,7 +248,7 @@ def sp_deferred_projections(
     dk = issue_ulysses_dim1(k_local, group)
     v_local = attn.v_proj(hidden_states).transpose(1, 2)
     dv = issue_ulysses_dim1(v_local, group)
-    g_raw = attn.f_b_proj(attn.f_a_proj(hidden_states))
+    g_raw = attn._project_gate(attn.f_b_proj, attn._project_gate(attn.f_a_proj, hidden_states))
     g_send = g_raw.view(batch_size, seq_len, projection_size).transpose(1, 2)
     dg = issue_ulysses_dim1(g_send, group)
     beta_send = attn.b_proj(hidden_states).float().transpose(1, 2)
@@ -291,4 +296,150 @@ def sp_deferred_output(
     do = issue_ulysses_dim1(o, group)
     gate_out = attn._gate_output(hidden_states).view(batch_size, seq_len, attn.num_heads, attn.head_dim)
     o = finish_ulysses_dim1(*do)
+    return o, gate_out
+
+
+def _replicated_send_channels(x: torch.Tensor, replica: int) -> torch.Tensor:
+    """Build the block-priority send layout of the replicated-head path.
+
+    ``(B, L/sp, H, D) -> (B, H*replica*D, L/sp)``: head h fills the ``replica`` consecutive a2a
+    slots ``[h*replica, (h+1)*replica)``, so slot s carries head ``s // replica`` -- the same
+    construction the blocking replicated path uses before its a2a.
+
+    Args:
+        x (torch.Tensor): The ``[B, L/sp, H, D]`` local projection in head-major view.
+        replica (int): The a2a slot count filled by every head (``sp_size // num_heads``).
+
+    Returns:
+        torch.Tensor: The ``[B, H*replica*D, L/sp]`` send tensor.
+    """
+    b, loc, h, d = x.shape
+    x = x.permute(0, 2, 3, 1).repeat_interleave(replica, dim=1)
+    return x.reshape(b, h * replica * d, loc)
+
+
+def _finish_short_conv_replicated(
+    conv: KDAShortConvolution,
+    issued: tuple[torch.Tensor, Any, torch.Size],
+    num_heads: int,
+    head: int,
+    cu_seqlens: torch.Tensor | list[int] | None,
+) -> torch.Tensor:
+    recv, work, _ = issued
+    # Seq-major finish unconditionally: the replicated recv carries exactly one head's D channels,
+    # so the head-major finish + transpose fallback that SP_A2A_DIRECT_CONV=0 selects on the head
+    # split would only add a copy here (same values).
+    x = finish_ulysses_dim1_seq_major(recv, work)  # (B, L, D): one head's channels, full seq
+    weight, bias = conv.materialize_weight_bias()
+    weight = weight.chunk(num_heads, dim=0)[head]
+    if bias is not None:
+        bias = bias.chunk(num_heads, dim=0)[head]
+    out, _ = conv(x, cu_seqlens=cu_seqlens, weight=weight, bias=bias)
+    return out
+
+
+def sp_deferred_projections_replicated(
+    attn: KimiDeltaAttention,
+    hidden_states: torch.Tensor,
+    sp_mesh: Any,
+    sp_rank: int,
+    sp_size: int,
+    cu_seqlens: torch.Tensor | list[int] | None,
+    batch_size: int,
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the deferred-fence q/k/v/g/beta schedule of the replicated-head SP path.
+
+    Same issue-early/fence-at-consumer schedule as ``sp_deferred_projections``, with the
+    replicated-head send layouts (every head fills ``replica = sp_size / num_heads`` a2a slots;
+    slot s carries head ``s // replica``) and the conv finish sliced to this rank's head block.
+    Returns the same five tensors the blocking replicated path produces, bit-identical.
+
+    Args:
+        attn (KimiDeltaAttention): The KDA module whose projections feed the a2as.
+        hidden_states (torch.Tensor): The ``[1, S/sp, hidden]`` shard input.
+        sp_mesh (DeviceMesh): The sequence-parallel mesh.
+        sp_rank (int): This rank's position in the SP group.
+        sp_size (int): The SP group size.
+        cu_seqlens (torch.Tensor | list[int] | None): Packed-sequence offsets.
+        batch_size (int): The (packed, always 1) batch size.
+        seq_len (int): The local shard sequence length.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            ``(q, k, v, g_raw, beta)`` exactly as the blocking replicated path yields.
+    """
+    group = sp_mesh.get_group()
+    replica = sp_size // attn.num_heads
+    head = sp_rank // replica
+
+    dq = issue_ulysses_dim1(
+        _replicated_send_channels(
+            attn.q_proj(hidden_states).view(batch_size, seq_len, attn.num_heads, attn.head_dim), replica
+        ),
+        group,
+    )
+    dk = issue_ulysses_dim1(
+        _replicated_send_channels(
+            attn.k_proj(hidden_states).view(batch_size, seq_len, attn.num_heads, attn.head_dim), replica
+        ),
+        group,
+    )
+    dv = issue_ulysses_dim1(
+        _replicated_send_channels(
+            attn.v_proj(hidden_states).view(batch_size, seq_len, attn.num_heads, attn.head_dim), replica
+        ),
+        group,
+    )
+    g_raw = attn._project_gate(attn.f_b_proj, attn._project_gate(attn.f_a_proj, hidden_states))
+    dg = issue_ulysses_dim1(
+        _replicated_send_channels(g_raw.view(batch_size, seq_len, attn.num_heads, attn.head_dim), replica),
+        group,
+    )
+    beta_send = attn.b_proj(hidden_states).float().transpose(1, 2).repeat_interleave(replica, dim=1)
+    dbeta = issue_ulysses_dim1(beta_send, group)
+
+    q = _finish_short_conv_replicated(attn.q_conv1d, dq, attn.num_heads, head, cu_seqlens)
+    k = _finish_short_conv_replicated(attn.k_conv1d, dk, attn.num_heads, head, cu_seqlens)
+    v = _finish_short_conv_replicated(attn.v_conv1d, dv, attn.num_heads, head, cu_seqlens)
+    g_raw = finish_ulysses_dim1_seq_major(dg[0], dg[1])
+    g_raw = g_raw.view(batch_size, seq_len * sp_size, 1, attn.head_dim)
+    beta = finish_ulysses_dim1_seq_major(dbeta[0], dbeta[1]).sigmoid()  # (B, L, 1)
+    return q, k, v, g_raw, beta
+
+
+def sp_deferred_output_replicated(
+    attn: KimiDeltaAttention,
+    o: torch.Tensor,
+    hidden_states: torch.Tensor,
+    sp_mesh: Any,
+    batch_size: int,
+    seq_len: int,
+    replica: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the deferred-fence output a2a of the replicated-head SP path.
+
+    Issues the reverse a2a before the gate projection and fences it at the o_norm consumption
+    point, then keeps the first replica of every head (``[:, :, ::replica]``, made contiguous
+    explicitly). Returns the same ``(o, gate_out)`` the blocking replicated path produces,
+    bit-identical.
+
+    Args:
+        attn (KimiDeltaAttention): The KDA module producing the gate.
+        o (torch.Tensor): The ``[B, L, 1, D]`` KDA core output over the full sequence.
+        hidden_states (torch.Tensor): The shard input feeding ``_gate_output``.
+        sp_mesh (DeviceMesh): The sequence-parallel mesh.
+        batch_size (int): The (packed, always 1) batch size.
+        seq_len (int): The local shard sequence length.
+        replica (int): The a2a slot count filled by every head.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: ``(o, gate_out)`` -- the fenced and replica-sliced
+            ``[B, L/sp, H, D]`` movement output and the gate projection.
+    """
+    group = sp_mesh.get_group()
+    do = issue_ulysses_dim1(o, group)
+    gate_out = attn._gate_output(hidden_states).view(batch_size, seq_len, attn.num_heads, attn.head_dim)
+    o = finish_ulysses_dim1(*do)  # (B, L/sp, sp, D)
+    o = o[:, :, ::replica].contiguous()
     return o, gate_out
