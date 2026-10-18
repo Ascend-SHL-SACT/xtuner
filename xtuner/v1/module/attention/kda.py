@@ -493,9 +493,15 @@ class KimiDeltaAttention(nn.Module):
         assert sp_mesh is not None
         sp_size = sp_mesh.size()
         sp_rank = seq_ctx.sp_rank
-        assert self.num_heads % sp_size == 0, (
-            f"KDA num_heads ({self.num_heads}) must be divisible by sp_size ({sp_size})"
-        )
+        if self.num_heads % sp_size != 0:
+            if sp_size % self.num_heads != 0:
+                raise ValueError(
+                    f"KDA Ulysses SP needs num_heads ({self.num_heads}) divisible by sp_size ({sp_size}) "
+                    f"for the head split, or sp_size divisible by num_heads for the replicated-head split."
+                )
+            # Not enough heads for the head split (GLM-5.3-Flash KDA has 64; sp 96/128); replicate
+            # every head across `sp_size / num_heads` a2a slots instead.
+            return self._forward_for_ulysses_sp_replicated(hidden_states, seq_ctx, sp_size, sp_rank)
 
         cu_seqlens = kda_lever.cu_seqlens_arg(seq_ctx, hidden_states.device, _KDA_NPU_BACKEND)
         projection_size = self.num_heads * self.head_dim
@@ -599,3 +605,115 @@ class KimiDeltaAttention(nn.Module):
             bias = bias.chunk(sp_size, dim=0)[sp_rank]
         out, _ = conv(x, cu_seqlens=cu_seqlens, weight=weight, bias=bias)
         return out
+
+    def _sp_short_conv_replicated(
+        self,
+        conv: KDAShortConvolution,
+        x_local: torch.Tensor,
+        sp_mesh: Any,
+        sp_rank: int,
+        sp_size: int,
+        replica: int,
+        cu_seqlens: torch.Tensor | list[int] | None,
+    ) -> torch.Tensor:
+        x = x_local.view(x_local.shape[0], x_local.shape[1], self.num_heads, self.head_dim)
+        # Head h fills the `replica` consecutive a2a slots [h*replica, (h+1)*replica), so slot s
+        # carries head s // replica and the scatter hands this rank exactly one head.
+        x = x.permute(0, 2, 3, 1)  # (B, H, D, L/sp)
+        x = x.repeat_interleave(replica, dim=1)  # (B, H*replica, D, L/sp)
+        x = x.reshape(x.shape[0], x.shape[1] * self.head_dim, x.shape[-1])  # (B, H*replica*D, L/sp)
+        x = ulysses_all_to_all(x, scatter_dim=1, gather_dim=2, mesh=sp_mesh)  # (B, D, L)
+        x = x.transpose(1, 2).contiguous()  # (B, L, D)
+
+        weight, bias = conv.materialize_weight_bias()
+        weight = weight.chunk(self.num_heads, dim=0)[sp_rank // replica]
+        if bias is not None:
+            bias = bias.chunk(self.num_heads, dim=0)[sp_rank // replica]
+        out, _ = conv(x, cu_seqlens=cu_seqlens, weight=weight, bias=bias)
+        return out
+
+    def _forward_for_ulysses_sp_replicated(
+        self,
+        hidden_states: torch.Tensor,
+        seq_ctx: SequenceContext,
+        sp_size: int,
+        sp_rank: int,
+    ) -> AttnOutputs:
+        """Ulysses SP with replicated heads (``sp_size > num_heads``).
+
+        Every head fills ``replica = sp_size / num_heads`` a2a slots (slot ``s`` carries head
+        ``s // replica``); each rank runs the KDA core for its one head-slot over the full
+        sequence; the output pass keeps only the first replica of every head, whose duplicated
+        slots receive zero upstream grad so every head is counted exactly once in the backward.
+        Uses the blocking schedule: the deferred-fence plumbing is replication-unaware.
+        Shares ``_forward_for_ulysses_sp``'s precondition: shards must be contiguous and
+        non-empty.
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        assert batch_size == 1, "KDA currently supports packed batch size 1"
+        sp_mesh = seq_ctx.sequence_parallel_mesh
+        assert sp_mesh is not None
+        replica = sp_size // self.num_heads
+
+        cu_seqlens = kda_lever.cu_seqlens_arg(seq_ctx, hidden_states.device, _KDA_NPU_BACKEND)
+        q = self._sp_short_conv_replicated(
+            self.q_conv1d, self.q_proj(hidden_states), sp_mesh, sp_rank, sp_size, replica, cu_seqlens
+        )
+        k = self._sp_short_conv_replicated(
+            self.k_conv1d, self.k_proj(hidden_states), sp_mesh, sp_rank, sp_size, replica, cu_seqlens
+        )
+        v = self._sp_short_conv_replicated(
+            self.v_conv1d, self.v_proj(hidden_states), sp_mesh, sp_rank, sp_size, replica, cu_seqlens
+        )
+
+        # Local seq, full heads -> replicate -> all_to_all -> full seq, one head slot (slot s
+        # carries head s // replica), same as the convs above.
+        g_raw = self._project_gate(self.f_b_proj, self._project_gate(self.f_a_proj, hidden_states))
+        g_raw = g_raw.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 3, 1)  # (B, H, D, L/sp)
+        g_raw = g_raw.repeat_interleave(replica, dim=1)
+        g_raw = g_raw.reshape(batch_size, self.num_heads * replica * self.head_dim, seq_len)
+        g_raw = _all_to_all_g(g_raw, scatter_dim=1, gather_dim=2, mesh=sp_mesh)  # (B, D, L)
+        g_raw = g_raw.transpose(1, 2).view(batch_size, seq_len * sp_size, 1, self.head_dim)
+
+        beta = self.b_proj(hidden_states).float().transpose(1, 2)  # (B, H, L/sp)
+        beta = beta.repeat_interleave(replica, dim=1)  # (B, H*replica, L/sp)
+        beta = _all_to_all_beta(beta, scatter_dim=1, gather_dim=2, mesh=sp_mesh)  # (B, 1, L)
+        beta = beta.transpose(1, 2).sigmoid()  # (B, L, 1)
+
+        q = q.view(batch_size, seq_len * sp_size, 1, self.head_dim)
+        k = k.view(batch_size, seq_len * sp_size, 1, self.head_dim)
+        v = v.view(batch_size, seq_len * sp_size, 1, self.head_dim)
+
+        a_log = _gate_param(self.A_log).chunk(self.num_heads, dim=0)[sp_rank // replica]
+        dt_bias = (
+            _gate_param(self.dt_bias)
+            .view(self.num_heads, self.head_dim)
+            .chunk(self.num_heads, dim=0)[sp_rank // replica]
+            .reshape(-1)
+        )
+        gate = fused_kda_gate(g_raw, a_log, dt_bias=dt_bias, lower_bound=self.gate_lower_bound)
+
+        kernel = self._select_kernel(seq_len * sp_size, cp_context=None)
+        o, _ = kernel(
+            q=q,
+            k=k,
+            v=v,
+            g=gate,
+            beta=beta,
+            use_qk_l2norm_in_kernel=True,
+            transpose_state_layout=True,
+            safe_gate=(self.gate_lower_bound is not None),
+            cu_seqlens=cu_seqlens,
+        )
+
+        # (B, L, 1, D) -> (B, L/sp, sp, D): slot s holds head s // replica computed on rank s.
+        o = _all_to_all_out(o, scatter_dim=1, gather_dim=2, mesh=sp_mesh)
+        # Keep the first replica of every head; the duplicated slots get zero upstream grad.
+        # Contiguous: the strided slice would otherwise be materialized implicitly by o_norm's
+        # NPU adapter.
+        o = o[:, :, ::replica].contiguous()
+
+        gate_out = self._gate_output(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        raw_output = self.o_norm(o, gate_out).reshape(batch_size, seq_len, -1)
+        projected_output = self.o_proj(raw_output)
+        return {"raw_output": raw_output, "projected_output": projected_output, "softmax_lse": None}
