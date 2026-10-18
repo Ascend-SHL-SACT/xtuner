@@ -226,10 +226,14 @@ def nonpad_index_and_count(seq_ctx_list: list[SequenceContext]) -> tuple[torch.T
         ref = ctx.input_ids if ctx.input_ids is not None else ctx.inputs_embeds
         assert ref is not None, "seq_ctx carries neither input_ids nor inputs_embeds"
         t_len = int(ref.shape[1])
-        seg_end = offset + t_len - int(ctx.num_padding)
+        num_padding = int(ctx.num_padding)
+        assert 0 <= num_padding <= t_len, (
+            f"num_padding {num_padding} outside [0, {t_len}] for a SequenceContext segment"
+        )
+        seg_end = offset + t_len - num_padding
         nonpad_parts.append(torch.arange(offset, seg_end, dtype=torch.int64, device=ref.device))
         offset += t_len
-        num_padding_total += int(ctx.num_padding)
+        num_padding_total += num_padding
     non_pad_token = offset - num_padding_total
     nonpad_indices = torch.cat(nonpad_parts) if len(nonpad_parts) > 1 else nonpad_parts[0]
     return nonpad_indices, non_pad_token
@@ -1139,8 +1143,9 @@ class MoE(BaseModel):
         balancing_ctx = cast(BalancingLossContext | None, balancing_ctx)
         z_ctx = cast(ZLossContext | None, z_ctx)
         # Hoisted out of the per-layer accumulate path: mask is constant across layers.
-        nonpad_indices = torch.nonzero(seq_ctx.mask, as_tuple=True)[1]
-        non_pad_token = nonpad_indices.numel()
+        # nonpad_index_and_count derives the indices from host metadata (the mask is a
+        # leading-True prefix), avoiding torch.nonzero's mandatory host-device sync here.
+        nonpad_indices, non_pad_token = nonpad_index_and_count([seq_ctx])
         num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, seq_ctx.mask.device)
 
         hidden_states = self._decoder_stack(
@@ -1181,8 +1186,7 @@ class MoE(BaseModel):
                 inputs_embeds=seq_ctx.inputs_embeds.clone() if seq_ctx.inputs_embeds is not None else None,
             )
             # MTP uses its own mask; main mask's non-pad indices do not apply.
-            mtp_nonpad_indices = torch.nonzero(mtp_seq_ctx.mask, as_tuple=True)[1]
-            mtp_non_pad_token = mtp_nonpad_indices.numel()
+            mtp_nonpad_indices, mtp_non_pad_token = nonpad_index_and_count([mtp_seq_ctx])
             mtp_num_tokens_global, mtp_z_world_size = self._z_loss_dist_token_count(
                 z_ctx, mtp_non_pad_token, mtp_seq_ctx.mask.device
             )
