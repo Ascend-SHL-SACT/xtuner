@@ -645,7 +645,10 @@ class KimiDeltaAttention(nn.Module):
         ``s // replica``); each rank runs the KDA core for its one head-slot over the full
         sequence; the output pass keeps only the first replica of every head, whose duplicated
         slots receive zero upstream grad so every head is counted exactly once in the backward.
-        Uses the blocking schedule: the deferred-fence plumbing is replication-unaware.
+        Follows the same ``SP_A2A_DEFER`` lever as the head-split path: the default deferred
+        fence issues each a2a as soon as its input is ready and fences it at the consumer
+        (``kda_lever.sp_deferred_projections_replicated`` / ``sp_deferred_output_replicated``);
+        lever ``0`` falls back to per-call blocking. ``SP_A2A_ASYNC=1`` applies under both.
         Shares ``_forward_for_ulysses_sp``'s precondition: shards must be contiguous and
         non-empty.
         """
@@ -656,29 +659,36 @@ class KimiDeltaAttention(nn.Module):
         replica = sp_size // self.num_heads
 
         cu_seqlens = kda_lever.cu_seqlens_arg(seq_ctx, hidden_states.device, _KDA_NPU_BACKEND)
-        q = self._sp_short_conv_replicated(
-            self.q_conv1d, self.q_proj(hidden_states), sp_mesh, sp_rank, sp_size, replica, cu_seqlens
-        )
-        k = self._sp_short_conv_replicated(
-            self.k_conv1d, self.k_proj(hidden_states), sp_mesh, sp_rank, sp_size, replica, cu_seqlens
-        )
-        v = self._sp_short_conv_replicated(
-            self.v_conv1d, self.v_proj(hidden_states), sp_mesh, sp_rank, sp_size, replica, cu_seqlens
-        )
+        if kda_lever.SP_A2A_DEFER:
+            q, k, v, g_raw, beta = kda_lever.sp_deferred_projections_replicated(
+                self, hidden_states, sp_mesh, sp_rank, sp_size, cu_seqlens, batch_size, seq_len
+            )
+        else:
+            q = self._sp_short_conv_replicated(
+                self.q_conv1d, self.q_proj(hidden_states), sp_mesh, sp_rank, sp_size, replica, cu_seqlens
+            )
+            k = self._sp_short_conv_replicated(
+                self.k_conv1d, self.k_proj(hidden_states), sp_mesh, sp_rank, sp_size, replica, cu_seqlens
+            )
+            v = self._sp_short_conv_replicated(
+                self.v_conv1d, self.v_proj(hidden_states), sp_mesh, sp_rank, sp_size, replica, cu_seqlens
+            )
 
-        # Local seq, full heads -> replicate -> all_to_all -> full seq, one head slot (slot s
-        # carries head s // replica), same as the convs above.
-        g_raw = self._project_gate(self.f_b_proj, self._project_gate(self.f_a_proj, hidden_states))
-        g_raw = g_raw.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 3, 1)  # (B, H, D, L/sp)
-        g_raw = g_raw.repeat_interleave(replica, dim=1)
-        g_raw = g_raw.reshape(batch_size, self.num_heads * replica * self.head_dim, seq_len)
-        g_raw = _all_to_all_g(g_raw, scatter_dim=1, gather_dim=2, mesh=sp_mesh)  # (B, D, L)
-        g_raw = g_raw.transpose(1, 2).view(batch_size, seq_len * sp_size, 1, self.head_dim)
+            # Local seq, full heads -> replicate -> all_to_all -> full seq, one head slot (slot s
+            # carries head s // replica), same as the convs above.
+            g_raw = self._project_gate(self.f_b_proj, self._project_gate(self.f_a_proj, hidden_states))
+            g_raw = g_raw.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(
+                0, 2, 3, 1
+            )  # (B, H, D, L/sp)
+            g_raw = g_raw.repeat_interleave(replica, dim=1)
+            g_raw = g_raw.reshape(batch_size, self.num_heads * replica * self.head_dim, seq_len)
+            g_raw = _all_to_all_g(g_raw, scatter_dim=1, gather_dim=2, mesh=sp_mesh)  # (B, D, L)
+            g_raw = g_raw.transpose(1, 2).view(batch_size, seq_len * sp_size, 1, self.head_dim)
 
-        beta = self.b_proj(hidden_states).float().transpose(1, 2)  # (B, H, L/sp)
-        beta = beta.repeat_interleave(replica, dim=1)  # (B, H*replica, L/sp)
-        beta = _all_to_all_beta(beta, scatter_dim=1, gather_dim=2, mesh=sp_mesh)  # (B, 1, L)
-        beta = beta.transpose(1, 2).sigmoid()  # (B, L, 1)
+            beta = self.b_proj(hidden_states).float().transpose(1, 2)  # (B, H, L/sp)
+            beta = beta.repeat_interleave(replica, dim=1)  # (B, H*replica, L/sp)
+            beta = _all_to_all_beta(beta, scatter_dim=1, gather_dim=2, mesh=sp_mesh)  # (B, 1, L)
+            beta = beta.transpose(1, 2).sigmoid()  # (B, L, 1)
 
         q = q.view(batch_size, seq_len * sp_size, 1, self.head_dim)
         k = k.view(batch_size, seq_len * sp_size, 1, self.head_dim)
@@ -706,14 +716,19 @@ class KimiDeltaAttention(nn.Module):
             cu_seqlens=cu_seqlens,
         )
 
-        # (B, L, 1, D) -> (B, L/sp, sp, D): slot s holds head s // replica computed on rank s.
-        o = _all_to_all_out(o, scatter_dim=1, gather_dim=2, mesh=sp_mesh)
-        # Keep the first replica of every head; the duplicated slots get zero upstream grad.
-        # Contiguous: the strided slice would otherwise be materialized implicitly by o_norm's
-        # NPU adapter.
-        o = o[:, :, ::replica].contiguous()
+        if kda_lever.SP_A2A_DEFER:
+            o, gate_out = kda_lever.sp_deferred_output_replicated(
+                self, o, hidden_states, sp_mesh, batch_size, seq_len, replica
+            )
+        else:
+            # (B, L, 1, D) -> (B, L/sp, sp, D): slot s holds head s // replica computed on rank s.
+            o = _all_to_all_out(o, scatter_dim=1, gather_dim=2, mesh=sp_mesh)
+            # Keep the first replica of every head; the duplicated slots get zero upstream grad.
+            # Contiguous: the strided slice would otherwise be materialized implicitly by o_norm's
+            # NPU adapter.
+            o = o[:, :, ::replica].contiguous()
 
-        gate_out = self._gate_output(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim)
+            gate_out = self._gate_output(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim)
         raw_output = self.o_norm(o, gate_out).reshape(batch_size, seq_len, -1)
         projected_output = self.o_proj(raw_output)
         return {"raw_output": raw_output, "projected_output": projected_output, "softmax_lse": None}

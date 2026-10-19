@@ -18,6 +18,7 @@
 - mock conv 收到的 weight 逐位等于参考全量 weight 的对应头块；
 - hidden 梯度切片、跨 rank 求和后的参数梯度与参考 ``assert_close``（加法结合序不同，非逐位）；
 - 每次前向恰 6 次 a2a（q/k/v/g/beta/out，与头切分路径相同）；
+- ``SP_A2A_DEFER`` 的 defer/blocking 两种调度输出与梯度逐位一致（defer 经 c10d issue、blocking 经 functional a2a）；
 - ``num_heads`` 与 ``sp_size`` 互不整除时 ``ValueError``。
 
 测试环境：纯 CPU / gloo（FileStore spawn，无 NPU、无 GPU 标记）；设备侧内核
@@ -37,9 +38,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from typing_extensions import NotRequired
 
 import xtuner.v1.module.attention.kda as kda_module
 from xtuner.v1.data_proto import SequenceContext
+from xtuner.v1.module.attention import kda_lever
 from xtuner.v1.module.attention.attn_outputs import AttnOutputs
 from xtuner.v1.ops.comm import all_to_all as all_to_all_module
 
@@ -192,6 +195,9 @@ class _RunSnapshot(TypedDict):
     core_in: tuple[torch.Tensor, ...]
     conv_w: torch.Tensor
     a2a_count: int
+    # 前向 a2a 计数/机制：仅 SP 侧由 ``_run_sp`` 在反向前捕获补齐；参考侧无 a2a，不设键。
+    forward_a2a: NotRequired[int]
+    forward_mech: NotRequired[set[str]]
 
 
 def _snapshot(out: AttnOutputs, grads: Sequence[torch.Tensor]) -> _RunSnapshot:
@@ -212,15 +218,25 @@ def _global_go() -> torch.Tensor:
 
 
 def _run_sp(
-    module: kda_module.KimiDeltaAttention, hidden_local: torch.Tensor, ctx: SequenceContext, go_global: torch.Tensor
+    module: kda_module.KimiDeltaAttention,
+    hidden_local: torch.Tensor,
+    ctx: SequenceContext,
+    go_global: torch.Tensor,
+    defer: bool,
 ) -> _RunSnapshot:
     """复制头 SP 前向 + 对 hidden 与全部参数的梯度（一次 autograd.grad，[hidden, *params] 序）。"""
+    kda_lever.SP_A2A_DEFER = defer
     _reset_records()
     go = go_global[:, dist.get_rank() * _S_LOC : (dist.get_rank() + 1) * _S_LOC, :]
     hidden = hidden_local.detach().clone().requires_grad_(True)
     out = module.forward_for_sp(hidden, ctx)
+    forward_a2a = len(_A2A_MECHANISM)
+    forward_mech = set(_A2A_MECHANISM)
     grads = torch.autograd.grad((out["projected_output"] * go).sum(), [hidden, *module.parameters()])
-    return _snapshot(out, grads)
+    snap = _snapshot(out, grads)
+    snap["forward_a2a"] = forward_a2a
+    snap["forward_mech"] = forward_mech
+    return snap
 
 
 def _run_reference(
@@ -254,13 +270,27 @@ def _case_matches_reference(rank: int, world: int) -> None:
 
     go_global = _global_go()
     ref = _run_reference(module_ref, hidden_global, ids_global, go_global)
-    sp = _run_sp(module, hidden_local, ctx, go_global)
+    sp = _run_sp(module, hidden_local, ctx, go_global, defer=True)
+    sp_blocking = _run_sp(module, hidden_local, ctx, go_global, defer=False)
 
     # 非退化哨兵。
     assert torch.isfinite(sp["projected"]).all() and sp["projected"].abs().sum() > 0
-    # 每次前向恰 6 次 a2a（q/k/v/g/beta/out，与头切分路径相同）；参考无 a2a。
-    assert sp["a2a_count"] == 6, sp["a2a_count"]
+    # 前向恰 6 次 a2a（q/k/v/g/beta/out，与头切分路径相同）；参考无 a2a。
+    assert sp["forward_a2a"] == 6, sp["forward_a2a"]
+    assert sp_blocking["forward_a2a"] == 6, sp_blocking["forward_a2a"]
     assert ref["a2a_count"] == 0
+    # defer 走 issue_ulysses_dim1 的 c10d 直调，blocking 走 functional autograd a2a。
+    assert sp["forward_mech"] == {"c10d"}, sp["forward_mech"]
+    assert sp_blocking["forward_mech"] == {"functional"}, sp_blocking["forward_mech"]
+    # 反向：defer 的逆 a2a 经 c10d 桩可见（前向+反向共 12 次）；blocking 的 functional
+    # autograd 反向不经过任何计数桩，仅前向 6 次可见。
+    assert sp["a2a_count"] == 12, sp["a2a_count"]
+    assert sp_blocking["a2a_count"] == 6, sp_blocking["a2a_count"]
+    # 两种调度逐位一致（SP_A2A_DEFER 只移动 wait 点，不改变任何算术）。
+    assert torch.equal(sp["projected"], sp_blocking["projected"])
+    assert torch.equal(sp["raw"], sp_blocking["raw"])
+    for a, b in zip(sp["grads"], sp_blocking["grads"]):
+        assert torch.equal(a, b)
 
     # 输出：本 rank 的局部切片与参考对应 token 段逐位一致（纯置换 + 确定性 mock）。
     assert torch.equal(sp["projected"], ref["projected"][:, rank * _S_LOC : (rank + 1) * _S_LOC, :])
