@@ -605,6 +605,26 @@ class SequenceContext:
         self._raw_inputs_embeds = None
         self._raw_input_ids = None
 
+    def release_rolled_future_inputs(self) -> None:
+        """Drop the rolled future-token inputs held by a rolled context.
+
+        ``roll_sequence_context`` returns a context whose ``input_ids`` / ``inputs_embeds``
+        are views of the rolled full-sequence tensors cached in ``_raw_input_ids`` /
+        ``_raw_inputs_embeds``. The MTP roll path passes that rolled context into the
+        checkpointed MTP layer as a non-tensor input, so — exactly like the gathered caches
+        released by :meth:`release_raw_caches` — the rolled full-sequence tensors, one set
+        per MTP depth and micro-batch, stay pinned by the checkpoint saved state until the
+        step's autograd graph is freed. The MTP block calls this method once every depth's
+        future embeddings are materialized and the deeper depths have consumed the roll
+        source, releasing them without affecting checkpoint replay: the layer receives the
+        shifted embeddings as an explicit tensor input and reads only depth-invariant
+        metadata from the context.
+        """
+        self._raw_inputs_embeds = None
+        self._raw_input_ids = None
+        self.inputs_embeds = None
+        self.input_ids = None
+
     @property
     def raw_position_ids(self) -> torch.LongTensor | None:
         """Full (un-split) position_ids across all SP ranks.
