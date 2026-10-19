@@ -84,6 +84,9 @@ class _CheckpointLayer(nn.Module):
         self.reentrant = reentrant
         self.futures = []
         self.contexts = []
+        # ctx.input_ids as seen during forward: the roll-path release strips the
+        # rolled inputs once every depth consumed them, so post-call reads see None.
+        self.forward_input_ids = []
 
     def _compute(self, hidden, future, ctx):
         return (self.weight * hidden + future).tanh() * ctx.mask.unsqueeze(-1)
@@ -95,6 +98,7 @@ class _CheckpointLayer(nn.Module):
         contexts = seq_ctx if multi else [seq_ctx]
         self.futures.append(futures)
         self.contexts.append(contexts)
+        self.forward_input_ids.append([None if c.input_ids is None else c.input_ids.clone() for c in contexts])
         outputs = [
             checkpoint(self._compute, h, e, ctx, use_reentrant=self.reentrant)
             if self.recompute
@@ -203,10 +207,14 @@ def test_token_id_only_inputs_keep_legacy_rolling_when_optimization_is_enabled()
         position_embeddings=(torch.empty(0), torch.empty(0)),
         seq_ctx=ctx,
     )
-    for depth, contexts in enumerate(layer.contexts, start=1):
+    for depth, ids_seen in enumerate(layer.forward_input_ids, start=1):
         expected = torch.arange(20).roll(-depth)
         expected[-depth:] = 0
-        torch.testing.assert_close(contexts[0].input_ids, expected.unsqueeze(0))
+        torch.testing.assert_close(ids_seen[0], expected.unsqueeze(0))
+    # release_rolled_future_inputs strips every rolled context's inputs after the
+    # block materialized all depths' future embeddings; assert that contract too.
+    for contexts in layer.contexts:
+        assert contexts[0].input_ids is None
 
 
 def _distributed_cache_worker(rank, rendezvous, backend="gloo", reentrant=False):

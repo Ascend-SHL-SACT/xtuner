@@ -32,13 +32,19 @@ TestCheckpointPinnedMtpCloneReleasesRawCaches
 roll 路径回归（``use_local_future_embeddings=False`` 或 ``inputs_embeds is None`` 时，
 ``mtp_block._next_future_inputs`` 逐深度调用 ``roll_sequence_context``）：每 depth 的
 rolled ctx 上挂着整包 rolled 张量（``_raw_inputs_embeds``）及其 SP 分片视图
-（``inputs_embeds``），且 rolled ctx 同样作为非张量入参被 checkpoint 节点捕获——比 gather
-路径更重（每 depth 一份整包，生存期同样到步末）。张量入参本身走 ``save_for_backward``，
-节点 backward 后即释放，不构成步末钉住；钉住通道只有非张量 rolled ctx。修复：
-``mtp_block`` 深度循环后对每个 rolled ctx 调 ``release_rolled_future_inputs()``。
+（``inputs_embeds``），且 rolled ctx 同样作为非张量入参被 checkpoint 节点捕获，生存期同样
+被拉到步末。携带 embedding 的子路径（显式 ``use_local_future_embeddings=False``）每 depth
+钉一份 0.5-1 GiB 整包；当期生产默认拓扑（``use_local_future_embeddings=True`` + 纯文本
+``inputs_embeds=None``）只钉 int64 ids 整包（~1 MiB 量级/depth/微批）。张量入参本身走
+``save_for_backward``，节点 backward 后即释放，不构成步末钉住；钉住通道只有非张量 rolled
+ctx。修复：``mtp_block`` 深度循环后对每个 rolled ctx 调 ``release_rolled_future_inputs()``。
+重放安全附注：checkpoint replay 会重跑层 forward，其 env 门控 ``SKIP_PAD_TOKENS`` 分支读
+``mask``（由被剥离的 inputs 派生）——``release_rolled_future_inputs`` 在剥离前把 pad-mask
+快照冻结到 ``_frozen_mask``，剥离后 ``mask`` 返回快照。
 
 TestSequenceContextReleaseRolledFutureInputs
-    test_release_drops_rolled_inputs: 剥离缓存与视图；视图清掉后整包 base 一并释放。
+    test_release_drops_rolled_inputs: 剥离缓存与视图；视图清掉后整包 base 一并释放；
+    剥离后 ``mask`` 仍返回与剥离前逐位一致的快照（含 num_padding 尾部）。
 TestCheckpointPinnedRolledContextReleasesFullPackInputs
     test_checkpoint_pinned_rolled_context_releases_full_pack_inputs: roll 路径拓扑
     （整包 base + 分片视图 + future 视图作显式张量入参），按生产顺序 forward → 剥离 →
@@ -104,6 +110,7 @@ class TestCheckpointPinnedMtpCloneReleasesRawCaches(unittest.TestCase):
     def test_checkpoint_pinned_clone_releases_raw_caches(self) -> None:
         parent = _make_ctx()
         parent.inputs_embeds = torch.randn(1, 8, 4)
+        clone_inputs_embeds_parent_view = parent.inputs_embeds
         # 生产拓扑：moe.py 对父 ctx 做 copy() 并把整包 gather 缓存写到克隆上。
         clone = parent.copy(inputs_embeds=parent.inputs_embeds.clone())
         base = torch.ones(1, 8, 4) * 3  # 等价于 512 MiB 整包 gather 输出的占位
@@ -123,6 +130,9 @@ class TestCheckpointPinnedMtpCloneReleasesRawCaches(unittest.TestCase):
         # 修复调用点（moe.py 在 mtp_block 返回后）：解除钉住。
         clone.release_raw_caches()
         self.assertIsNone(base_ref())
+        # gather 路径的释放只作用于克隆：共享的父 ctx 字段不得被误清。
+        self.assertIsNotNone(parent.inputs_embeds)
+        self.assertIs(parent.inputs_embeds, clone_inputs_embeds_parent_view)
 
 
 class TestSequenceContextReleaseRolledFutureInputs(unittest.TestCase):
@@ -134,6 +144,9 @@ class TestSequenceContextReleaseRolledFutureInputs(unittest.TestCase):
         ctx._raw_input_ids = raw_ids
         ctx.inputs_embeds = raw_embeds[:, 2:6]  # SP 分支写入的分片视图
         ctx.input_ids = raw_ids[:, 2:6]
+        ctx.num_padding = 2  # mask 尾部 2 个 pad：快照必须保留该信息
+        mask_before = ctx.mask
+        self.assertEqual(int(mask_before.sum()), 2)  # 4 个分片位 - 2 pad
         embeds_ref = weakref.ref(raw_embeds)
         del raw_embeds, raw_ids
 
@@ -145,6 +158,9 @@ class TestSequenceContextReleaseRolledFutureInputs(unittest.TestCase):
         self.assertIsNone(ctx.input_ids)
         # 分片视图不剥离的话整包 base 仍被视图钉住：视图清掉后 base 一并释放。
         self.assertIsNone(embeds_ref())
+        # SKIP_PAD_TOKENS 分支在 checkpoint replay（backward）中重读 mask：
+        # 剥离后必须返回剥离前冻结的快照，而不是在已清字段上崩溃。
+        self.assertTrue(torch.equal(ctx.mask, mask_before))
 
 
 class _RollMtpLayer(nn.Module):
@@ -187,8 +203,10 @@ class TestCheckpointPinnedRolledContextReleasesFullPackInputs(unittest.TestCase)
         future = rolled.inputs_embeds  # 生产中 mtp_block 传给层的 future_embeddings 视图
         loss = layer(hidden_ckpt, future_embeddings=future, seq_ctx=rolled).sum()
         del future  # 生产拓扑：mtp_block 返回后 future 局部变量消亡
+        mask_before = rolled.mask  # replay 的 SKIP_PAD_TOKENS 分支要读：释放前先冻结
         # 修复调用点（mtp_block 深度循环后）：解除整包 base 的钉住。
         rolled.release_rolled_future_inputs()
+        self.assertTrue(torch.equal(rolled.mask, mask_before))  # 冻结快照供 replay 读
         loss.backward()
 
         self.assertIsNone(embeds_ref())

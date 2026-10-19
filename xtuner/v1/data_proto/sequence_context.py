@@ -106,6 +106,8 @@ class SequenceContext:
     _raw_inputs_embeds: torch.FloatTensor | None
     _shard_start: int
     _shard_size: int
+    # Pad-mask snapshot taken by release_rolled_future_inputs (checkpoint replay safety)
+    _frozen_mask: torch.BoolTensor | None
 
     def __init__(
         self,
@@ -178,6 +180,7 @@ class SequenceContext:
         self._raw_inputs_embeds = raw_inputs_embeds
         self._shard_start = shard_start
         self._shard_size = shard_size
+        self._frozen_mask = None
         self.seq_idx = None
         # Per-(device, dtype) cached device copies of the (CPU-resident) cu maps. On NPU the
         # cu tensors deliberately stay on CPU (see ``to``), and every consumer needs a device
@@ -513,6 +516,11 @@ class SequenceContext:
     @property
     def mask(self) -> torch.BoolTensor:
         mask: torch.BoolTensor
+        # Snapshot taken by release_rolled_future_inputs: once the rolled inputs are
+        # stripped the derivation below would assert, yet checkpoint replay re-runs the
+        # layer forward, whose env-gated SKIP_PAD_TOKENS branch reads this property.
+        if self._frozen_mask is not None:
+            return self._frozen_mask
         if self.input_ids is not None:
             mask = cast(torch.BoolTensor, torch.ones_like(self.input_ids, dtype=torch.bool))
         else:
@@ -614,14 +622,22 @@ class SequenceContext:
         checkpointed MTP layer as a non-tensor input, so — exactly like the gathered caches
         released by :meth:`release_raw_caches` — the rolled full-sequence tensors, one set
         per MTP depth and micro-batch, stay pinned by the checkpoint saved state until the
-        step's autograd graph is freed. The MTP block calls this method once every depth's
-        future embeddings are materialized and the deeper depths have consumed the roll
-        source, releasing them without affecting checkpoint replay: the layer receives the
-        shifted embeddings as an explicit tensor input and reads only depth-invariant
-        metadata from the context.
+        step's autograd graph is freed (the embedding case is a 0.5-1 GiB full-sequence
+        tensor per depth, the token-ID-only case an int64 full-sequence tensor of about a
+        few MiB). The MTP block calls this method once every depth's future embeddings are
+        materialized and the deeper depths have consumed the roll source, releasing them
+        without affecting checkpoint replay: the layer receives the shifted embeddings as
+        an explicit tensor input and reads only depth-invariant metadata from the context.
+
+        The one exception is the env-gated ``SKIP_PAD_TOKENS`` branch of the MoE decoder
+        layer, which reads :attr:`mask` — a property derived from the inputs dropped here —
+        during checkpoint replay (backward re-runs the layer forward). The pad-mask snapshot
+        therefore gets frozen into ``_frozen_mask`` before the inputs are stripped, and
+        :attr:`mask` serves that snapshot afterwards.
         """
-        self._raw_inputs_embeds = None
-        self._raw_input_ids = None
+        if self._frozen_mask is None and (self.input_ids is not None or self.inputs_embeds is not None):
+            self._frozen_mask = self.mask
+        self.release_raw_caches()
         self.inputs_embeds = None
         self.input_ids = None
 
