@@ -590,6 +590,21 @@ class SequenceContext:
         self._raw_inputs_embeds = cast(torch.FloatTensor, gathered)
         return self._raw_inputs_embeds
 
+    def release_raw_caches(self) -> None:
+        """Drop the lazily gathered full-sequence caches to free device memory.
+
+        The full-pack gathers cached by ``raw_input_ids`` / ``raw_inputs_embeds`` are only
+        consumed while MTP builds its future-token inputs. The MTP forward passes a clone of
+        this context (see ``SequenceContext.copy``) into the MTP block, and reentrant activation
+        checkpointing captures that clone as a non-tensor checkpoint input, which keeps it — and
+        the full-pack tensor cached on it — alive until the step's autograd graph is freed. The
+        MoE model calls this method once the MTP block has materialized every depth's future
+        inputs, releasing the cached gathers without affecting checkpoint replay. The caches are
+        re-derived on demand if the properties are accessed again.
+        """
+        self._raw_inputs_embeds = None
+        self._raw_input_ids = None
+
     @property
     def raw_position_ids(self) -> torch.LongTensor | None:
         """Full (un-split) position_ids across all SP ranks.
