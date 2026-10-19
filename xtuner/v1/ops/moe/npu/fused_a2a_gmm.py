@@ -23,7 +23,13 @@ Op contract (probed on Ascend910, CANN9.2/torch_npu2.9.1 — see memory
 ``[E_local, in, out]`` with ``trans_gmm_weight=False``; ``send_counts``/``recv_counts`` flat
 ``List[int]`` of length ``E_global = ep * e_local`` (per-global-expert / source-rank-major-then-local
 respectively); ``permute_out_flag=True`` returns the 3rd tensor = a2a output already permuted to
-local-expert order, reused for dW.
+local-expert order, reused for dW. The cluster CANN tiling rejects count lists longer than 256
+entries (``grouped_mat_mul_allto_allv_tiling.cpp:350``, "The length of recvCnts[288] should be in
+(0, 256]" — job-dyb-q35-xtuner-52, GLM-5.3-Flash: 288 experts at EP32), so
+``fused_dispatch_mlp_combine`` splits the local experts into balanced chunks (each call's
+send/recv lists stay ``ep * size_c <= 256`` entries) and runs the pipeline once per chunk, with a
+one-row-per-rank structural pad so no chunk's outbound counts go all-zero (the op hard-fails on
+that); see ``_plan_local_expert_chunks``.
 
 This module also hosts ``fused_forward``, the ``MoEDecoderLayer`` orchestrator (the env-gated entry
 point in ``MoEDecoderLayer._pre_moe_forward``) that wires the FSDP2-local expert weights + the MoE
@@ -122,6 +128,46 @@ def _compute_counts(
     # group_list: per-local-expert received count = sum over source ranks (for the dW matmul loop).
     group_list = recv_grid.sum(dim=0).to("cpu").tolist()
     return send_counts, recv_counts, group_list
+
+
+_MAX_FUSED_COUNT_ENTRIES = 256
+
+
+def _plan_local_expert_chunks(ep_size: int, e_local: int) -> list[tuple[int, int]]:
+    """Plan the local-expert chunks that keep every fused call's count lists within the CANN cap.
+
+    The cluster CANN tiling (cann-9.0.0) rejects ``send_counts``/``recv_counts`` lists longer than
+    256 entries: ``grouped_mat_mul_allto_allv_tiling.cpp:350``, "The length of recvCnts[288] should
+    be in (0, 256]" (job-dyb-q35-xtuner-52, GLM-5.3-Flash: 288 routed experts at EP32). Each chunk
+    issues one fused call over ``size_c`` of the rank's local experts, i.e. ``ep_size * size_c``
+    count entries; chunking is balanced so no call is needlessly small.
+
+    Args:
+        ep_size (int): the expert-parallel world size.
+        e_local (int): local expert count on this rank (``n_routed_experts // ep_size``).
+
+    Returns:
+        list[tuple[int, int]]: ``(start, size)`` local-expert ranges partitioning ``[0, e_local)``
+        (a single full range when ``ep_size * e_local <= 256``, i.e. the unchunked path).
+    """
+    if ep_size * e_local <= _MAX_FUSED_COUNT_ENTRIES:
+        return [(0, e_local)]
+    if ep_size > _MAX_FUSED_COUNT_ENTRIES:
+        raise ValueError(
+            f"ep_size={ep_size} exceeds the fused a2a+gmm count-list cap {_MAX_FUSED_COUNT_ENTRIES}: "
+            "each call needs at least ep_size count entries, so the fused path cannot run; "
+            "set XTUNER_MOE_FUSED_A2A_GMM=0 to use the separated dispatcher path"
+        )
+    max_size = max(1, _MAX_FUSED_COUNT_ENTRIES // ep_size)
+    n_chunks = (e_local + max_size - 1) // max_size
+    base, extra = divmod(e_local, n_chunks)
+    chunks: list[tuple[int, int]] = []
+    start = 0
+    for i in range(n_chunks):
+        size = base + (1 if i < extra else 0)
+        chunks.append((start, size))
+        start += size
+    return chunks
 
 
 def _dw_matmul_loop(
@@ -339,6 +385,13 @@ def fused_dispatch_mlp_combine(
     same sort order as the input (``dispatch_preprocess``'s sort), so the caller applies the final
     ``unpermute(..., row_id_map, probs=topk_weights)``.
 
+    When ``E_global > 256`` (the cluster CANN count-list cap) the local experts are split into
+    balanced chunks (``_plan_local_expert_chunks``) and the pipeline runs once per chunk over the
+    gathered per-chunk rows; the reassembled output and the fired ``recv_tokens_hook`` total are
+    identical to the single-call path. Each per-chunk call is structurally padded with one zero
+    row per rank (attributed to the rank's own first chunk expert) so no call ever presents an
+    all-zero outbound count list, which the fused op rejects (561002).
+
     Args:
         hidden_states (torch.Tensor): sort-permuted dispatch input ``[n_local, hidden]``.
         w1 (torch.Tensor): native FC1 (gate+up) weight ``[E_local, 2 * inter, hidden]``.
@@ -375,9 +428,77 @@ def fused_dispatch_mlp_combine(
     send_counts, recv_counts, group_list = _compute_counts(topk_ids, n_routed_experts, ep_group)
     if recv_tokens_hook is not None:
         recv_tokens_hook(sum(recv_counts))
-    gate_up_out = AlltoallvPermuteGmm.apply(hidden_states, w1, w1_fwd, ep_group, send_counts, recv_counts, group_list)
-    intermediate = act_fn(gate_up_out, split_dim=-1)
-    combined = GmmUnpermuteAlltoallv.apply(intermediate, w2, w2_fwd, ep_group, send_counts, recv_counts, group_list)
+    e_local = len(group_list)
+    ep_size = n_routed_experts // e_local
+    chunks = _plan_local_expert_chunks(ep_size, e_local)
+    if len(chunks) == 1:
+        gate_up_out = AlltoallvPermuteGmm.apply(
+            hidden_states, w1, w1_fwd, ep_group, send_counts, recv_counts, group_list
+        )
+        intermediate = act_fn(gate_up_out, split_dim=-1)
+        combined = GmmUnpermuteAlltoallv.apply(
+            intermediate, w2, w2_fwd, ep_group, send_counts, recv_counts, group_list
+        )
+        return combined
+    # Chunked path (E_global > 256): run the pipeline once per local-expert chunk. The dispatch
+    # input is sort-permuted by GLOBAL expert id (dispatch_preprocess, the same contract the
+    # single call's send_counts segmentation relies on), and chunk c covers local experts
+    # ``[c0, c0 + size_c)`` of EVERY source rank — global ids ``s * e_local + c0 + j``, a
+    # contiguous id run per source rank s. So each chunk's send rows are gathered with one
+    # index_select over per-source aranges, the per-chunk counts re-index that (s, j) grid, the
+    # combine returns those rows in the same order, and one index_put reassembles the full
+    # sort-permuted layout for the caller's ``unpermute``. Grads flow through the gather/put
+    # (index_add) and the per-chunk weight views into the native parameters; the recompute
+    # re-issue re-runs this deterministic planning. The hook fires once, with the unchanged total.
+    #
+    # Structural pad: every rank appends one zero row per chunk, attributed to its own first
+    # chunk expert (global id ``ep_rank * e_local + c0``). The op hard-fails (561002) when a
+    # call's outbound count list is all zero — which a chunk hits whenever this rank routed no
+    # token to ANY of the chunk's experts (small eval batches, RL rollouts, early router
+    # collapse), a shape the single-call path cannot produce. The pad is data-independent and
+    # needs no extra exchange: each rank pads an expert it owns, so its send and recv counts
+    # both gain +1 at the same flat index and the round trip stays collectively consistent. The
+    # zero row contributes exact zeros through gmm/act/dW, and its combine output (row
+    # ``block_start`` of the chunk's return buffer — first row of this rank's (source=self,
+    # j=0) group, the same grid the send payload uses) is sliced off before reassembly.
+    device = hidden_states.device
+    ep_rank = dist.get_rank(ep_group)
+    offsets = [0]
+    for count in send_counts:
+        offsets.append(offsets[-1] + count)
+    pad_send, pad_recv, pad_group = list(send_counts), list(recv_counts), list(group_list)
+    for c0, _size_c in chunks:
+        pad_at = ep_rank * e_local + c0
+        pad_send[pad_at] += 1
+        pad_recv[pad_at] += 1
+        pad_group[c0] += 1
+    gathered_idx: list[torch.Tensor] = []
+    combined_rows: list[torch.Tensor] = []
+    for c0, size_c in chunks:
+        idx = torch.cat(
+            [torch.arange(offsets[s * e_local + c0], offsets[s * e_local + c0 + size_c]) for s in range(ep_size)]
+        ).to(device, non_blocking=True)
+        # Pad slot: start of this rank's own source block (rows of earlier blocks precede it).
+        block_start = sum(offsets[s * e_local + c0 + size_c] - offsets[s * e_local + c0] for s in range(ep_rank))
+        x_real = hidden_states.index_select(0, idx)
+        pad_row = x_real.new_zeros(1, x_real.shape[1])
+        x_c = torch.cat([x_real[:block_start], pad_row, x_real[block_start:]], dim=0)
+        send_c = [pad_send[s * e_local + c0 + j] for s in range(ep_size) for j in range(size_c)]
+        recv_c = [pad_recv[s * e_local + c0 + j] for s in range(ep_size) for j in range(size_c)]
+        gl_c = pad_group[c0 : c0 + size_c]
+        gate_up_c = AlltoallvPermuteGmm.apply(
+            x_c, w1[c0 : c0 + size_c], w1_fwd[c0 : c0 + size_c], ep_group, send_c, recv_c, gl_c
+        )
+        inter_c = act_fn(gate_up_c, split_dim=-1)
+        gathered_idx.append(idx)
+        back_c = GmmUnpermuteAlltoallv.apply(
+            inter_c, w2[c0 : c0 + size_c], w2_fwd[c0 : c0 + size_c], ep_group, send_c, recv_c, gl_c
+        )
+        # Drop the pad row's combine output (it returns at ``block_start``, see above).
+        combined_rows.append(torch.cat([back_c[:block_start], back_c[block_start + 1 :]], dim=0))
+    idx_all = torch.cat(gathered_idx)
+    combined = torch.empty_like(hidden_states)
+    combined.index_put_((idx_all,), torch.cat(combined_rows, dim=0))
     return combined
 
 
