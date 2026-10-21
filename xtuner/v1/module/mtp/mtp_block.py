@@ -179,6 +179,7 @@ class MTPBlock(nn.Module):
         current_seq_ctx = seq_ctx
         raw_inputs_embeds = self._gather_future_embeddings(seq_ctx)
         previous_layer_results: MTPInternalOutput | None = None
+        rolled_ctxs: list[SequenceContext] = []
 
         num_steps = self.mtp_config.num_layers
         for step in range(num_steps):
@@ -186,6 +187,8 @@ class MTPBlock(nn.Module):
             current_seq_ctx, future_embeddings = self._next_future_inputs(
                 current_seq_ctx, embed_tokens_fn, depth=step + 1, raw_inputs_embeds=raw_inputs_embeds
             )
+            if current_seq_ctx is not seq_ctx:
+                rolled_ctxs.append(current_seq_ctx)
 
             if self.mtp_config.detach_mtp_inputs:
                 future_embeddings = future_embeddings.detach()
@@ -211,6 +214,15 @@ class MTPBlock(nn.Module):
                     "router_topk_ids": layer_results["router_topk_ids"],
                 }
             )
+
+        # The roll path clones a context per depth and caches the rolled full-sequence
+        # tensors on it; the checkpointed layer captures that context as a non-tensor input,
+        # which would pin every depth's rolled tensors until the step's graph is freed. Their
+        # future embeddings are explicit tensor inputs and the deeper depths have already
+        # consumed the roll source, so drop them here (see
+        # ``SequenceContext.release_rolled_future_inputs``).
+        for rolled_ctx in rolled_ctxs:
+            rolled_ctx.release_rolled_future_inputs()
 
         return mtp_outputs
 
@@ -252,6 +264,7 @@ class MTPBlock(nn.Module):
         current_seq_ctx_list = list(seq_ctx_list)
         raw_inputs_embeds_list = [self._gather_future_embeddings(ctx) for ctx in seq_ctx_list]
         previous_layer_results: MTPInternalOutput | None = None
+        rolled_ctxs: list[SequenceContext] = []
 
         num_steps = self.mtp_config.num_layers
         for step in range(num_steps):
@@ -261,7 +274,9 @@ class MTPBlock(nn.Module):
                 self._next_future_inputs(ctx, embed_tokens_fn, depth=step + 1, raw_inputs_embeds=raw)
                 for ctx, raw in zip(current_seq_ctx_list, raw_inputs_embeds_list)
             ]
-            current_seq_ctx_list = [ctx for ctx, _ in future_inputs]
+            next_seq_ctx_list = [ctx for ctx, _ in future_inputs]
+            rolled_ctxs.extend(ctx for ctx, orig in zip(next_seq_ctx_list, seq_ctx_list) if ctx is not orig)
+            current_seq_ctx_list = next_seq_ctx_list
             future_embeddings_list = [embeds for _, embeds in future_inputs]
 
             layer_results = cast(
@@ -288,6 +303,11 @@ class MTPBlock(nn.Module):
                 )
 
             current_hidden_states_list = layer_results["hidden_states"]
+
+        # Drop the roll path's per-depth rolled full-sequence inputs pinned by the
+        # checkpointed layers (see the single-microbatch path).
+        for rolled_ctx in rolled_ctxs:
+            rolled_ctx.release_rolled_future_inputs()
 
         return outputs_per_mb
 
