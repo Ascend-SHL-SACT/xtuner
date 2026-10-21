@@ -900,6 +900,14 @@ class MoE(BaseModel):
                 position_embeddings=position_embeddings_list,
                 seq_ctx=mtp_seq_ctx_list,
             )
+            # The MTP clones outlive this forward inside reentrant-checkpoint saved state:
+            # CheckpointFunction stores non-tensor inputs by reference until the autograd
+            # graph is freed at step end. Their gathered full-sequence caches are fully
+            # consumed here (every depth future is a materialized copy and checkpoint replay
+            # re-runs the layer on its explicit inputs), so drop them now instead of pinning
+            # one full-pack embedding per micro-batch until step end.
+            for mtp_seq_ctx in mtp_seq_ctx_list:
+                mtp_seq_ctx.release_raw_caches()
 
             # Accumulate from the first loss tensor (no host-built 0.0 seed): the CPU->NPU
             # scalar H2D parks the host at the tail of the stream queue. 0.0 + x is
@@ -1198,6 +1206,9 @@ class MoE(BaseModel):
                 position_embeddings=position_embeddings,
                 seq_ctx=mtp_seq_ctx,
             )
+            # Drop the clone's gathered full-sequence caches; the clone is pinned by the MTP
+            # layers' checkpoint saved state until step end (see the micro-batched MTP path).
+            mtp_seq_ctx.release_raw_caches()
 
             # Accumulate MTP auxiliary losses and collect every recurrent step.
             draft_hidden_states: list[torch.Tensor] = []
