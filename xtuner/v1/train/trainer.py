@@ -1550,6 +1550,9 @@ class Trainer:
         set_random_seed(seed)
 
     def _try_bind_numa(self):
+        if os.getenv("XTUNER_DISABLE_NUMA", "0") == "1":
+            logger.info(f"Rank: {self.rank} skip numa binding because XTUNER_DISABLE_NUMA=1.")
+            return
         # NPU: per-rank CPU pinning via npu_cpu_binder (8-core NUMA-local slice).
         # Gated by XTUNER_NPU_CPU_BIND (default on).
         if str(DEVICE).split(":")[0] == "npu":
@@ -1562,6 +1565,7 @@ class Trainer:
                 except Exception as e:
                     logger.info(f"Rank: {self.rank} npu_cpu_binder failed: {e}")
             return
+
 
         if str(DEVICE) != "cuda":
             log_rank0.info("Current device is not cuda, skip numa binding.")
@@ -2233,6 +2237,7 @@ class Trainer:
         env = {
             "XTUNER_DETERMINISTIC": os.getenv("XTUNER_DETERMINISTIC"),
             "XTUNER_GC_ENABLE": os.getenv("XTUNER_GC_ENABLE"),
+            "XTUNER_DISABLE_NUMA": os.getenv("XTUNER_DISABLE_NUMA"),
             "XTUNER_FILE_OPEN_CONCURRENCY": os.getenv("XTUNER_FILE_OPEN_CONCURRENCY"),
             "XTUNER_TOKENIZE_CHUNK_SIZE": os.getenv("XTUNER_TOKENIZE_CHUNK_SIZE"),
             "XTUNER_TOKENIZE_WORKERS": os.getenv("XTUNER_TOKENIZE_WORKERS"),

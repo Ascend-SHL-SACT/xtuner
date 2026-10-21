@@ -225,6 +225,11 @@ class MTPBlock(nn.Module):
         for rolled_ctx in rolled_ctxs:
             rolled_ctx.release_rolled_future_inputs()
 
+        if raw_inputs_embeds is not None:
+            # Each depth now owns its local future embeddings. Layer checkpoint
+            # recomputation takes those explicitly and does not need the full gather.
+            # Drop only the context cache; keep the embeddings' autograd edges intact.
+            seq_ctx._raw_inputs_embeds = None
         return mtp_outputs
 
     def _call_decoder_layer(
