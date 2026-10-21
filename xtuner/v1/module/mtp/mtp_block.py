@@ -12,6 +12,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
 )
 
 from .config import MTPConfig
+from .halo import HaloFutureEmbeds, build_halo_future_embeds, halo_packed_future_embeddings, mtp_halo_enabled
 from .mtp_layer import MTPLayer
 from .utils import local_packed_future_embeddings, roll_sequence_context
 
@@ -311,8 +312,11 @@ class MTPBlock(nn.Module):
 
         return outputs_per_mb
 
-    def _gather_future_embeddings(self, seq_ctx: SequenceContext) -> torch.Tensor | None:
+    def _gather_future_embeddings(self, seq_ctx: SequenceContext) -> torch.Tensor | HaloFutureEmbeds | None:
         if self.mtp_config.use_local_future_embeddings and seq_ctx.inputs_embeds is not None:
+            if mtp_halo_enabled():
+                # XTUNER_MTP_HALO=1: neighbor halo instead of the full-sequence gather.
+                return build_halo_future_embeds(seq_ctx, halo_size=self.mtp_config.num_layers)
             # Preserve the existing gather semantics. Access once per microbatch;
             # the shared context retains one full base, never seven rolled bases.
             return seq_ctx.raw_inputs_embeds
@@ -324,13 +328,15 @@ class MTPBlock(nn.Module):
         embed_tokens_fn: Callable[[torch.Tensor], torch.Tensor],
         *,
         depth: int,
-        raw_inputs_embeds: torch.Tensor | None,
+        raw_inputs_embeds: torch.Tensor | HaloFutureEmbeds | None,
     ) -> tuple[SequenceContext, torch.Tensor]:
         if raw_inputs_embeds is None:
             rolled_ctx = roll_sequence_context(seq_ctx, shifts=-1)
             return rolled_ctx, self._embed_future(rolled_ctx, embed_tokens_fn)
 
         assert seq_ctx.inputs_embeds is not None
+        if isinstance(raw_inputs_embeds, HaloFutureEmbeds):
+            return seq_ctx, halo_packed_future_embeddings(raw_inputs_embeds, seq_ctx.cu_seq_lens_q, depth=depth)
         mesh = seq_ctx.sequence_parallel_mesh
         shard_start = seq_ctx._shard_start if mesh is not None and mesh.size() > 1 else 0
         future = local_packed_future_embeddings(
