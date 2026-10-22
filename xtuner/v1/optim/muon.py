@@ -503,6 +503,11 @@ class Muon(Optimizer):
         all_tasks = chain(muon_tasks, adamw_tasks)
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
+        # XTUNER_MUON_SWAP=1: step must not return while the last momentum D2H
+        # is still in flight -- host consumers of the pinned-CPU state (e.g.
+        # checkpoint save) have no device-side ordering of their own.
+        if self._swap_momentum:
+            muon_swap.host_sync_d2h()
 
         return loss
 

@@ -29,8 +29,17 @@ waited on the default stream at the next H2D: a step's D2H (copy stream) writes
 the pinned-CPU buffer that the next step's H2D (default stream) reads, so the
 default stream must wait the prior D2H.
 
-``XTUNER_MUON_SWAP_OVERLAP=0`` falls back to default-stream FIFO copies (no copy
-stream, no events) -- the prior serial path, kept for A/B.
+``XTUNER_MUON_SWAP_OVERLAP=0`` falls back to default-stream FIFO copies -- the
+prior serial path, kept for A/B. The copy stream itself goes unused on that
+path, but ``d2h_ev`` is still recorded so the host-side gate
+(``host_sync_d2h``) keeps working.
+
+Stream topology: this module owns a private copy stream so the D2H can
+overlap the AsyncRuntime event loop's prior-batch AGRS collectives on the
+default stream. No other async copy path is active today, so the private
+stream arbitrates with nothing; per-step one-way swap traffic is
+~3.7 GiB/rank (bf16 momentum + the AdamW-group m/v), so if a second copy
+mechanism is ever enabled alongside, share one copy stream between them.
 """
 
 from __future__ import annotations
@@ -56,14 +65,24 @@ def is_enabled() -> bool:
     return os.environ.get("XTUNER_MUON_SWAP", "0") == "1"
 
 
+_USE_COPY_STREAM: bool | None = None
+
+
 def _use_copy_stream() -> bool:
     """Return whether D2H runs on a dedicated copy stream (default on).
+
+    The env var is resolved once per process at the first call, per the
+    offload programming-requirements discipline that hot paths must not read
+    environment variables.
 
     Returns:
         bool: True (default) for D2H-overlap; False for the default-stream FIFO
         fallback (``XTUNER_MUON_SWAP_OVERLAP=0``).
     """
-    return os.environ.get("XTUNER_MUON_SWAP_OVERLAP", "1") == "1"
+    global _USE_COPY_STREAM
+    if _USE_COPY_STREAM is None:
+        _USE_COPY_STREAM = os.environ.get("XTUNER_MUON_SWAP_OVERLAP", "1") == "1"
+    return _USE_COPY_STREAM
 
 
 class _SwapCtx:
@@ -165,6 +184,9 @@ def d2h_momentum(dev_tensors: list[Tensor], cpu_tensors: list[Tensor]) -> None:
     if not _use_copy_stream():
         for d, c in zip(dev_tensors, cpu_tensors):
             c.copy_(d, non_blocking=True)
+        # Same-stream FIFO needs no device-side gate, but host_sync_d2h reads
+        # d2h_ev, so record it here too (once, on the default stream).
+        _get_ctx().d2h_ev.record()
         return
     ctx = _get_ctx()
     compute_ev = DEVICE_MODULE.Event()
@@ -175,3 +197,21 @@ def d2h_momentum(dev_tensors: list[Tensor], cpu_tensors: list[Tensor]) -> None:
             c.copy_(d, non_blocking=True)
             d.record_stream(ctx.copy_s)
         ctx.d2h_ev.record()
+
+
+def host_sync_d2h() -> None:
+    """Block the host until every momentum D2H launched so far has landed.
+
+    The copy-stream D2H is asynchronous with respect to the host, so
+    ``Muon.step`` returns while the last D2H may still be in flight; host-side
+    consumers of the pinned-CPU state (e.g. checkpoint save) have no
+    device-side ordering of their own. Call once at the end of ``Muon.step``,
+    after the AsyncRuntime has drained every update task. Guarded on the swap
+    context rather than the environment, so the gate cannot disagree with the
+    swap's own launch state and the hot path never re-reads env vars. No-op
+    when no D2H was ever launched this process; the primed ``d2h_ev`` keeps
+    the wait cheap when this step launched nothing.
+    """
+    if _SWAP_CTX is None:
+        return
+    _SWAP_CTX.d2h_ev.synchronize()
