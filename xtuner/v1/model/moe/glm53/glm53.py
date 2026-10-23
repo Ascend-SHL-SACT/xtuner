@@ -32,6 +32,11 @@ from pydantic import Field, computed_field
 from typing_extensions import Self, override
 
 from xtuner.v1.model.base import DEFAULT_FLOAT8_CFG, HFSaveCfg, TorchCompileOption
+from xtuner.v1.model.moe.glm52.activation_offload_npu import (
+    activation_offload_npu_enabled,
+    make_activation_offload_npu_ctx,
+    register_activation_offload_npu_hooks,
+)
 from xtuner.v1.model.moe.moe import BalancingLossConfig, MoE, MoEConfig
 from xtuner.v1.module.decoder_layer.mhc import MHCConfig
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEActFnConfig
@@ -109,6 +114,23 @@ class Glm53TextMoE(MoE):
         if self.config.ep_size > 1:
             return GLM53_MOE_EP_COMPILE_CFG
         return GLM53_MOE_NON_EP_COMPILE_CFG
+
+    @override
+    def _configure_model_specific_layers(self) -> None:
+        # Gate + wiring for the NPU activation offload, mirroring GLM-5.2's wiring in
+        # moe/glm52/glm52.py; all logic lives in activation_offload_npu.py. Parks each
+        # offload-scope layer's input hidden states after the no_grad original forward, refills
+        # them at the replay entry, and shadows _saved_tensors_offload_ctx on the instance so the
+        # legacy window stops capturing the hidden states this mechanism owns (GLM-5.3 has no
+        # DSA ids tensors in the legacy window, so the shadow empties it entirely).
+        if activation_offload_npu_enabled():
+            register_activation_offload_npu_hooks(
+                model_layers=self.layers,
+                first_offload_layer=self.config.first_k_dense_replace,
+            )
+            setattr(
+                self, "_saved_tensors_offload_ctx", make_activation_offload_npu_ctx(self._saved_tensors_offload_ctx)
+            )
 
     def _expand_hc(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hc_mult = self.config.mhc.hc_mult

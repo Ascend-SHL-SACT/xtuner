@@ -25,12 +25,18 @@ TestGlm53TextMoEGradientParity
     test_full_crop_fsdp_gradients_match_hf                   五层真实权重 FSDP 梯度与 HF 对齐
 TestNoPEDSAMLAConfigValidatesAssignment
     test_backend_assignment_is_validated                     构造后赋值仍走校验
+TestGlm53ActivationOffloadNpu
+    test_env_gate_wires_park_refill_hooks_on_offload_scope_layers  门控开时钩子只挂 offload 范围层且 ctx 被遮蔽
+    test_gate_off_leaves_model_unwired                       门控关时不挂钩、ctx 保持原方法
+    test_shadow_ctx_filters_float_tensors                    遮蔽窗口只把非浮点张量传给原窗口
+    test_park_refill_roundtrip_through_checkpoint_replay     单层 reentrant checkpoint 下 park/refill 全程走通
 """
 
 import gc
 import os
 import re
 from pathlib import Path
+from unittest import mock
 
 import parametrize
 import pytest
@@ -607,3 +613,101 @@ class TestNoPEDSAMLAConfigValidatesAssignment:
             cfg.sparse_mla_backend = "tilelang"
         cfg.sparse_mla_backend = "torch"
         assert cfg.sparse_mla_backend == "torch"
+
+
+class TestGlm53ActivationOffloadNpu:
+    """XTUNER_ACTIVATION_OFFLOAD_NPU 原本只在 GLM-5.2 接线，对 GLM-5.3-Flash 完全无效；
+    这里锁住 `_configure_model_specific_layers` 的接线行为（xtuner/v1/model/moe/glm53/glm53.py）。"""
+
+    _HOOK_NAMES = {"_forward_input_pre_hook", "_park_layer_input_after_forward"}
+
+    @staticmethod
+    def _offload_hook_names(layer) -> set[str]:
+        names = {getattr(hook, "func", hook).__name__ for hook in layer._forward_pre_hooks.values()}
+        names |= {getattr(hook, "func", hook).__name__ for hook in layer._forward_hooks.values()}
+        return names & TestGlm53ActivationOffloadNpu._HOOK_NAMES
+
+    def test_env_gate_wires_park_refill_hooks_on_offload_scope_layers(self):
+        # 门控开：park/refill 钩子只挂在 >= first_k_dense_replace 的层上，与 legacy 窗口范围
+        # 一致；_saved_tensors_offload_ctx 被遮蔽成过滤浮点张量的闭包。
+        from xtuner.v1.model.moe.glm52 import activation_offload_npu as offload_mod
+
+        with mock.patch.dict(os.environ, {"XTUNER_ACTIVATION_OFFLOAD_NPU": "1"}):
+            model = _tiny_cfg().build()
+            assert offload_mod.activation_offload_npu_enabled()
+        first = model.config.first_k_dense_replace
+        for idx_str, layer in model.layers.items():
+            hooked = self._offload_hook_names(layer)
+            if int(idx_str) < first:
+                assert not hooked, idx_str
+            else:
+                assert hooked == self._HOOK_NAMES, (idx_str, hooked)
+        assert offload_mod._chain_head_layer == model.config.num_hidden_layers - 1
+        assert not hasattr(model._saved_tensors_offload_ctx, "__self__")
+
+    def test_gate_off_leaves_model_unwired(self):
+        # 门控关：不挂钩、ctx 保持原绑定方法——env 不能在 glm53 上有隐性副作用。
+        with mock.patch.dict(os.environ):
+            os.environ.pop("XTUNER_ACTIVATION_OFFLOAD_NPU", None)
+            model = _tiny_cfg().build()
+        for idx_str, layer in model.layers.items():
+            assert not self._offload_hook_names(layer), idx_str
+        assert model._saved_tensors_offload_ctx.__self__ is model
+
+    def test_shadow_ctx_filters_float_tensors(self):
+        # 遮蔽窗口只把非浮点张量传给原窗口；glm53 的 legacy 窗口只有 hidden states，
+        # 遮蔽后整个窗口为空（nullcontext）。
+        import contextlib
+
+        from xtuner.v1.model.moe.glm52.activation_offload_npu import make_activation_offload_npu_ctx
+
+        seen: dict[int, list[torch.Tensor]] = {}
+
+        def original_ctx(block_idx: int, tensors: list[torch.Tensor]) -> contextlib.AbstractContextManager:
+            seen[block_idx] = list(tensors)
+            return contextlib.nullcontext()
+
+        shadow = make_activation_offload_npu_ctx(original_ctx)
+        floats = [torch.zeros(2), torch.zeros(3, dtype=torch.bfloat16)]
+        ints = [torch.zeros(2, dtype=torch.long)]
+        with shadow(0, floats + ints):
+            pass
+        assert seen == {0: ints}
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="park/refill roundtrip requires CUDA")
+    def test_park_refill_roundtrip_through_checkpoint_replay(self):
+        # 真走一遍 park（D2H → 设备存储 resize 成 0）→ refill（replay 入口 H2D 原位恢复）：
+        # 用单层 reentrant checkpoint 包裹一个 offload 范围层，触发 no_grad 原始前向 + grad
+        # replay，钩子靠 grad mode 在两种语义间分身；未包裹层保持惰性。
+        import torch._dynamo
+
+        from xtuner.v1.model.moe.glm52 import activation_offload_npu as offload_mod
+        from xtuner.v1.model.utils.checkpointing import apply_activation_checkpointing
+
+        with mock.patch.dict(os.environ, {"XTUNER_ACTIVATION_OFFLOAD_NPU": "1"}):
+            model = _tiny_cfg().build()
+        model = model.cuda().to(torch.bfloat16)
+        torch.manual_seed(0)
+        for p in model.parameters():
+            if p.is_floating_point():
+                p.data.normal_(mean=0.0, std=0.02)
+
+        model.layers["3"] = apply_activation_checkpointing(model.layers["3"], preserve_rng_state=False)
+
+        # 本测试只验证 park/refill 机制本身（compile_cfg=False），dynamo 一律关：NPU 容器上
+        # dynamo 追踪 has_triton_experimental_host_tma 会因 get_device_capability()=None 炸
+        # InternalTorchDynamoError（与本 offload 无关，plain forward 测试同样中招）。
+        with mock.patch.object(torch._dynamo.config, "disable", True):
+            seq_len = 128  # >= KDA kernel's minimum chunk-friendly length, see _tiny_cfg docstring.
+            input_ids = torch.randint(2, 200, (1, seq_len)).cuda()
+            seq_ctx = SequenceContext.from_input_ids((input_ids,), device="cuda")
+            out = model(seq_ctx=seq_ctx, loss_ctx=None)
+            assert torch.isfinite(out.logits).all()
+            # 原始前向已 park 层 3 的输入（注册项保留到 replay 消费，int 键），其余层无残留。
+            assert set(offload_mod._layer_offloads) == {3}
+            out.logits.float().pow(2).sum().backward()
+        # replay 入口 refill 弹掉注册项；所有浮点参数（除刻意冻结的 indexer）拿到梯度。
+        assert offload_mod._layer_offloads == {}
+        for name, p in model.named_parameters():
+            if p.is_floating_point() and "self_attn.indexer" not in name:
+                assert p.grad is not None and p.grad.abs().sum() > 0, f"{name} got no gradient"

@@ -215,11 +215,14 @@ def _park_launch(*, layer_idx: int, hidden_states: torch.Tensor | list[torch.Ten
     # by the checkpoint frames; _ensure_hidden_resident restores their storage
     # before the replay reads them.
     #
-    # One layer owns one live offload entry at a time. Reusing it while still
-    # active would overwrite the earlier D2H result, so fail loudly if the
-    # scheduling contract is violated (mirrors dsa_topk_offload_npu.py).
-    if layer_idx in _layer_offloads:
-        raise RuntimeError(f"Activation offload for layer {layer_idx} is still active.")
+    # One layer owns one live offload entry at a time, and the lifecycle
+    # strictly alternates park (this hook) with refill (replay entry) per
+    # layer. A second park for the same layer therefore means the earlier pass
+    # never reached its backward — a forward_only pass (no replay, as in
+    # TrainEngine.forward_only) or a failure between forward and backward. The
+    # abandoned entry is unrecoverable by design, so drop it and reuse the
+    # slot; keeping it (or raising) would poison every later step.
+    _layer_offloads.pop(layer_idx, None)
 
     swap_tensors: list[SwapTensor] = []
     # Register before parking so a mid-loop failure cannot strand a launched

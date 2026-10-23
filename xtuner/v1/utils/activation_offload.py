@@ -101,8 +101,9 @@ class SwapTensor:
         if self.stat != "host":
             return
         if flag:
+            # Every in-tree caller runs on the default stream (training forward and the
+            # legacy pack window), where current == default, so one wait suffices.
             torch.cuda.current_stream().wait_stream(stream)
-            torch.cuda.default_stream().wait_stream(stream)
         self.tensor.storage().resize_(0)
         self.stat = "host"
 
