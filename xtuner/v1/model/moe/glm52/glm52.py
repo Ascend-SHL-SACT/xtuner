@@ -27,12 +27,12 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
 from xtuner.v1.module.mtp import MTPConfig
 from xtuner.v1.module.rope import RopeParametersConfig
 from xtuner.v1.module.router.noaux_router import NoAuxRouterConfig
-
-from .activation_offload_npu import (
+from xtuner.v1.utils.activation_offload_npu import (
     activation_offload_npu_enabled,
     make_activation_offload_npu_ctx,
     register_activation_offload_npu_hooks,
 )
+
 from .decoder_layer import (
     GLM52DenseDecoderLayer,
     GLM52DenseDecoderLayerMicroBatchOutput,
@@ -127,6 +127,7 @@ class Glm52MoE(MoE):
             register_activation_offload_npu_hooks(
                 model_layers=self.layers,
                 first_offload_layer=self.config.first_k_dense_replace,
+                chain_id="glm52",
             )
             setattr(
                 self, "_saved_tensors_offload_ctx", make_activation_offload_npu_ctx(self._saved_tensors_offload_ctx)
