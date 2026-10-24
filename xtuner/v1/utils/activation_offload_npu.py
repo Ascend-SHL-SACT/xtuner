@@ -175,14 +175,24 @@ def make_activation_offload_npu_ctx(
     return _ctx
 
 
-# Live offloads keyed by layer index, one SwapTensor per micro-batch; each
-# SwapTensor pins its hidden-state tensor alive until the replay-entry refill
-# consumes the entry. Layer-index keying (not tensor identity) mirrors
-# dsa_topk_offload_npu.py: the reentrant replay passes detach_variable copies,
-# so id() does not survive into the replay while the shared storage does.
-# Entries are keyed by (chain_id, layer_idx) so coexisting chains -- the text
-# decoder layers and a vision tower -- never pop each other's offloads.
-_layer_offloads: dict[tuple[str, int], list[SwapTensor]] = {}
+# Live offloads keyed by layer index, one pass per entry and one SwapTensor per
+# micro-batch; each SwapTensor pins its hidden-state tensor alive until the
+# replay-entry refill consumes it. Layer-index keying (not tensor identity)
+# mirrors dsa_topk_offload_npu.py: the reentrant replay passes detach_variable
+# copies, so id() does not survive into the replay while the shared storage
+# does. Entries are keyed by (chain_id, layer_idx) so coexisting chains -- the
+# text decoder layers and a vision tower -- never pop each other's offloads.
+#
+# A layer can hold several passes at once: under intra_layer_micro_batch > 1
+# the vision tower runs once per sample (plus a dummy call for a text-only
+# sample), so both passes park a block before either is replayed. Each pass
+# keeps its own entry and pinned buffer -- one shared entry would let the second
+# pass overwrite the first, whose replay then reads zero-sized storage.
+_layer_offloads: dict[tuple[str, int], list[list[SwapTensor]]] = {}
+# A layer re-parked past this many in-flight passes is accumulating passes that
+# never reach their backward (forward_only calls, aborted steps): drop the
+# oldest, which replaces the stale-entry drop of the single-entry registry.
+_MAX_INFLIGHT_PASSES = 8
 _offload_streams: dict[int, torch.cuda.Stream] = {}
 # Per chain: the highest registered layer, set at registration. Only consulted
 # when that layer is itself wrapped by activation checkpointing (a model whose
@@ -237,10 +247,10 @@ def _forward_input_pre_hook(
     #   prefetched by the last refill, this is only an event wait.
     if not module.training:
         return
-    if torch.is_grad_enabled():
-        _ensure_hidden_resident(chain_id, layer_idx)
-        return
     hidden_states = args[0] if args else kwargs.get("hidden_states")
+    if torch.is_grad_enabled():
+        _ensure_hidden_resident(chain_id, layer_idx, hidden_states)
+        return
     if hidden_states is None:
         return
     _park_launch(chain_id=chain_id, layer_idx=layer_idx, hidden_states=hidden_states)
@@ -256,30 +266,31 @@ def _park_launch(*, chain_id: str, layer_idx: int, hidden_states: torch.Tensor |
     # by the checkpoint frames; _ensure_hidden_resident restores their storage
     # before the replay reads them.
     #
-    # One layer owns one live offload entry at a time, and the lifecycle
-    # strictly alternates park (this hook) with refill (replay entry) per
-    # layer. A second park for the same layer therefore means the earlier pass
-    # never reached its backward — a forward_only pass (no replay, as in
-    # TrainEngine.forward_only) or a failure between forward and backward. The
-    # abandoned entry is unrecoverable by design, so drop it and reuse the
-    # slot; keeping it (or raising) would poison every later step.
-    stale_entry = _layer_offloads.pop((chain_id, layer_idx), None)
-    if stale_entry:
+    # Each park takes the next pass index of the layer (see _layer_offloads). A
+    # pass that never reaches its backward -- a forward_only pass or a step
+    # aborted between forward and backward -- cannot be dropped at the next
+    # park without breaking its own replay, so it is bounded instead: past
+    # _MAX_INFLIGHT_PASSES the oldest pass is abandoned.
+    passes = _layer_offloads.setdefault((chain_id, layer_idx), [])
+    if len(passes) >= _MAX_INFLIGHT_PASSES:
+        dropped = passes.pop(0)
         log_rank0.warning(
-            f"Activation offload (NPU): dropped a stale offload entry for chain {chain_id!r} layer {layer_idx} "
-            "whose replay never ran (forward_only pass or a step aborted between forward and backward)."
+            f"Activation offload (NPU): layer {layer_idx} of chain {chain_id!r} held {_MAX_INFLIGHT_PASSES} "
+            f"passes; dropped the oldest ({len(dropped)} parked tensor(s)) whose replay cannot run."
         )
-
+    pass_idx = len(passes)
     swap_tensors: list[SwapTensor] = []
     # Register before parking so a mid-loop failure cannot strand a launched
     # copy without a visible owner: the partial entry stays visible to
     # _park_finish and _ensure_hidden_resident, and the next consumption
     # refills whatever was launched.
-    _layer_offloads[(chain_id, layer_idx)] = swap_tensors
+    passes.append(swap_tensors)
     for mb_idx, hidden in enumerate(hidden_states if isinstance(hidden_states, list) else [hidden_states]):
         # Reuse the activation-offload pinned-buffer cache, keyed per chain,
-        # layer and micro-batch slot; shape or dtype drift reallocates.
-        key = f"{chain_id}_act_hidden_{layer_idx}_{mb_idx}"
+        # layer, pass and micro-batch slot; shape or dtype drift reallocates.
+        # The pass is part of the key because a second in-flight pass must not
+        # write over the copy the first one still has to be refilled from.
+        key = f"{chain_id}_act_hidden_{layer_idx}_{pass_idx}_{mb_idx}"
         tensor_cpu = OffloadManager().get_or_create_pin_memory(key, hidden.shape, hidden.dtype)
         swap_tensor = SwapTensor(hidden, key, tensor_cpu=tensor_cpu)
         # d2h doc 2.2: one ordering gate per copy. launch_d2h records an event on
@@ -299,7 +310,12 @@ def _park_finish(chain_id: str, layer_idx: int) -> None:
     # kept: the replay refill pops it. Swaps whose copy never launched (stat
     # "device") are skipped by wait_d2h_finished, so partial parks finish
     # consistently.
-    swap_tensors = _layer_offloads.get((chain_id, layer_idx))
+    # Park and finish are the adjacent pre/post hooks of one module invocation
+    # on one thread, so the pass this invocation parked is the last one.
+    passes = _layer_offloads.get((chain_id, layer_idx))
+    if not passes:
+        return
+    swap_tensors = passes[-1]
     if not swap_tensors:
         return
     for swap_tensor in swap_tensors:
@@ -325,12 +341,20 @@ def _park_finish(chain_id: str, layer_idx: int) -> None:
 
 
 @torch.compiler.disable
-def _ensure_hidden_resident(chain_id: str, layer_idx: int) -> None:
+def _ensure_hidden_resident(
+    chain_id: str, layer_idx: int, hidden_states: torch.Tensor | list[torch.Tensor] | None
+) -> None:
     # Restore the device storage of one layer's input hidden states at the
     # replay entry and kick off the previous layer's H2D prefetch. The
     # backward replay re-enters layers in reverse order; each layer's pre-hook
     # pops its own entry, so every other call (original forwards,
     # already-consumed layers, inference) is a no-op miss.
+    #
+    # The replay tensor is a detached view of the parked tensor and shares its
+    # StorageImpl, whose ``_cdata`` survives the park's ``resize_(0)``, so the
+    # pass this replay owns is selected by storage identity: a layer can hold
+    # several in-flight passes, and restoring another pass's copy would hand
+    # this replay the wrong data.
     #
     # The previous-layer prefetch runs before the miss return on purpose. The
     # highest *wrapped* layer never gets prefetched by a later replay (it is
@@ -342,14 +366,38 @@ def _ensure_hidden_resident(chain_id: str, layer_idx: int) -> None:
     # runs with grad enabled in the original forward, calls this pre-hook and
     # misses (unwrapped layers never park), and this prefetch is the only
     # callback between the head's park and the backward replay.
-    swap_tensors = _layer_offloads.pop((chain_id, layer_idx), None)
-    prev_entry = _layer_offloads.get((chain_id, layer_idx - 1))
-    if prev_entry:
-        for swap_tensor in prev_entry:
-            if swap_tensor.stat == "host":
-                # Async H2D on the offload stream (records h2d_event and
-                # keeps the storage alive for the copy via record_stream).
-                swap_tensor.prefetch_launch_h2d(offload_stream(swap_tensor.tensor.device), True)
+    tensors = hidden_states if isinstance(hidden_states, list) else [hidden_states]
+    wanted = {tensor.untyped_storage()._cdata for tensor in tensors if isinstance(tensor, torch.Tensor)}
+    passes = _layer_offloads.get((chain_id, layer_idx))
+    swap_tensors: list[SwapTensor] | None = None
+    matched_pass: int | None = None
+    if passes:
+        for pass_idx, pass_tensors in list(enumerate(passes)):
+            hits = [swap for swap in pass_tensors if swap.tensor.untyped_storage()._cdata in wanted]
+            if not hits:
+                continue
+            matched_pass = pass_idx
+            swap_tensors = hits
+            rest = [swap for swap in pass_tensors if swap not in hits]
+            if rest:
+                passes[pass_idx] = rest
+            else:
+                passes.pop(pass_idx)
+            break
+        if not passes:
+            del _layer_offloads[(chain_id, layer_idx)]
+    prev_passes = _layer_offloads.get((chain_id, layer_idx - 1))
+    if prev_passes:
+        # Same pass as the copy this replay owns, so only that pass is brought
+        # back early; a miss falls back to every in-flight pass.
+        for pass_idx, pass_tensors in enumerate(prev_passes):
+            if matched_pass is not None and pass_idx != matched_pass:
+                continue
+            for swap_tensor in pass_tensors:
+                if swap_tensor.stat == "host":
+                    # Async H2D on the offload stream (records h2d_event and
+                    # keeps the storage alive for the copy via record_stream).
+                    swap_tensor.prefetch_launch_h2d(offload_stream(swap_tensor.tensor.device), True)
     if swap_tensors is None:
         return
 
