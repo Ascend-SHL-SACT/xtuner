@@ -75,6 +75,18 @@ __all__ = ["npu_kpool_topk_indices"]
 # chain. Setting it to ``0`` restores the legacy per-segment path bit for bit.
 _BATCHED_SCORE = os.environ.get("XTUNER_GLM53_KPOOL_BATCHED_SCORE", "1") == "1"
 
+# Row-block scoring of the batched path: scores ``chunk_rows`` queries at a time so the
+# whole-call ``[S, W]`` fp32 + bool buffers shrink to one block (see kpool_npu_chunk.py). ``0``
+# keeps the whole-call buffers; a positive value is the memory knob for long-context shards
+# where ``W`` (the largest document's pool count) dominates the transient footprint.
+try:
+    _SCORE_CHUNK_ROWS = int(os.environ.get("XTUNER_GLM53_KPOOL_SCORE_CHUNK_ROWS", "0") or 0)
+except ValueError as exc:
+    raise ValueError(
+        f"XTUNER_GLM53_KPOOL_SCORE_CHUNK_ROWS={os.environ.get('XTUNER_GLM53_KPOOL_SCORE_CHUNK_ROWS')!r} "
+        "is not a valid int"
+    ) from exc
+
 # SP work-balancing overrides for the indexer scorer (see ``npu_kpool_topk_indices``). The
 # launch scripts export both; unset keeps the caller's config values untouched.
 _ENV_BALANCE_SP: bool | None = (
@@ -256,9 +268,28 @@ def npu_kpool_topk_indices(
                 # prefix test (see the ``select_k`` contract in ``_score_and_topk_batched``).
                 # Do not tighten this to a per-document minimum -- mixed packs would lose the
                 # batched path for no correctness gain.
-                sel_all = _score_and_topk_batched(
-                    q_local, pool_key, w_all_f, ranges, row_prefix, prefix_host, select_k, index_head_dim
-                ).to(torch.int32)
+                if _SCORE_CHUNK_ROWS > 0:
+                    # Row-block variant of the call below: same kernel, same weights, one
+                    # block-sized buffer instead of the whole-call ``[S, W]`` pair -- same
+                    # per-row score multiset, ids identical except for exact ties on the
+                    # ``select_k``-th rank (see kpool_npu_chunk.py). Returns int32 already.
+                    from .kpool_npu_chunk import score_and_topk_batched_chunked
+
+                    sel_all = score_and_topk_batched_chunked(
+                        q_local,
+                        pool_key,
+                        w_all_f,
+                        ranges,
+                        row_prefix,
+                        prefix_host,
+                        select_k,
+                        index_head_dim,
+                        _SCORE_CHUNK_ROWS,
+                    )
+                else:
+                    sel_all = _score_and_topk_batched(
+                        q_local, pool_key, w_all_f, ranges, row_prefix, prefix_host, select_k, index_head_dim
+                    ).to(torch.int32)
                 # ``topk`` hands back int64 ids; left as int64 they poison the shared expand
                 # below -- ``tok`` becomes a 2.1 GB int64 buffer and ``masked_fill_`` (no
                 # int64 AICORE kernel on 910C) drops to the AI_CPU at ~40 GB/s, ~56 ms per
@@ -501,6 +532,7 @@ def _score_and_topk_batched(
     prefix_host: list[int],
     select_k: int,
     index_head_dim: int,
+    pool_key_padded: Tensor | None = None,
 ) -> Tensor:
     """Score every document segment with one kernel launch each, then topk the shard once.
 
@@ -529,9 +561,14 @@ def _score_and_topk_batched(
         row_prefix (Tensor): Per-row visible-pool prefix ``[S]`` int32.
         prefix_host (list[int]): ``row_prefix`` as plain ints; bounds each launch's pool axis
             without a device readback.
-        select_k (int): Slot width (``index_topk // index_kpool``); must not exceed the largest
-            segment's pool count so the batched topk width matches the legacy slot buffer.
+        select_k (int): Slot width (``index_topk // index_kpool``). The returned tensor is
+            ``[S, min(select_k, max_pools)]`` wide, so a caller that needs exactly ``select_k``
+            columns (e.g. a smaller pool axis per row block) must pad the tail itself; any id
+            past the row's prefix is invalid downstream, so a pad sentinel is equivalent.
         index_head_dim (int): Indexer head dimension (scale only).
+        pool_key_padded (Tensor | None): ``pool_key`` already padded with ``_MAX_BLOCK_P - 1``
+            zero key rows, when the caller scores several blocks off the same untouched keys
+            (see ``kpool_npu_chunk``); ``None`` pads here.
 
     Returns:
         Tensor: ``[S, min(select_k, max_pools)]`` int64 document-local pool ids, sorted by
@@ -563,7 +600,11 @@ def _score_and_topk_batched(
     # padded to whole tiles, and the kernel's pool-axis boundary_check does not reliably clamp
     # the MTE read (see lightning_indexer_score.forward), so the last segment must have real
     # rows to read into. Padded keys are zero; their columns are invalid per the mask above.
-    pool_key_pad = torch.nn.functional.pad(pool_key, (0, 0, 0, _MAX_BLOCK_P - 1))
+    pool_key_pad = (
+        pool_key_padded
+        if pool_key_padded is not None
+        else torch.nn.functional.pad(pool_key, (0, 0, 0, _MAX_BLOCK_P - 1))
+    )
     scale = index_head_dim**-0.5
     for row_lo, row_hi, pool_lo, pool_hi, _doc_start in ranges:
         # ``row_prefix`` is monotone within a document, so the segment's last row carries the

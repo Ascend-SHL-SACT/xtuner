@@ -171,6 +171,7 @@ def _run_topk(
     batched: bool,
     index_topk: int = 64,
     index_kpool: int = 4,
+    chunk_rows: int = 0,
 ) -> Tensor:
     """以指定门状态跑一次 ``npu_kpool_topk_indices``（批量路径是否派发由 ``batched_spy`` 观察）。
 
@@ -181,11 +182,13 @@ def _run_topk(
         batched (bool): ``kpool_npu._BATCHED_SCORE`` 的注入值。
         index_topk (int): 语义 token 预算。
         index_kpool (int): 池大小。
+        chunk_rows (int): ``kpool_npu._SCORE_CHUNK_ROWS`` 的注入值（0 = 整 call 批量缓冲）。
 
     Returns:
         Tensor: ``[S, 1, kpool_output_width(...)]`` int32 输出。
     """
     monkeypatch.setattr(kpool_npu, "_BATCHED_SCORE", batched)
+    monkeypatch.setattr(kpool_npu, "_SCORE_CHUNK_ROWS", chunk_rows)
     q, k, gate, weights, ape = inputs
     return kpool_npu.npu_kpool_topk_indices(
         q,
@@ -843,3 +846,104 @@ class TestKpoolBatchedSelInt32:
         inplace = [dt for name, dt in spy.calls if "masked_fill_" in name]
         assert inplace, "the expand chain must run its in-place masked_fill_ at least once"
         assert inplace == [torch.int32], spy.calls
+
+
+class TestKpoolScoreChunkEquivalence:
+    """行分块打分（``_SCORE_CHUNK_ROWS``）与整 call 批量打分的逐位等价。
+
+    分块路径只把整 call 的 ``[S, W]`` fp32/bool 缓冲换成逐块 ``[chunk, W_block]``：每块池轴按该块
+    自身可见前缀做上取整截断（``kpool_npu_chunk._POOL_AXIS_ALIGN/_SLACK``），块外列在整 call 路径上
+    也因可见性掩码保持 ``finfo.min`` 预填，故每行参与排序的值集不变。当前缀小于 ``select_k``
+    （所有可见列都进入选中宽度）时选中 id 逐位相同；当前缀达到 ``select_k`` 且第 k 名存在精确平分时，
+    两种缓冲宽度可能保留不同的等分列（``torch.topk`` 对等值的排序依 N 而定），故那种布局只断言
+    选中**集合**相同。这些用例锁定"块跨文档边界""块内前缀参差""整 call 回退（chunk_rows >= S）"、
+    "池轴截断真正生效"与大量平分五种布局。
+    """
+
+    @_requires_accelerator
+    @_requires_fused_indexer
+    @pytest.mark.gpu
+    @pytest.mark.parametrize("chunk_rows", [1, 3, 1000])
+    def test_mixed_packed_documents_bitwise_equal(self, monkeypatch: pytest.MonkeyPatch, chunk_rows: int) -> None:
+        """混合长短文档 + 块跨文档边界：与整 call 批量输出逐位一致。"""
+        doc_lens = [200, 3, 17, 64, 65, 1, 129, 300, 7, 77]
+        ctx = _make_ctx(doc_lens)
+        inputs = _make_inputs(doc_lens, seed=11)
+        whole = _run_topk(monkeypatch, inputs, ctx, batched=True)
+        chunked = _run_topk(monkeypatch, inputs, ctx, batched=True, chunk_rows=chunk_rows)
+        assert chunked.dtype == whole.dtype == torch.int32
+        assert chunked.shape == whole.shape
+        assert torch.equal(chunked, whole)
+
+    @_requires_accelerator
+    @_requires_fused_indexer
+    @pytest.mark.gpu
+    def test_single_long_document_clamped_block_bitwise_equal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """单长文档：逐块池轴上取整截断生效，输出仍与整 call 逐位一致。"""
+        doc_lens = [1024]
+        ctx = _make_ctx(doc_lens)
+        inputs = _make_inputs(doc_lens, seed=12)
+        whole = _run_topk(monkeypatch, inputs, ctx, batched=True)
+        chunked = _run_topk(monkeypatch, inputs, ctx, batched=True, chunk_rows=128)
+        assert torch.equal(chunked, whole)
+
+    @_requires_accelerator
+    @_requires_fused_indexer
+    @pytest.mark.gpu
+    def test_trinary_tie_stress_bitwise_equal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """三值 q/k 制造大量精确 fp32 平分：分块缓冲宽度变化不影响 topk 结果。"""
+        doc_lens = [130, 70, 258, 64]
+        ctx = _make_ctx(doc_lens)
+        inputs = _make_inputs(doc_lens, seed=13, tie_stress=True)
+        whole = _run_topk(monkeypatch, inputs, ctx, batched=True)
+        chunked = _run_topk(monkeypatch, inputs, ctx, batched=True, chunk_rows=64)
+        assert torch.equal(chunked, whole)
+
+    @_requires_accelerator
+    @_requires_fused_indexer
+    @pytest.mark.gpu
+    def test_chunked_path_dispatches_one_block_per_chunk(
+        self, monkeypatch: pytest.MonkeyPatch, batched_spy: list[bool]
+    ) -> None:
+        """分块路径按块派发批量打分段（整 call 路径只派发一次），且输出仍逐位一致。"""
+        doc_lens = [512]
+        ctx = _make_ctx(doc_lens)
+        inputs = _make_inputs(doc_lens, seed=14)
+        whole = _run_topk(monkeypatch, inputs, ctx, batched=True)
+        assert batched_spy == [True]
+        chunked = _run_topk(monkeypatch, inputs, ctx, batched=True, chunk_rows=128)
+        assert batched_spy == [True, True, True, True, True], batched_spy  # 1 whole-call + ceil(512/128) blocks
+        assert torch.equal(chunked, whole)
+
+    @_requires_accelerator
+    @_requires_fused_indexer
+    @pytest.mark.gpu
+    @pytest.mark.parametrize("chunk_rows", [128, 512])
+    def test_long_document_pool_axis_clamp_bites(self, monkeypatch: pytest.MonkeyPatch, chunk_rows: int) -> None:
+        """长文档下逐块池轴截断真正生效（块宽 < 整 call 宽），选中集合仍与整 call 一致。"""
+        doc_lens = [8192]  # 2048 pools: 首块 max prefix 32 -> pool_bound 1024，截断必然发生
+        ctx = _make_ctx(doc_lens)
+        inputs = _make_inputs(doc_lens, seed=15)
+        widths: list[int] = []
+        real = kpool_npu._score_and_topk_batched
+
+        def _spy(*args: Any, **kwargs: Any) -> Tensor:
+            ranges = args[3]
+            widths.append(max(r[3] - r[2] for r in ranges))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(kpool_npu, "_score_and_topk_batched", _spy)
+        whole = _run_topk(monkeypatch, inputs, ctx, batched=True)
+        assert widths == [2048], widths  # 整 call：一个 segment，整个文档的池轴
+        widths.clear()
+        chunked = _run_topk(monkeypatch, inputs, ctx, batched=True, chunk_rows=chunk_rows)
+        assert len(widths) > 1 and min(widths) < 2048, widths  # 至少一块被截断
+
+        # NH=8 下「所有头点积为负」的池分数精确等于 0（概率 2**-8），会落在第 k 名附近与别的等分
+        # 列竞争，此时两种缓冲宽度可能留下不同的等分列：断言选中集合（而非顺序）相同。
+        # ``[S, 1, 1]`` against the ``[S, 1, width]`` output: a ``[S, 1]`` mask would broadcast
+        # to ``[S, S, width]`` instead of masking per row.
+        prefix = torch.tensor(_row_prefixes(doc_lens, 4), device=whole.device, dtype=torch.int32).view(-1, 1, 1)
+        valid_a = torch.where(whole < prefix, whole, torch.full_like(whole, -1)).sort(-1).values
+        valid_b = torch.where(chunked < prefix, chunked, torch.full_like(chunked, -1)).sort(-1).values
+        assert torch.equal(valid_a, valid_b)
