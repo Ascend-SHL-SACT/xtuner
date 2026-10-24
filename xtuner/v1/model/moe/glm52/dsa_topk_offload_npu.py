@@ -7,8 +7,8 @@ import torch
 
 from xtuner.v1.utils import log_rank0
 from xtuner.v1.utils.activation_offload import OffloadManager, SwapTensor
+from xtuner.v1.utils.activation_offload_npu import offload_stream
 
-from .activation_offload_npu import _offload_stream
 from .decoder_layer import (
     GLM52DenseDecoderLayerMicroBatchOutput,
     GLM52DenseDecoderLayerOutput,
@@ -265,4 +265,4 @@ def _topk_stream(device: torch.device) -> torch.cuda.Stream:
     # at dual-stream arbitration, not at any refill blocking. Serializing the
     # copies on one stream is harmless (their total transfer time per step is
     # two orders of magnitude below the step time).
-    return _offload_stream(device)
+    return offload_stream(device)

@@ -101,8 +101,9 @@ class SwapTensor:
         if self.stat != "host":
             return
         if flag:
+            # Every in-tree caller runs on the default stream (training forward and the
+            # legacy pack window), where current == default, so one wait suffices.
             torch.cuda.current_stream().wait_stream(stream)
-            torch.cuda.default_stream().wait_stream(stream)
         self.tensor.storage().resize_(0)
         self.stat = "host"
 
@@ -118,10 +119,13 @@ class SwapTensor:
         with torch.no_grad():
             # if self.tensor_cpu.isnan().any():
             #     raise RuntimeError("d2h error")
+            # Non-blocking so the host thread is not stalled behind the copy and
+            # every copy already enqueued on the offload stream (d2h doc 2.5/3.4).
+            # Each caller orders the consumer reads itself; see _unpack_from_cpu.
             if self.is_slice_tensor:
-                self.tensor.copy_(self.tensor_cpu)
+                self.tensor.copy_(self.tensor_cpu, non_blocking=True)
             else:
-                self.tensor.storage().copy_(self.tensor_cpu.storage())
+                self.tensor.storage().copy_(self.tensor_cpu.storage(), non_blocking=True)
             self.stat = "device"
 
     def load(self):
@@ -415,6 +419,11 @@ class async_save_on_cpu(saved_tensors_hooks):
 
             OffloadManager().del_may_npu_tensor(f"{group}_{int(block_idx) + 1}_", h2d_stream)
             swap_tensor.launch_h2d(h2d_stream, True, working_stream)
+            # launch_h2d's copy is non-blocking: the autograd consumer reads the
+            # restored storage on the working stream right after this returns, so
+            # order that stream behind the copy (the blocking copy used to imply
+            # this wait on the host side; d2h doc 3.4).
+            working_stream.wait_stream(h2d_stream)
             # if block_idx in ["0", "2", "3"]:
             # if block_idx in ["0"]:
             #     torch.cuda.synchronize()
