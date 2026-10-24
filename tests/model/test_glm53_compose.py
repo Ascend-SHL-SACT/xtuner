@@ -4,6 +4,9 @@ Tiny synthetic config (mirrors test_glm53_text_moe.py / test_glm53_vision.py fix
 required: KDA's Triton kernel has no CPU backend.
 """
 
+import os
+from unittest import mock
+
 import pytest
 import torch
 from torch.testing._internal.common_distributed import DistributedTestBase
@@ -325,3 +328,106 @@ class TestGlm53ComposeForward:
         reference = model.language_model(ref_ctx, None).logits
 
         torch.testing.assert_close(logits, reference, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+class TestGlm53VisionActivationOffloadNpu:
+    """XTUNER_ACTIVATION_OFFLOAD_NPU 对视觉塔的接线（Glm53VisionTower.fully_shard）：park/refill
+    钩子只挂 recompute 范围内的 block，并与 text 链（chain_id="glm53_text"）在同一注册表里互不串扰。"""
+
+    _HOOK_NAMES = {"_forward_input_pre_hook", "_park_layer_input_after_forward"}
+
+    @staticmethod
+    def _offload_hook_names(layer) -> set[str]:
+        # 注册发生在 checkpoint 包裹之前：被包裹的 block 上钩子在内层 _checkpoint_wrapped_module。
+        inner = getattr(layer, "_checkpoint_wrapped_module", layer)
+        names = {getattr(hook, "func", hook).__name__ for hook in inner._forward_pre_hooks.values()}
+        names |= {getattr(hook, "func", hook).__name__ for hook in inner._forward_hooks.values()}
+        return names & TestGlm53VisionActivationOffloadNpu._HOOK_NAMES
+
+    def test_tower_registers_hooks_on_recompute_scope_blocks_only(self):
+        # depth=2 × ratio 0.5 → 只 wrap block 0：钩子必须只落在它身上；text 链在 build 时已注册，
+        # 两条链共存于同一 _chain_heads 注册表，键各归各。
+        from xtuner.v1.utils import activation_offload_npu as offload_mod
+
+        with mock.patch.dict(os.environ, {"XTUNER_ACTIVATION_OFFLOAD_NPU": "1"}):
+            model = _build_model(fully_shard=False)
+            # init_world_mesh 需要进程组；这里只验证接线、config.fully_shard=False 不走 FSDP，桩掉即可。
+            with mock.patch("xtuner.v1.model.compose.glm53.modeling_vision.init_world_mesh", lambda: None):
+                model.vision_tower.fully_shard(
+                    FSDPConfig(ep_size=1, vision_recompute_ratio=0.5, checkpoint_preserve_rng_state=False)
+                )
+        assert self._offload_hook_names(model.vision_tower.blocks[0]) == self._HOOK_NAMES
+        # block 0 已被 checkpoint 包裹（钩子在其内层原始 block 上）；范围外的 block 1 保持裸模块。
+        assert hasattr(model.vision_tower.blocks[0], "_checkpoint_wrapped_module")
+        assert not hasattr(model.vision_tower.blocks[1], "_checkpoint_wrapped_module")
+        assert not self._offload_hook_names(model.vision_tower.blocks[1])
+        assert offload_mod._chain_heads["glm53_vision"] == 0
+        assert offload_mod._chain_heads["glm53_text"] == model.language_model.config.num_hidden_layers - 1
+
+    def test_gate_off_leaves_tower_unwired(self):
+        # 门控关：视觉塔不挂钩（与 test_glm53_text_moe 的门控关用例同一语义，env 不能有隐性副作用）。
+        with mock.patch.dict(os.environ):
+            os.environ.pop("XTUNER_ACTIVATION_OFFLOAD_NPU", None)
+            model = _build_model(fully_shard=False)
+            with mock.patch("xtuner.v1.model.compose.glm53.modeling_vision.init_world_mesh", lambda: None):
+                model.vision_tower.fully_shard(
+                    FSDPConfig(ep_size=1, vision_recompute_ratio=0.5, checkpoint_preserve_rng_state=False)
+                )
+        for block in model.vision_tower.blocks:
+            assert not self._offload_hook_names(block)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="park/refill roundtrip requires CUDA")
+    def test_vision_and_text_chains_roundtrip_without_cross_talk(self):
+        # 两条链在同一次前向/反向里各自 park/refill：注册表按 (chain_id, layer_idx) 键控，视觉
+        # block 与 text 层的条目互不顶掉；各链在 replay 入口只消费自己的条目，反向结束双双清空；
+        # pinned 缓存键以链名前缀区分，两条链不共享 buffer。
+        import torch._dynamo
+
+        from xtuner.v1.model.utils.checkpointing import apply_activation_checkpointing
+        from xtuner.v1.utils import activation_offload_npu as offload_mod
+
+        class _ToyBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(8, 8, bias=False)
+
+            def forward(self, hidden_states):
+                return self.linear(hidden_states)
+
+        with mock.patch.dict(os.environ, {"XTUNER_ACTIVATION_OFFLOAD_NPU": "1"}):
+            text_blocks = torch.nn.ModuleList([_ToyBlock().cuda().to(torch.bfloat16) for _ in range(2)])
+            vision_blocks = torch.nn.ModuleList([_ToyBlock().cuda().to(torch.bfloat16)])
+            offload_mod.register_activation_offload_npu_hooks(
+                model_layers=text_blocks, first_offload_layer=0, chain_id="glm52"
+            )
+            offload_mod.register_activation_offload_npu_hooks(
+                model_layers=vision_blocks, first_offload_layer=0, chain_id="glm53_vision"
+            )
+            # 生产路径的顺序：先注册（钩子落在原始 block 上），再包 checkpoint（wrap 进边界内）。
+            for i in range(len(text_blocks)):
+                text_blocks[i] = apply_activation_checkpointing(text_blocks[i], preserve_rng_state=False)
+            for i in range(len(vision_blocks)):
+                vision_blocks[i] = apply_activation_checkpointing(vision_blocks[i], preserve_rng_state=False)
+
+            def run(x):
+                for block in text_blocks:
+                    x = block(x)
+                for block in vision_blocks:
+                    x = block(x)
+                return x
+
+            # 本测试只验证 park/refill 机制本身，dynamo 一律关（同 text-moe roundtrip 用例的理由）。
+            with mock.patch.object(torch._dynamo.config, "disable", True):
+                x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+                out = run(x)
+                # 原始前向（no_grad）已 park：text 层 0/1 与视觉 block 0 三个条目并存，键不冲突。
+                assert set(offload_mod._layer_offloads) == {("glm52", 0), ("glm52", 1), ("glm53_vision", 0)}
+                assert {swap.key for swap in offload_mod._layer_offloads[("glm53_vision", 0)]} == {
+                    "glm53_vision_act_hidden_0_0"
+                }
+                assert {swap.key for swap in offload_mod._layer_offloads[("glm52", 0)]} == {"glm52_act_hidden_0_0"}
+                out.pow(2).sum().backward()
+            # 反向 replay：视觉 block 先消费（前向最后执行），text 条目此时仍存活、随后被各自
+            # replay 消费——pop 按 (chain, 层号) 精确命中，结束后全部清空。
+            assert offload_mod._layer_offloads == {}

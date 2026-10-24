@@ -26,6 +26,10 @@ from xtuner.v1.ops.act_fn import get_act_fn
 from xtuner.v1.ops.attn_imp import AttnOpOutputs, get_attn_impl_fn
 from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
 from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_device, get_torch_device_module
+from xtuner.v1.utils.activation_offload_npu import (
+    activation_offload_npu_enabled,
+    register_activation_offload_npu_hooks,
+)
 from xtuner.v1.utils.init_weight import default_init_weights
 from xtuner.v1.utils.misc import clean_param_name
 
@@ -432,6 +436,15 @@ class Glm53VisionModel(BaseModel):
         # blocks' worth of retained activations -- attention plus a 4096-wide MLP per block --
         # dominates the step's peak memory and OOMs long before the language tower does.
         num_recompute_layers = int(len(self.blocks) * fsdp_config.vision_recompute_ratio)
+        # Offload the recompute-scope blocks' input hidden states to CPU (XTUNER_ACTIVATION_OFFLOAD_NPU=1),
+        # same park/refill hook mechanism as the text decoder but under its own chain id, registered on
+        # the raw blocks *before* checkpoint wrapping so the hooks fire inside the checkpoint boundary.
+        if num_recompute_layers > 0 and fsdp_config.requires_grad and activation_offload_npu_enabled():
+            register_activation_offload_npu_hooks(
+                model_layers=list(self.blocks[:num_recompute_layers]),
+                first_offload_layer=0,
+                chain_id="glm53_vision",
+            )
         for layer_idx in range(num_recompute_layers):
             self.blocks[layer_idx] = apply_activation_checkpointing(
                 self.blocks[layer_idx],
