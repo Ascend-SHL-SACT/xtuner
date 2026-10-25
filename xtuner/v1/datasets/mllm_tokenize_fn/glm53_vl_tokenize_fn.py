@@ -35,7 +35,11 @@ from transformers import AutoProcessor
 from transformers.models.glm5_next.image_processing_glm5_next import smart_resize as image_smart_resize
 from transformers.models.glm5_next.video_processing_glm5_next import smart_resize as video_smart_resize
 from transformers.video_utils import VideoMetadata
-from xtuner.v1.data_proto.messages.glm53_chat import _tokenize_with_loss_mask, render_glm53_chat, sort_tool_messages
+from xtuner.v1.data_proto.messages.glm53_chat import (
+    _tokenize_with_loss_mask,
+    glm53_media_messages,
+    render_glm53_chat,
+)
 from xtuner.v1.utils import get_logger
 
 from ..data_item import CacheItem, Glm53VLDataItem
@@ -44,9 +48,11 @@ from .base_mllm_tokenize_fn import (
     BaseMLLMTokenizeFnConfig,
     BaseMLLMTokenizeFunction,
     OSSLoaderConfig,
+    collect_image_video_paths_and_extra,
     get_image_path,
     load_image,
 )
+from .image_data_uri import is_data_uri, load_image_data_uri
 from .qwen3_vl_utils import Qwen3VLOSSLoader, pil_loader, sort_frames
 
 
@@ -215,12 +221,14 @@ class Glm53VLTokenizeFunction(BaseMLLMTokenizeFunction):
 
     # ---- shared render/expand/tokenize, called by both cache and runtime paths ----
 
-    def __call__(self, item: dict, media_root: str = "", **kwargs):
-        # tool 块先按 tool_calls 顺序拉平（排序单位是 entry，与官方 jinja 的发射语义一致）：
-        # 渲染器会按同一 can_sort 规则重排 marker，而媒体 payload 由基类 __call__ 按消息顺序
-        # 收集、与 marker 位置式配对。先拉平消息让收集顺序与渲染后的 marker 顺序一致。
-        item = {**item, "messages": sort_tool_messages(item["messages"])}
-        return super().__call__(item, media_root=media_root, **kwargs)
+    def _collect_media(self, item: dict):
+        # 渲染器为结构化 tool 输出（{"id": ..., "output": [...]} 条目）里嵌套的媒体同样发射
+        # placeholder marker，而基类收集器只看每条消息 content 的直接列表项，嵌套媒体会出现
+        # "渲染出 marker、却没有对应 payload" 的错配。glm53_media_messages 按渲染 marker 顺序
+        # 把所有媒体 part（含嵌套 output 内的）拉平成合成 user 消息，保证位置式配对不错位。
+        return collect_image_video_paths_and_extra(
+            glm53_media_messages(item["messages"]), allow_all_roles=self.allow_all_roles
+        )
 
     def _render_base(self, data_item: dict) -> tuple[str, list[bool]]:
         self._check_no_literal_visual_marker(data_item)
@@ -317,13 +325,20 @@ class Glm53VLTokenizeFunction(BaseMLLMTokenizeFunction):
         pixel_values_list = []
         image_grid_list = []
         for image_file in self._image_path:
-            image_path_ = get_image_path(image_file, media_root)
-            if self.oss_loader is not None and "s3://" in image_path_:
-                img_str = self.oss_loader.client.get(image_path_)
-                image = pil_loader(img_str)
+            # 按 Data Format Types（V0.5 Agent）§7.1-7.2：嵌入图片使用
+            # data:image/<subtype>;base64,<payload>（整体称为 data URI）。
+            # base64 图片直接内存解码，绕过 media_root / OSS；裸 base64 仍走引用路径，
+            # 仅严格以小写 data: 开头时进入此分支；该分支内格式错误不回退到引用路径。
+            if is_data_uri(image_file):
+                image = load_image_data_uri(image_file)
             else:
-                assert "s3://" not in image_path_, "Please use oss_loader_cfg to load image from s3."
-                image = load_image(image_path_)
+                image_path_ = get_image_path(image_file, media_root)
+                if self.oss_loader is not None and "s3://" in image_path_:
+                    img_str = self.oss_loader.client.get(image_path_)
+                    image = pil_loader(img_str)
+                else:
+                    assert "s3://" not in image_path_, "Please use oss_loader_cfg to load image from s3."
+                    image = load_image(image_path_)
             image = apply_exif_orientation(image)
             processed_i = self.image_processor(images=[image], return_tensors="pt")
             pixel_values_list.append(processed_i["pixel_values"])

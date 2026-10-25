@@ -32,6 +32,7 @@ from xtuner.v1.ops.sparse_mla import (
     KPoolIndexerBackend,
     SparseMLABackend,
     SparseMLAProtocol,
+    ensure_deep_select_runtime_available,
     get_kpool_topk_indices,
     get_sparse_mla,
 )
@@ -166,9 +167,10 @@ class NoPEDSAMLAConfig(MLAConfig):
     sparse_mla_backend: Literal["torch", "flash_mla_cudnn", "tilelang", "torch_npu"] = "torch"
     # Independent of `sparse_mla_backend` above, which is `flash_mla_cudnn` here and is not
     # even a valid indexer backend -- inheriting it would never have worked.
-    indexer_backend: KPoolIndexerBackend = "tilelang"
+    # DeepSelect may replace only TopK or both scoring and TopK (cooperative SM90 path).
     # Opt in with "tilelang_cooperative" for cooperative BF16 scoring + DeepSelect.
     # Requires SM90+, BF16 Q/K with 32 heads x 128, and an installed DeepSelect module.
+    indexer_backend: KPoolIndexerBackend = "tilelang"
     # Bound logits memory with query chunks; cooperative scoring reuses FP32 scratch.
     indexer_topk_query_chunk_size: int | None = Field(default=1024, gt=0)
     # Enable SP balancing to redistribute causal scoring queries with neighbor P2P.
@@ -279,6 +281,8 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
         self.freeze_dsa_indexer = freeze_dsa_indexer
         self.sparse_mla_func: SparseMLAProtocol = get_sparse_mla(sparse_mla_backend)
         self.alignment = _SPARSE_MLA_ALIGNMENT[sparse_mla_backend]
+        if indexer_backend == "tilelang_deepselect":
+            ensure_deep_select_runtime_available()
 
         # No cute_dsl backend here, unlike GLM-5.2's per-token indexer: that kernel is
         # specialized to topk in {1024, 2048} (radix bin width, candidate tiles and compaction

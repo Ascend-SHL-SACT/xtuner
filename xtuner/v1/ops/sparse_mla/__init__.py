@@ -93,6 +93,8 @@ def get_kpool_topk_indices(backend: KPoolIndexerBackend) -> KPoolTopKIndicesProt
         return torch_kpool_topk_indices
     if backend == "tilelang":
         return kpool_topk_indices
+    if backend == "tilelang_deepselect":
+        return functools.partial(kpool_topk_indices, selector="deep_select")
     if backend == "torch_npu":
         from .kpool_npu import npu_kpool_topk_indices
 

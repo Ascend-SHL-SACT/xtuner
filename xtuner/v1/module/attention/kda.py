@@ -406,9 +406,10 @@ class KimiDeltaAttention(nn.Module):
         assert batch_size == 1, "KDA currently supports packed batch size 1"
 
         cu_seqlens = kda_lever.cu_seqlens_arg(seq_ctx, hidden_states.device, _KDA_NPU_BACKEND)
-        q, _ = self.q_conv1d(x=self.q_proj(hidden_states), cu_seqlens=cu_seqlens)
-        k, _ = self.k_conv1d(x=self.k_proj(hidden_states), cu_seqlens=cu_seqlens)
-        v, _ = self.v_conv1d(x=self.v_proj(hidden_states), cu_seqlens=cu_seqlens)
+        cu_seqlens_cpu = seq_ctx.cu_seq_lens_q_cpu
+        q, _ = self.q_conv1d(x=self.q_proj(hidden_states), cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu)
+        k, _ = self.k_conv1d(x=self.k_proj(hidden_states), cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu)
+        v, _ = self.v_conv1d(x=self.v_proj(hidden_states), cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu)
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -426,6 +427,7 @@ class KimiDeltaAttention(nn.Module):
             transpose_state_layout=True,
             safe_gate=(self.gate_lower_bound is not None),
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
 
         gate_out = self._gate_output(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -501,6 +503,7 @@ class KimiDeltaAttention(nn.Module):
         )
 
         cu_seqlens = kda_lever.cu_seqlens_arg(seq_ctx, hidden_states.device, _KDA_NPU_BACKEND)
+        cu_seqlens_cpu = seq_ctx.cu_seq_lens_q_cpu
         projection_size = self.num_heads * self.head_dim
 
         if kda_lever.SP_A2A_DEFER:
@@ -516,6 +519,7 @@ class KimiDeltaAttention(nn.Module):
                 sp_rank,
                 sp_size,
                 cu_seqlens,
+                cu_seqlens_cpu,
             )
             k = self._sp_short_conv(
                 self.k_conv1d,
@@ -525,6 +529,7 @@ class KimiDeltaAttention(nn.Module):
                 sp_rank,
                 sp_size,
                 cu_seqlens,
+                cu_seqlens_cpu,
             )
             v = self._sp_short_conv(
                 self.v_conv1d,
@@ -534,6 +539,7 @@ class KimiDeltaAttention(nn.Module):
                 sp_rank,
                 sp_size,
                 cu_seqlens,
+                cu_seqlens_cpu,
             )
 
             # Local seq, full heads -> all_to_all -> full seq, head shard (same as GDN g/beta).
@@ -567,6 +573,7 @@ class KimiDeltaAttention(nn.Module):
             transpose_state_layout=True,
             safe_gate=(self.gate_lower_bound is not None),
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
 
         if kda_lever.SP_A2A_DEFER:
@@ -589,6 +596,7 @@ class KimiDeltaAttention(nn.Module):
         sp_rank: int,
         sp_size: int,
         cu_seqlens: torch.Tensor | list[int] | None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Gather the full sequence for a channel shard, then run the same conv
         entry as non-SP."""
@@ -600,5 +608,5 @@ class KimiDeltaAttention(nn.Module):
         weight = weight.chunk(sp_size, dim=0)[sp_rank]
         if bias is not None:
             bias = bias.chunk(sp_size, dim=0)[sp_rank]
-        out, _ = conv(x, cu_seqlens=cu_seqlens, weight=weight, bias=bias)
+        out, _ = conv(x, cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu, weight=weight, bias=bias)
         return out

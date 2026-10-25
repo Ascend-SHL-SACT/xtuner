@@ -17,8 +17,9 @@ DSAIndexerBackend = Literal[
 # DSAIndexerBackend, there's no cudnn_dsa/flash_mla/deep_gemm_fp8/cute_dsl KPool kernel.
 # "torch_npu" adds the Ascend backend (fused lightning scoring on NPU, chunked-eager fallback
 # elsewhere). "tilelang_cooperative" is cooperative BF16 scoring + DeepSelect and retains the
-# original TileLang backend.
-KPoolIndexerBackend = Literal["torch", "tilelang", "tilelang_cooperative", "torch_npu"]
+# original TileLang backend. "tilelang_deepselect" replaces only the TopK; both DeepSelect
+# variants keep KPool's TileLang-compatible output contract.
+KPoolIndexerBackend = Literal["torch", "tilelang", "tilelang_cooperative", "tilelang_deepselect", "torch_npu"]
 
 
 class SparseMLAOutputs(NamedTuple):
