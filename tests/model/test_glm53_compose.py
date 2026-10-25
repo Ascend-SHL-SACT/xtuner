@@ -423,11 +423,11 @@ class TestGlm53VisionActivationOffloadNpu:
                 out = run(x)
                 # 原始前向（no_grad）已 park：text 层 0/1 与视觉 block 0 三个条目并存，键不冲突。
                 assert set(offload_mod._layer_offloads) == {("glm52", 0), ("glm52", 1), ("glm53_vision", 0)}
-                assert {swap.key for swap in offload_mod._layer_offloads[("glm53_vision", 0)]} == {
-                    "glm53_vision_act_hidden_0_0"
-                }
-                assert {swap.key for swap in offload_mod._layer_offloads[("glm52", 0)]} == {"glm52_act_hidden_0_0"}
+                assert [swap.key for swap in offload_mod._layer_offloads[("glm53_vision", 0)][0]] == [
+                    "glm53_vision_act_hidden_0_0_0"
+                ]
+                assert [swap.key for swap in offload_mod._layer_offloads[("glm52", 0)][0]] == ["glm52_act_hidden_0_0_0"]
                 out.pow(2).sum().backward()
             # 反向 replay：视觉 block 先消费（前向最后执行），text 条目此时仍存活、随后被各自
-            # replay 消费——pop 按 (chain, 层号) 精确命中，结束后全部清空。
+            # replay 消费——refill 按 (chain, 层号) 加 storage 身份精确命中，结束后全部清空。
             assert offload_mod._layer_offloads == {}
