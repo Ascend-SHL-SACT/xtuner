@@ -34,6 +34,7 @@ from xtuner.v1.utils.init_weight import default_init_weights
 from xtuner.v1.utils.misc import clean_param_name
 
 from .glm53_config import Glm53VisionConfig
+from .vision_fsdp_fuse import shard_vision_blocks, vision_fuse_k
 
 
 DEVICE = get_device()
@@ -452,14 +453,28 @@ class Glm53VisionModel(BaseModel):
             )
 
         if self.config.fully_shard:
-            for block in self.blocks:
-                self._fully_shard(
+            fuse_k = vision_fuse_k()
+            if fuse_k:
+                # XTUNER_VISION_FSDP_FUSE=K > 1: one FSDP2 unit per K ViT blocks, so the
+                # rendezvous-bound per-block collectives collapse into one per group.
+                shard_vision_blocks(
+                    self,
+                    self.blocks,
                     mesh=self.fsdp_mesh,
                     mp_policy=mp_policy,
-                    reshard_after_forward=True,
                     offload_policy=CPUOffloadPolicy() if fsdp_config.cpu_offload else None,
-                    module=block,
+                    reshard_after_forward=True,
+                    fuse_k=fuse_k,
                 )
+            else:
+                for block in self.blocks:
+                    self._fully_shard(
+                        mesh=self.fsdp_mesh,
+                        mp_policy=mp_policy,
+                        reshard_after_forward=True,
+                        offload_policy=CPUOffloadPolicy() if fsdp_config.cpu_offload else None,
+                        module=block,
+                    )
             self._fully_shard(
                 mesh=self.fsdp_mesh,
                 mp_policy=mp_policy,
