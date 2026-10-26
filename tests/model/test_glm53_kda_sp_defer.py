@@ -278,12 +278,15 @@ def _mock_gate_param(param: torch.Tensor) -> torch.Tensor:
 # ---- recorder 委托 ----
 
 
-def _sync_a2a_issue(send: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch.Tensor, _CpuWork]:
+def _sync_a2a_issue(
+    send: torch.Tensor, group: dist.ProcessGroup, pooled: bool = False
+) -> tuple[torch.Tensor, _CpuWork]:
     """``ulysses_dispatch._a2a_issue`` 的同步 stub：gloo 上直接 all_to_all_single（无流/事件）。
 
     捕获 send 缓冲（``_AsyncUlyssesDim1`` reshape 后的 ``(world, dim/world, ...)`` 布局）供 send
     布局断言使用。前向 issue 与反向（``_AsyncUlyssesDim1.backward``）都经模块 globals 解析到此处，
-    因此 a2a 计数天然覆盖 fwd+bwd。
+    因此 a2a 计数天然覆盖 fwd+bwd。``pooled`` 是生产侧的 recv 缓冲池标志
+    （``XTUNER_ULYSSES_A2A_POOL``，默认关），stub 恒用 ``empty_like``，语义上与关池一致。
     """
     _LOG.append("issue")
     _A2A_SENDS.append(send.detach().clone())

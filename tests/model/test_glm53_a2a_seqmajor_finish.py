@@ -136,8 +136,13 @@ def _build_kda_layer() -> kda_module.KimiDeltaAttention:
     return module.to(torch.bfloat16)
 
 
-def _sync_a2a_issue(send: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch.Tensor, None]:
-    """``ulysses_dispatch._a2a_issue`` 的同步 stub：gloo 上直接 all_to_all_single。"""
+def _sync_a2a_issue(
+    send: torch.Tensor, group: dist.ProcessGroup, pooled: bool = False
+) -> tuple[torch.Tensor, None]:
+    """``ulysses_dispatch._a2a_issue`` 的同步 stub：gloo 上直接 all_to_all_single。
+
+    ``pooled`` 只由真实现使用（缓冲池），stub 一律 ``empty_like``，等价于关池。
+    """
     recv = torch.empty_like(send)
     dist.all_to_all_single(recv, send, group=group)
     return recv, None

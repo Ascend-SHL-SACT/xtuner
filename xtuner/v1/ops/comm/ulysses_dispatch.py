@@ -59,6 +59,7 @@ import os
 import torch
 import torch.distributed as dist
 
+from xtuner.v1.ops.comm.a2a_pool import a2a_pool_enabled, pool_acquire, pool_release
 from xtuner.v1.utils import get_device
 
 
@@ -110,26 +111,37 @@ def _comm_stream(group: dist.ProcessGroup) -> torch.cuda.Stream:
     return stream
 
 
-def _a2a_issue(send: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch.Tensor, _WorkOpt]:
+def _a2a_issue(
+    send: torch.Tensor, group: dist.ProcessGroup, pooled: bool = False
+) -> tuple[torch.Tensor, _WorkOpt]:
     """Enqueue ``all_to_all_single`` on the comm stream without parking the
     host.
 
     The received buffer is allocated on the calling stream so its block
     returns to the caller's allocator pool. Neither buffer is readable until
     the returned work handle is fenced via ``_wait_a2a``; both are kept alive
-    in ``_PENDING_A2A`` until then.
+    in ``_PENDING_A2A`` until then. A ``pooled`` issue takes the received
+    buffer from the bounded staging pool (``XTUNER_ULYSSES_A2A_POOL``) and
+    hands it back with ``pool_release`` once its consumer is done; only the
+    forward movements pool, never the backward (its recv is the data gradient
+    that flows on).
 
     Args:
         send (torch.Tensor): Uniformly split send buffer (dim 0 chunked per
             rank), produced on the calling stream.
         group (dist.ProcessGroup): Process group to communicate over.
+        pooled (bool): Take the received buffer from the staging pool instead
+            of a fresh allocation (ignored while the pool gate is off).
 
     Returns:
         tuple[torch.Tensor, dist.Work | None]: The received buffer (same
             shape as ``send``) and the c10d work handle fencing it (``None``
             when the backend ran the collective synchronously).
     """
-    recv = torch.empty_like(send)
+    if pooled and a2a_pool_enabled():
+        recv = pool_acquire(send.shape, send.dtype, send.device)
+    else:
+        recv = torch.empty_like(send)
     stream = _comm_stream(group)
     ready = torch.cuda.Event()
     ready.record(torch.cuda.current_stream())
@@ -211,7 +223,7 @@ class _AsyncUlyssesDim1(torch.autograd.Function):
         if world == 1:
             return input, None
         send = input.reshape(world, input.shape[1] // world, *input.shape[2:]).contiguous()
-        return _a2a_issue(send, group)
+        return _a2a_issue(send, group, pooled=True)
 
     @staticmethod
     def backward(  # noqa: ANN001
@@ -243,7 +255,7 @@ class _AsyncUlyssesDim2(torch.autograd.Function):
             return input, None
         send = input.reshape(1, input.shape[1], world, input.shape[2] // world, *input.shape[3:])
         send = send.permute(2, 0, 1, *range(3, send.dim())).contiguous()
-        return _a2a_issue(send, group)
+        return _a2a_issue(send, group, pooled=True)
 
     @staticmethod
     def backward(  # noqa: ANN001
@@ -298,6 +310,7 @@ def finish_ulysses_dim1(recv: torch.Tensor, work: _WorkOpt, out_shape: torch.Siz
     """
     _wait_a2a(work)
     out = recv.permute(1, 0, *range(2, recv.dim())).contiguous()
+    pool_release(recv, out)
     return out.reshape(out_shape)
 
 
@@ -325,7 +338,8 @@ def finish_ulysses_dim1_seq_major(recv: torch.Tensor, work: _WorkOpt) -> torch.T
     """
     _wait_a2a(work)
     out = recv.permute(0, 2, 1).contiguous()
-    return out.reshape(1, recv.shape[0] * recv.shape[2], recv.shape[1])
+    pool_release(recv, out)
+    return out.reshape(1, out.shape[0] * out.shape[1], out.shape[2])
 
 
 def issue_ulysses_dim2(x: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch.Tensor, _WorkOpt, torch.Size]:
@@ -365,6 +379,7 @@ def finish_ulysses_dim2(recv: torch.Tensor, work: _WorkOpt, out_shape: torch.Siz
     """
     _wait_a2a(work)
     out = recv.permute(1, 0, *range(2, recv.dim())).contiguous()
+    pool_release(recv, out)
     return out.reshape(out_shape)
 
 

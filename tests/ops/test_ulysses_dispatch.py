@@ -225,7 +225,9 @@ _issued_works: list[_CpuWork] = []
 _WORK_COMPLETED: list[bool] = [True]
 
 
-def _sync_a2a_issue(send: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch.Tensor, _CpuWork]:
+def _sync_a2a_issue(
+    send: torch.Tensor, group: dist.ProcessGroup, pooled: bool = False
+) -> tuple[torch.Tensor, _CpuWork]:
     """``ulysses_dispatch._a2a_issue`` 的同步 stub：gloo 上直接 all_to_all_single。"""
     recv = torch.empty_like(send)
     dist.all_to_all_single(recv, send, group=group)
@@ -234,9 +236,11 @@ def _sync_a2a_issue(send: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch
     return recv, work
 
 
-def _real_async_a2a_issue(send: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch.Tensor, _CpuWrappedWork]:
+def _real_async_a2a_issue(
+    send: torch.Tensor, group: dist.ProcessGroup, pooled: bool = False
+) -> tuple[torch.Tensor, _CpuWrappedWork]:
     """真 async stub：调用真实 ``_a2a_issue``（gloo ``async_op=True``），work 包一层计数。"""
-    recv, real_work = _REAL_A2A_ISSUE(send, group)
+    recv, real_work = _REAL_A2A_ISSUE(send, group, pooled=pooled)
     assert real_work is not None, "gloo async_op=True 必须返回 Work 句柄"
     work = _CpuWrappedWork(real_work)
     _issued_works.append(work)
