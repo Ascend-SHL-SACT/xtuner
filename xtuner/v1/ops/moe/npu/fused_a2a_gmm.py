@@ -18,6 +18,13 @@ checkpoint re-issues both fused a2a ops in backward. The re-issued grouped-matmu
 unless the forward-only weight clones are detached (``no_grad`` in
 ``fused_dispatch_mlp_combine``) — see that function for the root cause and the run52/run67 A/B.
 
+That recompute also re-issues the metadata count exchange, which is redundant: the replay
+recomputes the same ``topk_ids`` from the same saved inputs, so ``XTUNER_MOE_COUNT_REUSE_REPLAY``
+hands the forward's ``send_counts``/``recv_counts``/``group_list`` back to the replay through
+``reuse_during_recompute`` and skips the collective. Default OFF (byte-identical to HEAD); it must
+be set identically on every EP rank (it gates a collective on the replay path) and relies on
+reproducible routing across forward and replay (see ``_compute_counts_for_call``).
+
 Op contract (probed on Ascend910, CANN9.2/torch_npu2.9.1 — see memory
 ``npu-alltoallv-gmm-probe-verdict``): ``hcom=`` (not ``group=``); ``gmm_weight`` 3D
 ``[E_local, in, out]`` with ``trans_gmm_weight=False``; ``send_counts``/``recv_counts`` flat
@@ -67,6 +74,22 @@ def is_enabled() -> bool:
         bool: True when ``XTUNER_MOE_FUSED_A2A_GMM=1``. Default OFF (byte-identical to HEAD).
     """
     return os.environ.get("XTUNER_MOE_FUSED_A2A_GMM", "0") == "1"
+
+
+def count_reuse_on_replay() -> bool:
+    """Return whether the count exchange reuses the forward counts on checkpoint replay.
+
+    Must be identical on every EP rank: it gates a collective on the replay path, so a mixed
+    setting deadlocks inside backward. Never applies under ``XTUNER_ROUTER_DEBUG=true``, whose
+    routing noise breaks the forward/replay ``topk_ids`` identity the reuse relies on.
+
+    Returns:
+        bool: True when ``XTUNER_MOE_COUNT_REUSE_REPLAY=1`` and routing is reproducible. Default
+            OFF (byte-identical to HEAD).
+    """
+    if os.environ.get("XTUNER_ROUTER_DEBUG") == "true":
+        return False
+    return os.environ.get("XTUNER_MOE_COUNT_REUSE_REPLAY", "0") == "1"
 
 
 def _resolve_hcom(ep_group: dist.ProcessGroup) -> tuple[str, int]:
@@ -128,6 +151,54 @@ def _compute_counts(
     # group_list: per-local-expert received count = sum over source ranks (for the dW matmul loop).
     group_list = recv_grid.sum(dim=0).to("cpu").tolist()
     return send_counts, recv_counts, group_list
+
+
+def _compute_counts_for_call(
+    topk_ids: torch.Tensor,
+    n_routed_experts: int,
+    ep_group: dist.ProcessGroup,
+) -> tuple[list[int], list[int], list[int]]:
+    """Run ``_compute_counts``, reusing the forward counts while a checkpoint replays.
+
+    Under activation-checkpoint replay the whole MoE layer re-runs from the same saved
+    inputs with the same weights and the same router state, so the router recomputes the
+    same ``topk_ids`` and the count exchange (one metadata all-to-all plus three D2H syncs
+    per call) would repeat work the forward already did. Gated by
+    ``XTUNER_MOE_COUNT_REUSE_REPLAY``: the counts are integers and the backward's
+    dispatch layout has to match the forward's, so replaying the forward lists is exact
+    rather than an approximation.
+
+    The router state is frozen across a microbatch's forward and replay: the only state
+    mutated within a microbatch is ``e_score_correction_bias``, and
+    ``MoE.post_micro_batch_forward`` updates it after that microbatch's ``forward`` plus
+    ``loss.backward()`` have both finished, so the replay sees the same bias and hence the
+    same ``topk_ids``. The remaining assumption is that the replay also reproduces the
+    forward's RNG stream up to the router (``checkpoint_preserve_rng_state`` stays on and
+    no RNG between the checkpoint boundary and the router differs; ``XTUNER_ROUTER_DEBUG``
+    is excluded by the gate) -- without it recomputing the counts would keep the layout
+    self-consistent, while reusing them would not.
+
+    Outside a checkpoint the call simply runs ``_compute_counts``; inside a replay with no
+    saved forward output it raises instead of silently recomputing. ``reuse_during_recompute``
+    is ``torch.compiler.disable``d, so this is not usable with a ``fullgraph`` compile of
+    ``MoEDecoderLayer.forward``.
+
+    Args:
+        topk_ids (torch.Tensor): per-token routed expert ids, ``[n_local, topk]``.
+        n_routed_experts (int): global expert count (``= ep * e_local``).
+        ep_group (dist.ProcessGroup): the expert-parallel process group.
+
+    Returns:
+        tuple[list[int], list[int], list[int]]: ``(send_counts, recv_counts, group_list)`` as
+        ``_compute_counts`` returns them.
+    """
+    if not count_reuse_on_replay():
+        return _compute_counts(topk_ids, n_routed_experts, ep_group)
+    # Lazy import keeps this ops module independent of the model package (``xtuner.v1.model``
+    # pulls in every model config); it is imported while the model package is still loading.
+    from xtuner.v1.model.utils.checkpointing import reuse_during_recompute
+
+    return reuse_during_recompute(_compute_counts, topk_ids, n_routed_experts, ep_group)
 
 
 _MAX_FUSED_COUNT_ENTRIES = 256
@@ -425,7 +496,7 @@ def fused_dispatch_mlp_combine(
     with torch.no_grad():
         w1_fwd = w1.transpose(1, 2).contiguous()
         w2_fwd = w2.transpose(1, 2).contiguous()
-    send_counts, recv_counts, group_list = _compute_counts(topk_ids, n_routed_experts, ep_group)
+    send_counts, recv_counts, group_list = _compute_counts_for_call(topk_ids, n_routed_experts, ep_group)
     if recv_tokens_hook is not None:
         recv_tokens_hook(sum(recv_counts))
     e_local = len(group_list)
