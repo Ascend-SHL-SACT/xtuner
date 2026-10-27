@@ -47,6 +47,14 @@ def _ascend_ops() -> SimpleNamespace:
     from liger_kernel.ops.backends._ascend.ops.fused_linear_cross_entropy import get_optimal_block_size
     from liger_kernel.ops.utils import amp_custom_bwd, amp_custom_fwd, get_npu_core_count
 
+    # liger_kernel >= 0.8.5 requires the HAS_TAIL constexpr on the no-weight
+    # backward kernel (masks the ragged last BLOCK_SIZE column chunk, same
+    # semantics as the in-package _plain_ce_need_mask); older builds reject it.
+    _bwd_params = {p.name for p in liger_cross_entropy_backward_kernel_no_weight.params}
+
+    def _has_tail_kwargs(n_cols: int, block_size: int) -> dict:
+        return {"HAS_TAIL": (n_cols % block_size) != 0} if "HAS_TAIL" in _bwd_params else {}
+
     return SimpleNamespace(
         make_ce_stats_buffer=_make_ce_stats_buffer,
         bwd_kernel_no_weight=liger_cross_entropy_backward_kernel_no_weight,
@@ -54,6 +62,7 @@ def _ascend_ops() -> SimpleNamespace:
         get_npu_core_count=get_npu_core_count,
         amp_custom_fwd=amp_custom_fwd,
         amp_custom_bwd=amp_custom_bwd,
+        has_tail_kwargs=_has_tail_kwargs,
     )
 
 
@@ -159,6 +168,7 @@ class NPUFusedLinearCrossEntropyFunction(torch.autograd.Function):
                 reduction=ctx.reduction,
                 BLOCK_SIZE=backward_block_size,
                 HAS_LSE=False,
+                **ops.has_tail_kwargs(v, backward_block_size),
             )
 
             grad_input[start_idx:end_idx] = grad_logits_chunk @ weight
