@@ -39,12 +39,11 @@ default-allocated and only read by the copy stream (``record_stream``) -- the
 reclaimable pattern (allocated on default, read on copy).
 
 Copy-path census: in the current production process this private stream is
-the only live PCIe copy path (muon_swap's stream is not constructed in adamw
-mode; the activation-offload NPU path belongs to a different model and is
-absent here; SP-MLA offload copies on the default stream). Should a second
-copy path be enabled (e.g. activation offload), the streams must be shared --
-exactly one writer per pinned buffer is what keeps the ``d2h_ev`` ordering
-above sound.
+the only live PCIe copy path (the activation-offload NPU path belongs to a
+different model and is absent here; SP-MLA offload copies on the default
+stream). Should a second copy path be enabled (e.g. activation offload), the
+streams must be shared -- exactly one writer per pinned buffer is what keeps
+the ``d2h_ev`` ordering above sound.
 
 Memory notes (verified): max_memory is set by fwd/bwd and is invariant across
 swap knobs (optimizer temps are chunked and fit in freed-activation space).

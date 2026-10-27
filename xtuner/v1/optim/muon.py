@@ -40,7 +40,6 @@ from torch.distributed.tensor.placement_types import Placement, Shard
 from torch.optim.optimizer import Optimizer as TorchOptimizer
 from torch.optim.optimizer import ParamsT
 
-from xtuner.v1.optim import muon_swap
 from xtuner.v1.utils import get_torch_device_module
 from xtuner.v1.utils.dtensor import group_tensors_by_device_mesh_and_placements
 
@@ -418,14 +417,8 @@ class Muon(Optimizer):
         # Keep fresh state empty so DCP can initialize it through its zero-gradient step.
         self._enable_all2all = enable_all2all
         self._remainder_strategy = remainder_strategy
-        # XTUNER_MUON_SWAP=1: keep Muon momentum + AdamW m,v on pinned CPU,
-        # H2D/D2H around the in-place update (see muon_swap / the async updates).
-        self._swap_momentum = muon_swap.is_enabled()
         self._muon_split_sizes = muon_split_sizes or {}
-        # MuonConfig(swap_optimizer=True) and XTUNER_MUON_SWAP=1 are two implementations of the
-        # same pinned-host state swap. XTUNER_MUON_SWAP (the A/B-validated copy-stream path)
-        # wins when both are requested, so the state is never pinned and staged twice.
-        self._swap_optimizer = swap_optimizer and not self._swap_momentum
+        self._swap_optimizer = swap_optimizer
         self.register_state_dict_post_hook(self._remove_clip_grad_policy)
         self.register_load_state_dict_pre_hook(self._restore_clip_grad_policy)
         if self._swap_optimizer:
@@ -528,11 +521,6 @@ class Muon(Optimizer):
         all_tasks = chain(muon_tasks, adamw_tasks)
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
-        # XTUNER_MUON_SWAP=1: step must not return while the last momentum D2H
-        # is still in flight -- host consumers of the pinned-CPU state (e.g.
-        # checkpoint save) have no device-side ordering of their own.
-        if self._swap_momentum:
-            muon_swap.host_sync_d2h()
 
         if self._swap_optimizer:
             # Non-blocking device-to-host copies must finish before checkpointing or the next step.
@@ -548,13 +536,7 @@ class Muon(Optimizer):
             state["momentum"] = torch.zeros_like(param)
             if algo == "adamw":
                 state["variance"] = torch.zeros_like(param)
-            # XTUNER_MUON_SWAP=1: replace the just-created device buffers with
-            # pinned-CPU ones so H2D/D2H can stage them across steps (no-op off).
-            # MuonConfig(swap_optimizer=True) keeps the same residency without the
-            # copy-stream staging; the two are mutually exclusive (see __init__).
-            if self._swap_momentum:
-                muon_swap.init_pinned_state(state, param, algo)
-            elif self._swap_optimizer:
+            if self._swap_optimizer:
                 state["momentum"] = _to_pinned_host(state["momentum"])
                 if algo == "adamw":
                     state["variance"] = _to_pinned_host(state["variance"])
@@ -960,7 +942,6 @@ class Muon(Optimizer):
                 process_group=plan.comm_pg,
                 num_experts=plan.num_experts,
                 global_shard_dim_size=global_shard_dim_size,
-                swap_momentum=self._swap_momentum,
                 M_host=host_momentums,
             )
         )
@@ -1014,7 +995,6 @@ class Muon(Optimizer):
                     weight_decay=weight_decay,
                     step=step,
                     epsilon=epsilon,
-                    swap_momentum=self._swap_momentum,
                     M_host=host_momentums,
                     V_host=host_variances,
                 )
@@ -1038,7 +1018,6 @@ def muon_update_batch_async(
     process_group: ProcessGroup | None = None,  # Unified process group for communication
     num_experts: int = 1,  # Number of experts for MoE models
     batch_size: int | None = None,  # If set, pad X/G/M to this size with zeros
-    swap_momentum: bool = False,  # H2D/D2H momentum (kept on pinned CPU)
     global_shard_dim_size: int | None = None,  # FSDP-visible shard dim; required for "agrs"/"all_to_all"
     M_host: list[Tensor] | None = None,  # Authoritative pinned host momentum when swapping
 ) -> Generator[None, None, None]:
@@ -1070,13 +1049,6 @@ def muon_update_batch_async(
     else:
         assert len(X) == world_size
 
-    # Muon momentum is kept on pinned CPU; H2D to a fresh device temp for the
-    # in-place momentum update, then D2H back before the device temp is freed.
-    M_cpu = None
-    if swap_momentum:
-        M_cpu = M
-        M = muon_swap.h2d_momentum(M, device=G[0].device)
-
     # Update momentum and compute the inputs for orthogonalization
     U = muon_update_pre_orthogonalize(
         G=maybe_to_local(G),
@@ -1088,10 +1060,6 @@ def muon_update_batch_async(
         # Orthogonalization only reads U; copy momentum back while communication runs.
         for host, updated in zip(M_host, maybe_to_local(M)):
             host.copy_(updated, non_blocking=True)
-
-    if swap_momentum:
-        assert M_cpu is not None
-        muon_swap.d2h_momentum(M, M_cpu)
 
     # Orthogonalize — dispatch to the appropriate communication strategy
     if comm_strategy == "agrs":
@@ -1681,19 +1649,10 @@ def adamw_update_foreach_async(
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     step: int,
     epsilon: float,
-    swap_momentum: bool = False,  # H2D/D2H AdamW m,v (kept on pinned CPU)
     M_host: list[Tensor] | None = None,  # Authoritative pinned host m when swapping
     V_host: list[Tensor] | None = None,  # Authoritative pinned host v when swapping
 ) -> Generator[None, None, None]:
     """Async wrapper around foreach AdamW update."""
-    # AdamW m,v are kept on pinned CPU; H2D to device temps for the in-place
-    # update, then D2H back before the device temps are freed.
-    M_cpu = V_cpu = None
-    if swap_momentum:
-        M_cpu, V_cpu = M, V
-        dev = G[0].device
-        M = muon_swap.h2d_momentum(M, device=dev)
-        V = muon_swap.h2d_momentum(V, device=dev)
     adamw_update_foreach(
         X,
         G,
@@ -1712,10 +1671,6 @@ def adamw_update_foreach_async(
     if V_host is not None:
         for host, updated in zip(V_host, V):
             host.copy_(updated, non_blocking=True)
-    if swap_momentum:
-        assert M_cpu is not None and V_cpu is not None
-        muon_swap.d2h_momentum(M, M_cpu)
-        muon_swap.d2h_momentum(V, V_cpu)
     yield
 
 
