@@ -49,6 +49,7 @@ from xtuner.v1.module.rope import RopeParametersConfig, RopeScalingConfig
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module, log_rank0, profile_time_and_memory
 from xtuner.v1.utils.compile import MaybeCompile, is_compiled_function, maybe_compile
 from xtuner.v1.utils.cpu_merge import cpu_merge_enabled, unshard_tensors_for_hf_save_with_cpu_merge
+from xtuner.v1.utils.fsdp_grad_offload import install_fsdp_grad_offload
 from xtuner.v1.utils.load_spec import (
     HFSavePlan,
     LoadSpec,
@@ -750,6 +751,8 @@ class BaseModel(nn.Module):
             offload_policy=offload_policy,
             ignored_params=ignored_params if ignored_params else None,
         )
+        if offload_policy is None:
+            install_fsdp_grad_offload(target)
 
     def save_hf(self, hf_dir: Path | str, save_dtype: torch.dtype = torch.bfloat16, safetensors_prefix: str = "model"):
         # Save may be called without `fully_shard`; refresh from the current runtime layout.

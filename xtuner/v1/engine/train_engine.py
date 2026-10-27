@@ -51,6 +51,7 @@ from xtuner.v1.utils import (
     profile_time_and_memory,
 )
 from xtuner.v1.utils.activation_offload import OffloadManager
+from xtuner.v1.utils.fsdp_grad_offload import begin_grad_offload_step, note_grad_offload_backward, restore_grad_offload
 from xtuner.v1.utils.grad_norm import cal_grad_norm
 
 
@@ -230,6 +231,7 @@ class TrainEngine:
         # update), so it costs no wall-clock time. Clearing here also covers the
         # abort/OOM paths of the previous step without a mid-step blocking sync.
         OffloadManager().clear_step()
+        begin_grad_offload_step()
 
         data_batch_info = self.model.pre_micro_batch_forward(data_batches)
         total_loss = torch.tensor(0.0, device=DEVICE)
@@ -255,6 +257,7 @@ class TrainEngine:
             micro_batch_results.append(output)
 
             loss = self._get_total_loss(output)
+            note_grad_offload_backward()
             loss.backward()
             # Logging must not retain checkpoint contexts from completed backwards.
             # Detaching here leaves accumulated parameter gradients untouched.
@@ -283,6 +286,7 @@ class TrainEngine:
 
     @_no_grad
     def clip_grad_norm(self, do_clip: bool = True, dtype=torch.float32):
+        restore_grad_offload()
         ProberList.before_clip_grad_norm(self.model)
         self.model.scale_and_reduce_grad()
 
