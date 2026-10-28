@@ -843,3 +843,103 @@ class TestKpoolBatchedSelInt32:
         inplace = [dt for name, dt in spy.calls if "masked_fill_" in name]
         assert inplace, "the expand chain must run its in-place masked_fill_ at least once"
         assert inplace == [torch.int32], spy.calls
+
+
+class TestKpoolBatchedScoreRowChunk:
+    """行分块（``XTUNER_KPOOL_SCORE_ROW_CHUNK`` / ``row_chunk``）与整段布局的等价回归。
+
+    512K 单文档 pack 在 SP=32 下，整段布局一次调用要 ``[S_local, W]`` fp32 分数 + bool 可见性 +
+    batched topk workspace ≈ 17 GB（job-dyb-q35-xtuner-09 第 1 步 backward 重算期设备 OOM 的崩点）。
+    行分块把每次调用的瞬态钉在 ~``row_chunk x W``：per-row 分数与 per-row topk 与其他行无关，返回
+    id 必须与整段布局逐位相同（可见池不足 ``select_k`` 的行，其 pad 列在两种布局里都属实现定义集合，
+    调用方 ``sel < row_prefix`` 统一掩回 -1）。
+    """
+
+    def test_parse_row_chunk(self) -> None:
+        """``_parse_row_chunk``：正数透传、<=0 归零（整段布局）、非法串报 ValueError。"""
+        parse = kpool_npu._parse_row_chunk
+        assert parse("2048") == 2048
+        assert parse("1") == 1
+        assert parse("0") == 0
+        assert parse("-5") == 0
+        with pytest.raises(ValueError, match="not a valid int"):
+            parse("abc")
+        with pytest.raises(ValueError, match="XTUNER_KPOOL_SCORE_ROW_CHUNK"):
+            parse("2o48")
+
+    @_requires_accelerator
+    @_requires_fused_indexer
+    @pytest.mark.gpu
+    @pytest.mark.parametrize(
+        ("doc_lens", "tie_stress", "index_topk"),
+        [
+            ([4096], False, 64),
+            ([700, 1300, 2096], False, 64),
+            ([700, 1300, 2096], True, 64),
+            ([4096], False, 2048),
+        ],
+        ids=["single-doc", "multi-doc", "multi-doc-tie", "single-doc-k512"],
+    )
+    def test_row_chunk_bitwise_matches_whole_shard(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        batched_spy: list[bool],
+        doc_lens: list[int],
+        tie_stress: bool,
+        index_topk: int,
+    ) -> None:
+        """legacy / 整段（row_chunk=0）/ 行分块（row_chunk=512）三方输出逐位一致。
+
+        块边界既落在单文档内部（[4096]），也跨文档缝（[700, 1300, 2096]）；三值 q/k 版本制造大量
+        精确 fp32 平分，压 topk 平局裁决在两种布局间必须一致。
+        """
+        ctx = _make_ctx(doc_lens)
+        inputs = _make_inputs(doc_lens, seed=41, tie_stress=tie_stress)
+        legacy = _run_topk(monkeypatch, inputs, ctx, batched=False, index_topk=index_topk)
+        assert batched_spy == [], "legacy run must not dispatch the batched scorer"
+        monkeypatch.setattr(kpool_npu, "_SCORE_ROW_CHUNK", 0)
+        whole = _run_topk(monkeypatch, inputs, ctx, batched=True, index_topk=index_topk)
+        monkeypatch.setattr(kpool_npu, "_SCORE_ROW_CHUNK", 512)
+        chunked = _run_topk(monkeypatch, inputs, ctx, batched=True, index_topk=index_topk)
+        assert batched_spy == [True, True], batched_spy
+        assert chunked.dtype == torch.int32 and chunked.shape == legacy.shape
+        assert torch.equal(legacy, whole)
+        assert torch.equal(whole, chunked)
+
+    @_requires_accelerator
+    @_requires_fused_indexer
+    @pytest.mark.gpu
+    @pytest.mark.parametrize("row_chunk", [4096, 8192], ids=["eq-seq-len", "gt-seq-len"])
+    def test_row_chunk_at_or_above_seq_len_takes_whole_shard(
+        self, monkeypatch: pytest.MonkeyPatch, batched_spy: list[bool], row_chunk: int
+    ) -> None:
+        """``row_chunk >= S`` 回落整段布局，输出与 ``row_chunk=0`` 逐位相同。"""
+        doc_lens = [4096]
+        ctx = _make_ctx(doc_lens)
+        inputs = _make_inputs(doc_lens, seed=43)
+        monkeypatch.setattr(kpool_npu, "_SCORE_ROW_CHUNK", 0)
+        whole = _run_topk(monkeypatch, inputs, ctx, batched=True)
+        monkeypatch.setattr(kpool_npu, "_SCORE_ROW_CHUNK", row_chunk)
+        fallen = _run_topk(monkeypatch, inputs, ctx, batched=True)
+        assert batched_spy == [True, True], batched_spy
+        assert torch.equal(whole, fallen)
+
+    @_requires_accelerator
+    @_requires_fused_indexer
+    @pytest.mark.gpu
+    def test_call_site_forwards_row_chunk(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """调用点把 ``_SCORE_ROW_CHUNK`` 作为 ``row_chunk`` 关键字传进批量打分函数。"""
+        seen: list[int | None] = []
+        real = kpool_npu._score_and_topk_batched
+
+        def _spy(*args: Any, **kwargs: Any) -> Tensor:
+            seen.append(kwargs.get("row_chunk"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(kpool_npu, "_score_and_topk_batched", _spy)
+        doc_lens = [4096]
+        ctx = _make_ctx(doc_lens)
+        inputs = _make_inputs(doc_lens, seed=47)
+        monkeypatch.setattr(kpool_npu, "_SCORE_ROW_CHUNK", 1024)
+        _run_topk(monkeypatch, inputs, ctx, batched=True)
+        assert seen == [1024], "the call site must forward _SCORE_ROW_CHUNK as the row_chunk kwarg"

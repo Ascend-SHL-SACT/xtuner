@@ -75,6 +75,47 @@ __all__ = ["npu_kpool_topk_indices"]
 # chain. Setting it to ``0`` restores the legacy per-segment path bit for bit.
 _BATCHED_SCORE = os.environ.get("XTUNER_GLM53_KPOOL_BATCHED_SCORE", "1") == "1"
 
+
+def _parse_row_chunk(raw: str) -> int:
+    """Parse ``XTUNER_KPOOL_SCORE_ROW_CHUNK``; ``<= 0`` selects the whole-shard layout.
+
+    Args:
+        raw (str): Raw environment value.
+
+    Returns:
+        int: Positive row-chunk bound, or ``0`` for the whole-shard layout.
+    """
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"XTUNER_KPOOL_SCORE_ROW_CHUNK={raw!r} is not a valid int") from exc
+    return value if value > 0 else 0
+
+
+# Row-chunk bound for the batched scoring path. The whole-call ``[S, W]`` fp32 score buffer,
+# the bool visibility buffer and the batched ``topk`` workspace all scale with ``S_local x W``
+# (``W`` = the largest document's pool count): a ~512K pack of two ~262K documents at SP=32
+# holds a [16384, 65792] buffer pair (~5.0 GiB) plus a ~2.2 GiB ``topk`` workspace in ONE call
+# (measured on 910C), which device-OOMs against ~53 GiB of resident state (job
+# dyb-q35-xtuner-09, step-1 backward replay, 3.30 GiB free). Chunking the query rows caps
+# every per-call transient at ``row_chunk x W`` independent of the shard length, pack length
+# and balance redistribution (measured ~0.45 GiB at the ``row_chunk=1024`` default, 16x down
+# from the whole-shard layout); per-row
+# scores and topk are unchanged, so the caller-visible output is identical -- rows with fewer
+# visible pools than ``select_k`` pick pad columns from an implementation-defined set in both
+# layouts, and the caller's ``sel < row_prefix`` test masks them to ``-1`` either way.
+# Chunking also lifts the fused score kernel's launch-grid cap (triton-ascend rejects
+# ``coreDim = row-tiles x pool-tiles > 65535``, which bounds the whole-shard layout at
+# ~262K-token documents for a 16K-row segment): a chunk launch carries ``row_chunk / 64`` row
+# tiles, extending the ceiling to ~4M-token documents at ``row_chunk=1024``. ``0`` restores
+# the whole-shard single-topk layout bit for bit.
+#
+# The default 1024 also keeps the per-call transient small enough that the step-1 backward
+# watermark leaves room for HCCL's lazily grown per-communicator buffer pools at SP=32 x 512K
+# (job dyb-q35-xtuner-12): every GiB shaved off the peak widens the free window the clip-time
+# collectives allocate from.
+_SCORE_ROW_CHUNK = _parse_row_chunk(os.environ.get("XTUNER_KPOOL_SCORE_ROW_CHUNK", "1024"))
+
 # SP work-balancing overrides for the indexer scorer (see ``npu_kpool_topk_indices``). The
 # launch scripts export both; unset keeps the caller's config values untouched.
 _ENV_BALANCE_SP: bool | None = (
@@ -257,7 +298,15 @@ def npu_kpool_topk_indices(
                 # Do not tighten this to a per-document minimum -- mixed packs would lose the
                 # batched path for no correctness gain.
                 sel_all = _score_and_topk_batched(
-                    q_local, pool_key, w_all_f, ranges, row_prefix, prefix_host, select_k, index_head_dim
+                    q_local,
+                    pool_key,
+                    w_all_f,
+                    ranges,
+                    row_prefix,
+                    prefix_host,
+                    select_k,
+                    index_head_dim,
+                    row_chunk=_SCORE_ROW_CHUNK,
                 ).to(torch.int32)
                 # ``topk`` hands back int64 ids; left as int64 they poison the shared expand
                 # below -- ``tok`` becomes a 2.1 GB int64 buffer and ``masked_fill_`` (no
@@ -501,6 +550,7 @@ def _score_and_topk_batched(
     prefix_host: list[int],
     select_k: int,
     index_head_dim: int,
+    row_chunk: int = 0,
 ) -> Tensor:
     """Score every document segment with one kernel launch each, then topk the shard once.
 
@@ -532,6 +582,15 @@ def _score_and_topk_batched(
         select_k (int): Slot width (``index_topk // index_kpool``); must not exceed the largest
             segment's pool count so the batched topk width matches the legacy slot buffer.
         index_head_dim (int): Indexer head dimension (scale only).
+        row_chunk (int): Query-row chunk bound; ``0`` (default) keeps the whole-shard layout.
+            A positive bound below ``S`` sizes the score/visibility buffers and the ``topk``
+            workspace to ``row_chunk`` rows instead of the whole shard, capping the call's
+            transients at ~``row_chunk x width`` independent of shard length, pack length and
+            balance redistribution. Per-row scores and per-row ``topk`` do not depend on other
+            rows, so the returned ids carry the same content the whole-shard layout produces;
+            rows with fewer visible pools than ``select_k`` pick pad columns from an
+            implementation-defined set in either layout, which the caller's ``sel < row_prefix``
+            test masks to ``-1``.
 
     Returns:
         Tensor: ``[S, min(select_k, max_pools)]`` int64 document-local pool ids, sorted by
@@ -543,6 +602,52 @@ def _score_and_topk_batched(
         raise RuntimeError("batched kpool scoring requires the fused lightning indexer kernel")
     max_pools = max(r[3] - r[2] for r in ranges)
     width = max_pools + _MAX_BLOCK_P
+    k = min(select_k, max_pools)
+    # One tail pad for the whole-call key buffer: every segment launches with its pool axis
+    # padded to whole tiles, and the kernel's pool-axis boundary_check does not reliably clamp
+    # the MTE read (see lightning_indexer_score.forward), so the last segment must have real
+    # rows to read into. Padded keys are zero; their columns are invalid per the mask above.
+    pool_key_pad = torch.nn.functional.pad(pool_key, (0, 0, 0, _MAX_BLOCK_P - 1))
+    scale = index_head_dim**-0.5
+    if 0 < row_chunk < seq_len:
+        # Chunked layout: two [row_chunk, width] buffers plus a topk workspace proportional to
+        # row_chunk, allocated once and reused per chunk, so per-call transients stay at
+        # ~row_chunk x width regardless of S_local, pack length and balance redistribution
+        # (the whole-shard layout below peaks at S_local x width plus its topk workspace). Row
+        # content is identical to the whole-shard layout: a row's scores depend only on that
+        # row, the chunked launch extent is clamped on the overlap's last row and columns past
+        # it are causally invisible to every overlap row (they keep the finfo.min prefill in
+        # both layouts), and topk reduces along the last dim independently per row.
+        finfo_min = float(torch.finfo(torch.float32).min)
+        topk_ids = torch.empty((seq_len, k), dtype=torch.int64, device=device)
+        scores_buf = torch.empty((row_chunk, width), dtype=torch.float32, device=device)
+        visible_buf = torch.empty((row_chunk, width), dtype=torch.bool, device=device)
+        arange_p = torch.arange(width, device=device)
+        for c_lo in range(0, seq_len, row_chunk):
+            c_hi = min(c_lo + row_chunk, seq_len)
+            scores = scores_buf[: c_hi - c_lo]
+            scores.fill_(finfo_min)
+            visible = visible_buf[: c_hi - c_lo]
+            torch.lt(arange_p.unsqueeze(0), row_prefix[c_lo:c_hi].unsqueeze(-1), out=visible)
+            for row_lo, row_hi, pool_lo, pool_hi, _doc_start in ranges:
+                r_lo = max(row_lo, c_lo)
+                r_hi = min(row_hi, c_hi)
+                if r_lo >= r_hi:
+                    continue
+                w = min(pool_hi - pool_lo, -(-prefix_host[r_hi - 1] // _MAX_BLOCK_P) * _MAX_BLOCK_P)
+                if w <= 0:
+                    continue
+                lightning_indexer_score_into(
+                    q_local[r_lo:r_hi],
+                    pool_key_pad[pool_lo:],
+                    w_all_f[r_lo:r_hi],
+                    visible[r_lo - c_lo : r_hi - c_lo, :w],
+                    scores[r_lo - c_lo : r_hi - c_lo, :w],
+                    w,
+                    scale,
+                )
+            topk_ids[c_lo:c_hi] = scores.topk(k, dim=-1).indices
+        return topk_ids
     # Transient memory scales as S_local x (largest-document pools + one tile of slack) for
     # *every* row, not each row's own document size: ~2.2 GB fp32 scores_all + ~0.55 GB bool
     # visible_all per call at 128K/SP=8 (allocator-reused across the 192 calls/step; validated
@@ -559,12 +664,6 @@ def _score_and_topk_batched(
     # row ``r`` iff ``c < row_prefix[r]`` -- columns past a document's real pools are past its
     # rows' prefixes too, i.e. invalid (the legacy path padded the mask with zeros instead).
     visible_all = torch.arange(width, device=device).unsqueeze(0) < row_prefix.unsqueeze(-1)
-    # One tail pad for the whole-call key buffer: every segment launches with its pool axis
-    # padded to whole tiles, and the kernel's pool-axis boundary_check does not reliably clamp
-    # the MTE read (see lightning_indexer_score.forward), so the last segment must have real
-    # rows to read into. Padded keys are zero; their columns are invalid per the mask above.
-    pool_key_pad = torch.nn.functional.pad(pool_key, (0, 0, 0, _MAX_BLOCK_P - 1))
-    scale = index_head_dim**-0.5
     for row_lo, row_hi, pool_lo, pool_hi, _doc_start in ranges:
         # ``row_prefix`` is monotone within a document, so the segment's last row carries the
         # widest visible prefix; rounding it up to a whole tile matches the kernel's
@@ -581,7 +680,7 @@ def _score_and_topk_batched(
             w,
             scale,
         )
-    return scores_all.topk(min(select_k, max_pools), dim=-1).indices
+    return scores_all.topk(k, dim=-1).indices
 
 
 def _score_pools(
