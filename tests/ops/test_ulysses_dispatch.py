@@ -23,6 +23,14 @@ Work-handle API（``ulysses_dispatch``）：
   事件 record 到当前流、comm 流 ``wait_event`` 接住，wrapper work 计数并委托真实句柄，
   fence 后数据逐位等于阻塞参考，且 ``_PENDING_A2A``（outstanding send/recv 缓冲注册表）
   在 fence 后被剪枝为空。
+- eager retire（``_PENDING_A2A`` 生命周期）：fence（``_wait_a2a``）即该集体的释放点——自身
+  entry（含 fence 时仍未 retire、被 ``wait()`` 接管的 work）立刻从注册表摘除，staging
+  send/recv 缓冲随之释放；prune 循环继续兜底清理从未被 fence 的孤儿 entry，失败 work 仍被钉住。
+- 门控关退化（``_a2a_issue`` 门控接线）：``A2A_ASYNC=False`` 时 ``_a2a_issue`` 在调用流上
+  inline 同步跑完 ``all_to_all_single(async_op=False)``（不触碰 comm 流/事件、不注册
+  ``_PENDING_A2A``），issue 返回 ``None`` 句柄、finish 的 ``_wait_a2a(None)`` 为 no-op；
+  deferred 前向与 backward 的反向 a2a 数值均与全局切片语义/手写伴随逐位一致——KDA 延迟
+  原语绕过 ``ulysses_all_to_all``，此接线让异步门对 KDA SP 主路径也是真开关。
 - backward：纯置换的伴随 = 同一 a2a 作用于输出梯度 + 逆 reshape；blocking 与 deferred 两种
   前向形态的 backward 均与手写全伴随逐位一致；backward 内部的反向 a2a 同样走
   issue -> ``_wait_a2a``（每个已发 work 都被 ``is_completed()`` 轮询）；dim2 的伴随 ==
@@ -32,18 +40,18 @@ Work-handle API（``ulysses_dispatch``）：
 
 异步门控分发（``all_to_all.ulysses_all_to_all``）：
 
-- 路由（``TestDispatchRouting``）：门控 env ``XTUNER_KDA_SP_A2A_ASYNC`` 在**每次调用时**读取。
-  未开启（unset / "0" / "" / "junk"）或调用形态不匹配（batch > 1、scatter_dim != 1、
-  gather_dim != 2）一律转发同步 functional-collectives 实现；env == "1" 且 batch-1 + (1, 2)
-  时改调 ``ulysses_scatter_heads_blocking(input, mesh.get_group())``。用例以 monkeypatch
-  的记录器断言「走了哪条路」，不触达真实通信（``_MeshStub`` 的 ``size() == 1`` 让同步路径的
-  movedim/tensor_split/cat 退化为输入的连续副本）。
-- 值契约 world==1（``TestDispatchValueWorldOne``）：主进程内 1-rank gloo 组，env 关（同步
-  functional collectives 路径）与 env 开（async 的 world==1 早退）都逐位返回输入值。
+- 路由（``TestDispatchRouting``）：门控 ``A2A_ASYNC`` 于 import 时一次读取（env
+  ``XTUNER_KDA_SP_A2A_ASYNC``；进程内翻转经模块属性 patch）。门控关闭或调用形态不匹配
+  （batch > 1、scatter_dim != 1、gather_dim != 2）一律转发同步 functional-collectives 实现；
+  门控开启且 batch-1 + (1, 2) 时改调 ``ulysses_scatter_heads_blocking(input,
+  mesh.get_group())``。用例以 monkeypatch 的记录器断言「走了哪条路」，不触达真实通信
+  （``_MeshStub`` 的 ``size() == 1`` 让同步路径的 movedim/tensor_split/cat 退化为输入的连续副本）。
+- 值契约 world==1（``TestDispatchValueWorldOne``）：主进程内 1-rank gloo 组，门控关（同步
+  functional collectives 路径）与门控开（async 的 world==1 早退）都逐位返回输入值。
 - 值契约 2-rank（``TestDispatchValueTwoRank``）：沿用 spawn harness，各 rank 以同一 seed
-  构造同一全局张量 ``G`` 后按序列切片作本地输入，断言 dispatch(env on) 与 dispatch(env off)
+  构造同一全局张量 ``G`` 后按序列切片作本地输入，断言 dispatch(门控开) 与 dispatch(门控关)
   逐位一致，且都等于全局切片语义 ``out[0, h, s] == G[0, rank*(A/sp)+h, s]``（3-D beta 形状
-  同断言），并核实 env 开的 batch-1 (1, 2) 调用确实经由真实的 ``ulysses_scatter_heads_blocking``。
+  同断言），并核实门控开的 batch-1 (1, 2) 调用确实经由真实的 ``ulysses_scatter_heads_blocking``。
 - 接线（``TestKdaImportWiring``）：``kda.py`` import 的 ``ulysses_all_to_all`` 来自
   ``all_to_all``；本 box 无 ``fla``，kda **模块本身**可 import（构造 KDA 模块才抛
   ImportError，用例不构造）。
@@ -75,6 +83,13 @@ TestUlyssesBackward
         伴随（reshape -> permute -> a2a -> reshape）；反向 a2a 的 work 被 fence 轮询。
     test_dim2_backward_matches_hand_adjoint: dim2 backward 等于手写全伴随，且等于 dim1
         movement 作用于输出梯度（互逆结构的交叉验证）。
+TestEagerRetire
+    test_fenced_entry_dropped_immediately_and_env_off_lags: eager retire（默认开）下 fence
+        后自身 entry 立即摘除（含 unretired work 被 ``wait()`` 接管的情形）、staging 缓冲随
+        entry 释放；env 关时 entry 滞留至 retire 后由 prune 循环清理（原行为）；真 async
+        work 集成：issue 后注册表恰一条，fence 后为空且数据 == 阻塞参考。
+    test_failed_work_pinned_across_env: 失败 work（wait() raise 与 completed-but-failed 两
+        形态）异常传播且 entry 钉住（eager retire 开/关同样钉），摘除提前到 wait 前即翻红。
 TestUlyssesWorldOne
     test_world_one_returns_input_unchanged: blocking 原样返回输入对象；issue/finish 数值
         恒等、work 为 ``None`` 且 out_shape == 输入形状。
@@ -86,7 +101,7 @@ TestUlyssesFinishGlue
         与 recv 元素数不符时抛 RuntimeError。
 """
 
-import os
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
@@ -105,9 +120,6 @@ from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
 _HEADS = 8
 _SEQ = 16
 _HDIM = 6
-
-# 被测门控 env 的文档化名称（按文档契约断言，而非引用实现内的常量）。
-_ENV = "XTUNER_KDA_SP_A2A_ASYNC"
 
 # 真实（未被 stub 的）``_a2a_issue``：真 async 用例在 worker 内包一层计数 wrapper 复用它。
 _REAL_A2A_ISSUE = ulysses_dispatch._a2a_issue
@@ -453,8 +465,8 @@ def _case_backward_dim2(rank: int, world: int) -> None:
     assert all(w.is_completed_calls >= 1 for w in _issued_works), "反向 a2a work 未被 fence 轮询"
 
 
-def _case_env_on_matches_env_off(rank: int, world: int) -> None:
-    """dispatch(env on) == dispatch(env off) == 全局切片语义（4-D 与 3-D beta 形状）。"""
+def _case_gate_on_matches_gate_off(rank: int, world: int) -> None:
+    """dispatch(门控开) == dispatch(门控关) == 全局切片语义（4-D 与 3-D beta 形状）。"""
     mesh, _ = _mesh_and_group(world)
     a_loc, s_loc = _HEADS // world, _SEQ // world
 
@@ -464,8 +476,8 @@ def _case_env_on_matches_env_off(rank: int, world: int) -> None:
     local4 = g4[:, :, rank * s_loc : (rank + 1) * s_loc, :].contiguous()
     local3 = g3[:, :, rank * s_loc : (rank + 1) * s_loc].contiguous()
 
-    # 核实 env 开的 batch-1 (1, 2) 调用确实经由真实的 ulysses_scatter_heads_blocking。
-    # spy 挂在 all_to_all 命名空间上：gate 读的是它 import 时拷贝的那份绑定。
+    # 核实门控开的 batch-1 (1, 2) 调用确实经由真实的 ulysses_scatter_heads_blocking。
+    # spy 挂在 all_to_all 命名空间上：路由在调用时经 all_to_all 的模块全局解析该名字。
     real_blocking = ulysses_dispatch.ulysses_scatter_heads_blocking
     seen: list[int] = []
 
@@ -475,30 +487,147 @@ def _case_env_on_matches_env_off(rank: int, world: int) -> None:
 
     all_to_all.ulysses_scatter_heads_blocking = _spy  # type: ignore[assignment]
 
-    os.environ[_ENV] = "1"
-    on4 = all_to_all.ulysses_all_to_all(local4, scatter_dim=1, gather_dim=2, mesh=mesh)
-    on3 = all_to_all.ulysses_all_to_all(local3, scatter_dim=1, gather_dim=2, mesh=mesh)
-    os.environ[_ENV] = "0"
-    off4 = all_to_all.ulysses_all_to_all(local4, scatter_dim=1, gather_dim=2, mesh=mesh)
-    off3 = all_to_all.ulysses_all_to_all(local3, scatter_dim=1, gather_dim=2, mesh=mesh)
-    os.environ.pop(_ENV, None)
-    # 非匹配形态（batch > 1 / 其他维度）env 开时的回退只做路由级验证（TestDispatchRouting）：
+    # 门控 env 于 import 时一次读取；进程内翻转经模块属性（spawn 子进程随用例退出，无需还原）。
+    old_gate = ulysses_dispatch.A2A_ASYNC
+    try:
+        ulysses_dispatch.A2A_ASYNC = True
+        on4 = all_to_all.ulysses_all_to_all(local4, scatter_dim=1, gather_dim=2, mesh=mesh)
+        on3 = all_to_all.ulysses_all_to_all(local3, scatter_dim=1, gather_dim=2, mesh=mesh)
+        ulysses_dispatch.A2A_ASYNC = False
+        off4 = all_to_all.ulysses_all_to_all(local4, scatter_dim=1, gather_dim=2, mesh=mesh)
+        off3 = all_to_all.ulysses_all_to_all(local3, scatter_dim=1, gather_dim=2, mesh=mesh)
+    finally:
+        ulysses_dispatch.A2A_ASYNC = old_gate
+    # 非匹配形态（batch > 1 / 其他维度）门控开时的回退只做路由级验证（TestDispatchRouting）：
     # batch-2 的值级回退检查不可行——同步助手 ulysses_all_to_all(x, scatter_dim=1) 在 B>1 时
     # movedim 后的 send buffer 非连续，c10d functional op 直接抛 "Expected input.is_contiguous()"
     # （预先存在的助手限制，与分发逻辑无关；KDA 调用点恒为 batch-1，不受影响）。
 
     expected4 = g4[:, rank * a_loc : (rank + 1) * a_loc, :, :]
     expected3 = g3[:, rank * a_loc : (rank + 1) * a_loc, :]
-    assert seen == [world, world], "env 开的 batch-1 (1,2) 调用未走 ulysses_scatter_heads_blocking"
+    assert seen == [world, world], "门控开的 batch-1 (1,2) 调用未走 ulysses_scatter_heads_blocking"
     assert on4.shape == expected4.shape and off4.shape == expected4.shape, (on4.shape, off4.shape)
     assert on3.shape == expected3.shape and off3.shape == expected3.shape, (on3.shape, off3.shape)
-    assert torch.equal(on4, off4), "dispatch(env on) 与 dispatch(env off) 不逐位一致 (4-D)"
-    assert torch.equal(on3, off3), "dispatch(env on) 与 dispatch(env off) 不逐位一致 (3-D)"
-    assert torch.equal(on4, expected4), "dispatch(env on) 违背全局切片语义 (4-D)"
-    assert torch.equal(off4, expected4), "dispatch(env off) 违背全局切片语义 (4-D)"
-    assert torch.equal(on3, expected3), "dispatch(env on) 违背全局切片语义 (3-D)"
-    assert torch.equal(off3, expected3), "dispatch(env off) 违背全局切片语义 (3-D)"
+    assert torch.equal(on4, off4), "dispatch(门控开) 与 dispatch(门控关) 不逐位一致 (4-D)"
+    assert torch.equal(on3, off3), "dispatch(门控开) 与 dispatch(门控关) 不逐位一致 (3-D)"
+    assert torch.equal(on4, expected4), "dispatch(门控开) 违背全局切片语义 (4-D)"
+    assert torch.equal(off4, expected4), "dispatch(门控关) 违背全局切片语义 (4-D)"
+    assert torch.equal(on3, expected3), "dispatch(门控开) 违背全局切片语义 (3-D)"
+    assert torch.equal(off3, expected3), "dispatch(门控关) 违背全局切片语义 (3-D)"
     assert on4.is_contiguous() and on3.is_contiguous(), "async 路径输出应连续"
+
+
+def _case_eager_retire(rank: int, world: int) -> None:
+    """eager retire 契约：fence 后立即摘除自身 entry（unretired work 也摘）。
+
+    单元级（``_CpuWork`` + 手工 entry，不依赖 gloo 完成时序）断言：fence 即摘
+    （``wait()`` 接管的 unretired work）、摘除后 staging 缓冲随 entry 释放。再以真 async
+    work（``_REAL_A2A_ISSUE`` 直发，注册表与 fence 持同一句柄）集成验证 issue 后注册表
+    恰一条、fence 后为空且数据 == 阻塞参考。
+    """
+    _, group = _mesh_and_group(world)
+
+    # -- fence 即摘：unretired work 被 wait() 恰一次，entry 立即消失 --
+    work = _CpuWork(completed=False)
+    send, recv = torch.empty(4, 4), torch.empty(4, 4)
+    send_ref, recv_ref = weakref.ref(send), weakref.ref(recv)
+    ulysses_dispatch._PENDING_A2A.append((work, send, recv))
+    del send, recv
+    ulysses_dispatch._wait_a2a(work)
+    assert work.wait_calls == 1, "fence 未 wait() 未 retire 的 work"
+    assert not ulysses_dispatch._PENDING_A2A, "eager retire 未在 fence 后摘除自身 entry"
+    assert send_ref() is None and recv_ref() is None, "fence 后 staging 缓冲应随 entry 释放"
+
+    # -- 集成级（真 async work）：issue 后注册表恰一条，fence 后为空且数据 == 阻塞参考 --
+    a_loc, s_loc = _HEADS // world, _SEQ // world
+    torch.manual_seed(31)
+    g4 = torch.randn(1, _HEADS, _SEQ, _HDIM)
+    local = g4[:, :, rank * s_loc : (rank + 1) * s_loc, :].contiguous()
+    send4 = local.reshape(world, a_loc, s_loc, _HDIM).contiguous()
+    ref_recv = torch.empty_like(send4)
+    dist.all_to_all_single(ref_recv, send4, group=group)
+    recv_raw, work_raw = _REAL_A2A_ISSUE(send4, group)
+    assert len(ulysses_dispatch._PENDING_A2A) == 1, "issue 后注册表应恰一条 entry"
+    ulysses_dispatch._wait_a2a(work_raw)
+    assert not ulysses_dispatch._PENDING_A2A, "真 async work 的 fence 未摘除自身 entry"
+    assert torch.equal(ref_recv, recv_raw), "eager retire 路径数据 != 阻塞参考"
+
+
+def _case_failed_work_pinned(rank: int, world: int) -> None:
+    """失败 work 钉住契约：wait() raise 与 completed-but-failed 两形态都不得摘 entry。
+
+    eager-retire 的摘除在 ``wait()`` 之后（fence 即释放点的前提），故 ``wait()`` 抛出的
+    失败必须让异常传播且 entry 钉在注册表里（comm 流可能仍在触碰其缓冲）。若有人把摘除
+    提前到 wait 之前（如 try/finally 包住 wait），本用例即翻红。
+    """
+    _, group = _mesh_and_group(world)
+
+    class _FailingWork(_CpuWork):
+        def is_success(self) -> bool:
+            return False
+
+        def wait(self) -> None:
+            super().wait()
+            raise RuntimeError("hccl backend failure")
+
+    # 形态一：未 completed，fence 走 wait() raise。
+    work = _FailingWork(completed=False)
+    entry = (work, torch.empty(4, 4), torch.empty(4, 4))
+    ulysses_dispatch._PENDING_A2A.append(entry)
+    with pytest.raises(RuntimeError):
+        ulysses_dispatch._wait_a2a(work)
+    assert ulysses_dispatch._PENDING_A2A == [entry], "wait() raise 的失败 entry 被误摘"
+
+    # 形态二：completed-but-failed（is_success()=False → 未 retire → 仍走 wait() raise）。
+    work2 = _FailingWork(completed=True)
+    entry2 = (work2, torch.empty(4, 4), torch.empty(4, 4))
+    ulysses_dispatch._PENDING_A2A.append(entry2)
+    with pytest.raises(RuntimeError):
+        ulysses_dispatch._wait_a2a(work2)
+    assert ulysses_dispatch._PENDING_A2A == [entry, entry2], "completed-but-failed entry 被误摘"
+
+
+def _case_gate_off_sync_issue(rank: int, world: int) -> None:
+    """门控关：``_a2a_issue`` 退化为调用流上的 inline 同步 a2a。
+
+    KDA 延迟原语（``issue_ulysses_dim1``/``finish_ulysses_dim1``）绕过
+    ``all_to_all.ulysses_all_to_all``，本用例断言门关时：issue 返回 ``None`` 句柄、不触碰
+    comm 流/事件、不注册 ``_PENDING_A2A``，前向与 backward 的反向 a2a 数值仍与全局切片
+    语义/手写伴随逐位一致（异步门对 KDA SP 主路径是真开关）。
+    """
+    _, group = _mesh_and_group(world)
+    a_loc, s_loc = _HEADS // world, _SEQ // world
+
+    torch.manual_seed(37)
+    g4 = torch.randn(1, _HEADS, _SEQ, _HDIM)
+    local = g4[:, :, rank * s_loc : (rank + 1) * s_loc, :].contiguous()
+    expected = g4[:, rank * a_loc : (rank + 1) * a_loc, :, :]
+
+    old_gate = ulysses_dispatch.A2A_ASYNC
+    try:
+        ulysses_dispatch.A2A_ASYNC = False
+        recv, work, out_shape = ulysses_dispatch.issue_ulysses_dim1(local, group)
+        assert out_shape == torch.Size((1, a_loc, _SEQ, _HDIM)), out_shape
+        assert work is None, "门控关时 issue 必须同步跑完并返回 None 句柄"
+        assert not ulysses_dispatch._PENDING_A2A, "门控关时不应注册 _PENDING_A2A"
+        assert not _waited_events and not _recorded_events, "门控关时不应触碰 comm 流/事件"
+        fin = ulysses_dispatch.finish_ulysses_dim1(recv, work, out_shape)
+        assert torch.equal(expected, fin), "门控关的 deferred 前向 != 全局切片语义"
+
+        # backward 的反向 a2a 同走 _a2a_issue：门控关下同步退化且梯度 == 手写全伴随。
+        xd = local.detach().clone().requires_grad_(True)
+        go = torch.randn(1, a_loc, _SEQ, _HDIM)
+        recv2, work2, out_shape2 = ulysses_dispatch.issue_ulysses_dim1(xd, group)
+        assert work2 is None, "门控关时第二次 issue 也必须同步"
+        y = ulysses_dispatch.finish_ulysses_dim1(recv2, work2, out_shape2)
+        (grad,) = torch.autograd.grad((y * go).sum(), (xd,))
+        gr = go.reshape(a_loc, world, s_loc, _HDIM).permute(1, 0, 2, 3).contiguous()
+        gx = torch.empty_like(gr)
+        dist.all_to_all_single(gx, gr, group=group)
+        expected_grad = gx.reshape(1, world * a_loc, s_loc, _HDIM)
+        assert torch.equal(expected_grad, grad), "门控关 backward != 手写伴随"
+    finally:
+        ulysses_dispatch.A2A_ASYNC = old_gate
 
 
 _CASES: dict[str, Callable[[int, int], None]] = {
@@ -508,12 +637,26 @@ _CASES: dict[str, Callable[[int, int], None]] = {
     "dim2_forward": _case_dim2_forward,
     "backward_dim1": _case_backward_dim1,
     "backward_dim2": _case_backward_dim2,
-    "env_on_matches_env_off": _case_env_on_matches_env_off,
+    "gate_on_matches_gate_off": _case_gate_on_matches_gate_off,
+    "eager_retire": _case_eager_retire,
+    "failed_work_pinned": _case_failed_work_pinned,
+    "gate_off_sync_issue": _case_gate_off_sync_issue,
 }
+
+
+def _install_worker_real_async() -> None:
+    """真 async 用例的 worker 安装：门控钉开 + 真 ``_a2a_issue``（门关时它退化为同步）。"""
+    ulysses_dispatch.A2A_ASYNC = True
+    _install_worker_cpu_stubs(_real_async_a2a_issue)
+
 
 # 真 async 用例保留真实 ``_a2a_issue``，只替换 comm-stream 部分（事件/流/stream 上下文）。
 _REAL_ASYNC_CASES: dict[str, Callable[[], None]] = {
-    "dim1_real_async": lambda: _install_worker_cpu_stubs(_real_async_a2a_issue),
+    "dim1_real_async": _install_worker_real_async,
+    "eager_retire": _install_worker_real_async,
+    # 门控关用例同样要真 ``_a2a_issue``（同步 stub 会掩盖门控分支）；门关分支不触流，
+    # CUDA stub 只是兜底。
+    "gate_off_sync_issue": lambda: _install_worker_cpu_stubs(_REAL_A2A_ISSUE),
 }
 
 
@@ -557,16 +700,16 @@ def _patch_route_recorders(monkeypatch: pytest.MonkeyPatch) -> tuple[list[_Call]
 
 def _route(
     monkeypatch: pytest.MonkeyPatch,
-    env: str | None,
+    gate: bool,
     x: torch.Tensor,
     scatter_dim: int = 1,
     gather_dim: int = 2,
 ) -> _RouteResult:
-    """以给定 env 经 ``all_to_all.ulysses_all_to_all`` 路由一次。
+    """以给定门控经 ``all_to_all.ulysses_all_to_all`` 路由一次。
 
     Args:
         monkeypatch (pytest.MonkeyPatch): pytest 的 monkeypatch 夹具。
-        env (str | None): 门控 env 的取值；``None`` 表示删除该变量（未设置）。
+        gate (bool): ``ulysses_dispatch.A2A_ASYNC`` 的取值（模块属性 patch，测试后还原）。
         x (torch.Tensor): 输入张量。
         scatter_dim (int): scatter 维度。
         gather_dim (int): gather 维度。
@@ -576,10 +719,7 @@ def _route(
     """
     calls, sync_sentinel, async_sentinel = _patch_route_recorders(monkeypatch)
     mesh = _MeshStub()
-    if env is None:
-        monkeypatch.delenv(_ENV, raising=False)
-    else:
-        monkeypatch.setenv(_ENV, env)
+    monkeypatch.setattr(ulysses_dispatch, "A2A_ASYNC", gate)
     out = all_to_all.ulysses_all_to_all(x, scatter_dim, gather_dim, mesh)
     return _RouteResult(out, calls, sync_sentinel, async_sentinel, mesh)
 
@@ -612,6 +752,23 @@ class TestUlyssesBackward:
 
     def test_dim2_backward_matches_hand_adjoint(self, tmp_path) -> None:
         _run_spawned("backward_dim2", 2, tmp_path)
+
+
+class TestEagerRetire:
+    """``_PENDING_A2A`` 生命周期：fence 即摘自身 entry，prune 兜底孤儿（2-rank gloo）。"""
+
+    def test_fenced_entry_dropped_immediately(self, tmp_path) -> None:
+        _run_spawned("eager_retire", 2, tmp_path)
+
+    def test_failed_work_pinned(self, tmp_path) -> None:
+        _run_spawned("failed_work_pinned", 2, tmp_path)
+
+
+class TestA2aIssueGateOff:
+    """``_a2a_issue`` 门控关分支：inline 同步退化（2-rank gloo）。"""
+
+    def test_gate_off_degrades_deferred_primitives_to_sync(self, tmp_path) -> None:
+        _run_spawned("gate_off_sync_issue", 2, tmp_path)
 
 
 class TestUlyssesWorldOne:
@@ -684,72 +841,54 @@ class TestUlyssesFinishGlue:
 
 
 class TestDispatchRouting:
-    """门控 env + 调用形态 → 同步 / async 路径的路由契约（记录器替身，无真实通信）。"""
+    """门控 A2A_ASYNC + 调用形态 → 同步 / async 路径的路由契约（记录器替身，无真实通信）。"""
 
-    def test_env_unset_routes_to_sync(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """env 未设置 → 同步路径被调，async 目标未被调。"""
+    def test_gate_off_routes_to_sync(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """门控关 → 同步路径被调，async 目标未被调。"""
         x = torch.randn(1, 4, 6)
-        res = _route(monkeypatch, None, x)
-        assert any(c[0] == "sync" for c in res.calls), "env 未设置应走同步路径"
-        assert not any(c[0] == "async" for c in res.calls), "env 未设置不应走 async 路径"
+        res = _route(monkeypatch, False, x)
+        assert any(c[0] == "sync" for c in res.calls), "门控关应走同步路径"
+        assert not any(c[0] == "async" for c in res.calls), "门控关不应走 async 路径"
 
-    @pytest.mark.parametrize("env", ["0", "", "junk", "true"])
-    def test_env_non_one_values_route_to_sync(self, monkeypatch: pytest.MonkeyPatch, env: str) -> None:
-        """env 存在但不等于 "1" → 同步路径。"""
-        x = torch.randn(1, 4, 6)
-        res = _route(monkeypatch, env, x)
-        assert any(c[0] == "sync" for c in res.calls), f"env={env!r} 应走同步路径"
-        assert not any(c[0] == "async" for c in res.calls), f"env={env!r} 不应走 async 路径"
-
-    def test_env_on_matching_call_routes_to_async(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """env == "1" + batch-1 + (1, 2) → async 目标以 (input, mesh.get_group()) 被调。"""
+    def test_gate_on_matching_call_routes_to_async(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """门控开 + batch-1 + (1, 2) → async 目标以 (input, mesh.get_group()) 被调。"""
         x = torch.randn(1, 4, 6, 3)
-        res = _route(monkeypatch, "1", x)
+        res = _route(monkeypatch, True, x)
         assert res.out is res.async_sentinel
         assert res.calls == [("async", x, res.mesh.group)]
 
     @pytest.mark.parametrize(("scatter_dim", "gather_dim"), [(2, 2), (1, 1), (0, 2), (1, 3)])
-    def test_env_on_non_matching_dims_route_to_sync(
+    def test_gate_on_non_matching_dims_route_to_sync(
         self, monkeypatch: pytest.MonkeyPatch, scatter_dim: int, gather_dim: int
     ) -> None:
-        """env == "1" 但 scatter/gather 维度不是 (1, 2) → 同步路径。"""
+        """门控开但 scatter/gather 维度不是 (1, 2) → 同步路径。"""
         x = torch.randn(1, 4, 6, 3)
-        res = _route(monkeypatch, "1", x, scatter_dim=scatter_dim, gather_dim=gather_dim)
+        res = _route(monkeypatch, True, x, scatter_dim=scatter_dim, gather_dim=gather_dim)
         assert any(c[0] == "sync" for c in res.calls), f"({scatter_dim},{gather_dim}) 应走同步路径"
         assert not any(c[0] == "async" for c in res.calls), f"({scatter_dim},{gather_dim}) 不应走 async 路径"
 
-    def test_env_on_batch_two_routes_to_sync(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """env == "1" 但 batch > 1 → 同步路径。"""
+    def test_gate_on_batch_two_routes_to_sync(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """门控开但 batch > 1 → 同步路径。"""
         x = torch.randn(2, 4, 6)
-        res = _route(monkeypatch, "1", x)
+        res = _route(monkeypatch, True, x)
         assert any(c[0] == "sync" for c in res.calls), "batch>1 应走同步路径"
         assert not any(c[0] == "async" for c in res.calls), "batch>1 不应走 async 路径"
 
-    def test_env_is_read_at_call_time(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """env 在每次调用时读取：两次调用之间翻转 env 即切换路径，无需重新 import。"""
-        x = torch.randn(1, 4, 6)
-        first = _route(monkeypatch, "0", x)
-        assert not any(c[0] == "async" for c in first.calls), "env=0 应走同步路径"
-        second = _route(monkeypatch, "1", x)
-        assert second.out is second.async_sentinel
-        third = _route(monkeypatch, "0", x)
-        assert not any(c[0] == "async" for c in third.calls), "env=0 应走同步路径"
-
 
 class TestDispatchValueWorldOne:
-    """world_size == 1（主进程内 1-rank gloo 组）：env 开/关均逐位返回输入值。"""
+    """world_size == 1（主进程内 1-rank gloo 组）：门控开/关均逐位返回输入值。"""
 
-    def test_env_off_and_on_return_input_values(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_gate_off_and_on_return_input_values(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         dist.init_process_group("gloo", store=dist.FileStore(str(tmp_path / "gloo_store"), 1), rank=0, world_size=1)
         try:
             mesh = init_device_mesh("cpu", (1,))
             x4 = torch.randn(1, 4, 6, 3)
             x3 = torch.randn(1, 4, 6)
 
-            monkeypatch.delenv(_ENV, raising=False)
+            monkeypatch.setattr(ulysses_dispatch, "A2A_ASYNC", False)
             off4 = all_to_all.ulysses_all_to_all(x4, scatter_dim=1, gather_dim=2, mesh=mesh)
             off3 = all_to_all.ulysses_all_to_all(x3, scatter_dim=1, gather_dim=2, mesh=mesh)
-            monkeypatch.setenv(_ENV, "1")
+            monkeypatch.setattr(ulysses_dispatch, "A2A_ASYNC", True)
             on4 = all_to_all.ulysses_all_to_all(x4, scatter_dim=1, gather_dim=2, mesh=mesh)
             on3 = all_to_all.ulysses_all_to_all(x3, scatter_dim=1, gather_dim=2, mesh=mesh)
         finally:
@@ -758,17 +897,17 @@ class TestDispatchValueWorldOne:
         for x, off, on in ((x4, off4, on4), (x3, off3, on3)):
             assert off.shape == x.shape, (off.shape, x.shape)
             assert on.shape == x.shape, (on.shape, x.shape)
-            assert torch.equal(off, x), "env 关（同步路径）未逐位返回输入值"
-            assert torch.equal(on, x), "env 开（async world==1 早退）未逐位返回输入值"
-        # env 开且 world==1 时 async 早退原样返回输入对象；同步路径返回的是新张量。
+            assert torch.equal(off, x), "门控关（同步路径）未逐位返回输入值"
+            assert torch.equal(on, x), "门控开（async world==1 早退）未逐位返回输入值"
+        # 门控开且 world==1 时 async 早退原样返回输入对象；同步路径返回的是新张量。
         assert on4 is x4 and on3 is x3
 
 
 class TestDispatchValueTwoRank:
-    """2-rank gloo spawn：env 开/关逐位一致，且都等于全局切片语义参考（值 + 布局）。"""
+    """2-rank gloo spawn：门控开/关逐位一致，且都等于全局切片语义参考（值 + 布局）。"""
 
-    def test_env_on_matches_env_off_and_global_semantics(self, tmp_path: Path) -> None:
-        _run_spawned("env_on_matches_env_off", 2, tmp_path)
+    def test_gate_on_matches_gate_off_and_global_semantics(self, tmp_path: Path) -> None:
+        _run_spawned("gate_on_matches_gate_off", 2, tmp_path)
 
 
 class TestKdaImportWiring:
