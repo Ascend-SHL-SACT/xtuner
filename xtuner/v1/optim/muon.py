@@ -343,6 +343,12 @@ class Muon(Optimizer):
         swap_optimizer (bool): Keep Muon momentum and AdamW momentum and variance in pinned host memory.
             Copy states to the device for each step and write updated states back before the step returns.
 
+    Note:
+        With ``swap_optimizer=True`` and ``XTUNER_MUON_SWAP_DEFERRED_DRAIN=1``, ``step`` skips the step-end
+        device drain: the pinned host state is fenced only by the ``state_dict`` / ``load_state_dict``
+        pre-hooks, and host tensors in ``optimizer.state[...]`` must not be read through any other path
+        (a direct read races with the in-flight tail D2H copy).
+
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
     """
@@ -419,10 +425,18 @@ class Muon(Optimizer):
         self._remainder_strategy = remainder_strategy
         self._muon_split_sizes = muon_split_sizes or {}
         self._swap_optimizer = swap_optimizer
+        # XTUNER_MUON_SWAP_DEFERRED_DRAIN=1: ``step`` does not wait for the tail D2H; the pinned
+        # host state is drained lazily, only before a host-side reader touches it.
+        self._defer_host_drain = swap_optimizer and os.environ.get("XTUNER_MUON_SWAP_DEFERRED_DRAIN") == "1"
         self.register_state_dict_post_hook(self._remove_clip_grad_policy)
         self.register_load_state_dict_pre_hook(self._restore_clip_grad_policy)
         if self._swap_optimizer:
             self.register_load_state_dict_post_hook(self._swap_loaded_states_to_host)
+        if self._defer_host_drain:
+            # The deferred path leaves the last D2H in flight across the step boundary, so drain
+            # before a checkpoint reads the pinned state and before a load overwrites it.
+            self.register_state_dict_pre_hook(self._drain_host_state)
+            self.register_load_state_dict_pre_hook(self._drain_host_state)
 
         # Validate MuonSplit before any optimizer update or collective.
         for group in self.param_groups:
@@ -522,9 +536,12 @@ class Muon(Optimizer):
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
 
-        if self._swap_optimizer:
+        if self._swap_optimizer and not self._defer_host_drain:
             # Non-blocking device-to-host copies must finish before checkpointing or the next step.
             DEVICE_MODULE.synchronize()
+        # Deferred drain: the tail D2H is left in flight on purpose. Nothing here needs a
+        # barrier: the next step's H2D is enqueued on the same stream, hence after that D2H, and
+        # every host-side reader goes through ``_drain_host_state`` (state_dict / load pre-hooks).
 
         return loss
 
@@ -541,6 +558,13 @@ class Muon(Optimizer):
                 if algo == "adamw":
                     state["variance"] = _to_pinned_host(state["variance"])
         return state
+
+    @staticmethod
+    def _drain_host_state(*_args: object) -> None:
+        # Runs before an optimizer state dict is built or loaded: the pinned host state is
+        # exposed by reference, and the last step's D2H is deliberately left in flight (see
+        # ``step``), so the device has to drain before any host-side reader touches it.
+        DEVICE_MODULE.synchronize()
 
     @staticmethod
     def _swap_loaded_states_to_host(optimizer: TorchOptimizer) -> None:
