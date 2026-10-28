@@ -2,13 +2,17 @@
 """Ulysses a2a dispatch gate and the deferred-work-fencing machinery it drives.
 
 ``xtuner.v1.ops.comm.all_to_all.ulysses_all_to_all`` consults
-``a2a_async_enabled()`` (env ``XTUNER_KDA_SP_A2A_ASYNC``, read per call, default
-off) and routes batch-1 ``scatter_dim=1`` / ``gather_dim=2`` movements through
-``ulysses_scatter_heads_blocking`` when it is on; every other call stays on the
-synchronous functional-collectives path. The KDA sequence-parallel lever
-``XTUNER_KDA_SP_A2A_DEFER`` (``xtuner.v1.module.attention.kda_lever``) issues
-the collectives with ``issue_ulysses_dim1`` and fences each at its consumer
-with ``finish_ulysses_*``.
+``a2a_async_enabled()`` (env ``XTUNER_KDA_SP_A2A_ASYNC``, captured once at
+import, default off) and routes batch-1 ``scatter_dim=1`` / ``gather_dim=2``
+movements through ``ulysses_scatter_heads_blocking`` when it is on; every
+other call stays on the synchronous functional-collectives path. The KDA
+sequence-parallel lever ``XTUNER_KDA_SP_A2A_DEFER``
+(``xtuner.v1.module.attention.kda_lever``) issues the collectives with
+``issue_ulysses_dim1`` and fences each at its consumer with
+``finish_ulysses_*``; those primitives bypass ``ulysses_all_to_all``, so the
+shared enqueue point ``_a2a_issue`` honors the same gate -- with it off every
+collective is issued inline on the calling stream and synchronously, making
+the env a real off-switch for the whole async machinery.
 
 Inline on the compute stream each collective blocks the host for the wire plus
 the slowest rank's arrival skew -- and with every rank parked in its own
@@ -68,6 +72,26 @@ if get_device() == "npu":
 
 _A2A_ASYNC_ENV = "XTUNER_KDA_SP_A2A_ASYNC"
 
+# Routing gate for ``all_to_all.ulysses_all_to_all``, read once at import: set
+# the env before process start; flipping at runtime requires a module reload or
+# patching this attribute (same contract as ``torch_all2all._META_A2A_ASYNC``).
+A2A_ASYNC: bool = os.getenv(_A2A_ASYNC_ENV, "0") == "1"
+
+
+def a2a_async_enabled() -> bool:
+    """Whether the async a2a routing gate is on.
+
+    Returns the gate captured at import time (``A2A_ASYNC``); the env is not
+    re-consulted per call, so flipping the gate at runtime requires a module
+    reload or patching the ``A2A_ASYNC`` attribute.
+
+    Returns:
+        bool: True when batch-1 ``scatter_dim=1`` / ``gather_dim=2`` movements
+        route through the deferred-fence async path.
+    """
+    return A2A_ASYNC
+
+
 # Send/recv buffers of collectives issued with ``async_op=True`` and not yet
 # fenced: (work, send, recv). Held so the caching allocator cannot reuse their
 # blocks while the backend's internal comm stream still reads/writes them;
@@ -86,11 +110,6 @@ _PENDING_A2A: list[tuple[dist.Work, torch.Tensor, torch.Tensor]] = []
 _COMM_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 _WorkOpt = dist.Work | None
-
-
-def a2a_async_enabled() -> bool:
-    """Whether ``XTUNER_KDA_SP_A2A_ASYNC`` is set to ``"1"`` (read per call)."""
-    return os.getenv(_A2A_ASYNC_ENV, "0") == "1"
 
 
 def _comm_stream(group: dist.ProcessGroup) -> torch.cuda.Stream:
@@ -119,6 +138,14 @@ def _a2a_issue(send: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch.Tens
     the returned work handle is fenced via ``_wait_a2a``; both are kept alive
     in ``_PENDING_A2A`` until then.
 
+    When the ``A2A_ASYNC`` gate is off, the collective is issued inline on the
+    calling stream with ``async_op=False`` instead (the pre-async behavior):
+    the host parks until it completes, nothing is registered in
+    ``_PENDING_A2A``, and the returned work is ``None`` so the caller's
+    ``_wait_a2a`` fence is a no-op. This makes the gate a real off-switch for
+    every ``_a2a_issue`` caller -- the KDA deferred primitives included, which
+    bypass ``all_to_all.ulysses_all_to_all`` where the gate is otherwise read.
+
     Args:
         send (torch.Tensor): Uniformly split send buffer (dim 0 chunked per
             rank), produced on the calling stream.
@@ -127,9 +154,13 @@ def _a2a_issue(send: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch.Tens
     Returns:
         tuple[torch.Tensor, dist.Work | None]: The received buffer (same
             shape as ``send``) and the c10d work handle fencing it (``None``
-            when the backend ran the collective synchronously).
+            when the gate is off or the backend ran the collective
+            synchronously).
     """
     recv = torch.empty_like(send)
+    if not A2A_ASYNC:
+        dist.all_to_all_single(recv, send, group=group, async_op=False)
+        return recv, None
     stream = _comm_stream(group)
     ready = torch.cuda.Event()
     ready.record(torch.cuda.current_stream())
@@ -169,10 +200,16 @@ def _wait_a2a(work: _WorkOpt) -> None:
     free once the backend's internal comm stream retired it. A work that
     completed but *failed* (peer abort, HCCL error) also goes through
     ``wait()`` so the stored exception surfaces here instead of the consumer
-    silently reading a never-written recv buffer. Also prunes the
-    pending-buffer registry of every collective that completed successfully
-    meanwhile; failed entries stay pinned (their buffers may still be touched
-    by the comm stream, and their fence will raise shortly anyway).
+    silently reading a never-written recv buffer.
+
+    Once this collective is fenced, its own registry entry is dropped at once:
+    ``wait()`` is the fence, so the entry's staging buffers are freeable here
+    and waiting for the completion-flag poll to clear them only hoards dead
+    buffers across every window without an a2a call (the forward-end ->
+    first-backward-a2a gap alone hoards ~2.5 GiB on the 16-die 128K workload).
+    The poll-based prune below still clears older entries that retired without
+    ever being fenced and keeps failed entries pinned (their buffers may still
+    be touched by the comm stream, and their fence will raise shortly anyway).
 
     Args:
         work (dist.Work | None): Work handle returned by ``_a2a_issue``
@@ -180,6 +217,11 @@ def _wait_a2a(work: _WorkOpt) -> None:
     """
     if work is not None and not _work_retired(work):
         work.wait()
+    if work is not None:
+        for i, entry in enumerate(_PENDING_A2A):
+            if entry[0] is work:
+                del _PENDING_A2A[i]
+                break
     if _PENDING_A2A:
         # Snapshot-iterate + remove (see the _PENDING_A2A contract): entries
         # appended by another thread while this loop runs are not in the
@@ -412,6 +454,7 @@ def ulysses_scatter_seq_blocking(x: torch.Tensor, group: dist.ProcessGroup) -> t
 
 __all__ = [
     "a2a_async_enabled",
+    "A2A_ASYNC",
     "issue_ulysses_dim1",
     "issue_ulysses_dim2",
     "finish_ulysses_dim1",

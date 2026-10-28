@@ -42,7 +42,9 @@ value-correct but deliberately keeps the fla_npu ``input_guard`` clone tax
   step at 30B/128K).
 
 The ``XTUNER_KDA_SP_A2A_ASYNC`` gate lives in ``xtuner.v1.ops.comm.ulysses_dispatch``
-(read per call inside ``all_to_all.ulysses_all_to_all``), not here.
+(consulted inside ``all_to_all.ulysses_all_to_all`` and the deferred primitives'
+enqueue point ``_a2a_issue``, where it degrades the collectives to inline
+synchronous calls), not here.
 """
 
 from __future__ import annotations

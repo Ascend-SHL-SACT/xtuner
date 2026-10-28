@@ -34,10 +34,11 @@ collective parity：两种调度均为前向 6 次 a2a、含反向 12 次（反�
 ``torch.equal``：同一调度内核序列 + 纯置换 a2a，单线程 fp32 下确定。
 
 偏差说明（有意为之）：
-- 阻塞基线的集合通信走 ``ulysses_dispatch.ulysses_all_to_all``；env 未设时它是 functional
+- 阻塞基线的集合通信走 ``ulysses_dispatch.ulysses_all_to_all``；门控关时它是 functional
   collectives 路径，不走 ``dist.all_to_all_single``。为使事件序/计数可与 defer 在同一原语点对拍，
-  顺序/等价/含反向计数用例在阻塞侧显式设 ``XTUNER_KDA_SP_A2A_ASYNC=1``（即文档所述的
-  ``ulysses_scatter_heads_blocking`` = issue+finish 背靠背），并用 env 未设的 functional 路径
+  顺序/等价/含反向计数用例在阻塞侧显式钉 ``ulysses_dispatch.A2A_ASYNC = True``（门控 env
+  ``XTUNER_KDA_SP_A2A_ASYNC`` 于 import 时一次读取，运行时翻转经模块属性；即文档所述的
+  ``ulysses_scatter_heads_blocking`` = issue+finish 背靠背），并用门控关的 functional 路径
   单独断言前向数量同为 6。
 - 分支选择（flag handling）用例在主进程 1-rank gloo 组内跑（world==1 时 a2a 原语早退、不触碰
   CUDA 流/事件），阻塞侧 recorder 委托给 ``ulysses_scatter_heads_blocking``（world==1 恒等返回）。
@@ -313,7 +314,7 @@ def _counting_functional_a2a(*args: object, **kwargs: object) -> object:
 def _install_worker_stubs() -> None:
     """spawn 子进程内的 CPU 化补丁（子进程随用例退出，无需还原）。"""
     torch.set_num_threads(1)
-    os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
+    ulysses_dispatch.A2A_ASYNC = False
     ulysses_dispatch._a2a_issue = _sync_a2a_issue  # type: ignore[assignment]
     ulysses_dispatch._wait_a2a = _recording_wait_a2a  # type: ignore[assignment]
     kda_module.causal_conv1d = _mock_causal_conv1d  # type: ignore[assignment]
@@ -416,9 +417,9 @@ def _run_schedule(
     go: torch.Tensor,
     *,
     defer: bool,
-    async_env: str | None,
+    async_on: bool,
 ) -> _RunSnapshot:
-    """以给定调度跑一次前向+梯度并快照（``async_env=None`` 表示 pop 掉 ASYNC env）。"""
+    """以给定调度跑一次前向+梯度并快照（``async_on`` 钉 ``ulysses_dispatch.A2A_ASYNC``）。"""
     kda_lever.SP_A2A_DEFER = defer
     # 逐位对照须覆盖 seq-major finish 路径：钉住 DIRECT_CONV，防止带 =0
     # 环境变量的机器把 DEFER=1 侧静默退回 legacy（fence 计数断言查不出值差异）。
@@ -427,10 +428,7 @@ def _run_schedule(
     _pinned_direct_conv = kda_lever.SP_A2A_DIRECT_CONV
     kda_lever.SP_A2A_DIRECT_CONV = True
     try:
-        if async_env is None:
-            os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
-        else:
-            os.environ["XTUNER_KDA_SP_A2A_ASYNC"] = async_env
+        ulysses_dispatch.A2A_ASYNC = async_on
         _reset_records()
         out, grads = _forward_grad(module, hidden_local, seq_ctx, go)
         return {
@@ -505,9 +503,9 @@ def _case_equivalence(rank: int, world: int) -> None:
     torch.manual_seed(13)
     go = torch.randn(1, _S_LOC, _HIDDEN, dtype=torch.float32)
 
-    defer_run = _run_schedule(module, hidden_local, seq_ctx, go, defer=True, async_env=None)
-    blocking_async_run = _run_schedule(module, hidden_local, seq_ctx, go, defer=False, async_env="1")
-    blocking_functional_run = _run_schedule(module, hidden_local, seq_ctx, go, defer=False, async_env=None)
+    defer_run = _run_schedule(module, hidden_local, seq_ctx, go, defer=True, async_on=False)
+    blocking_async_run = _run_schedule(module, hidden_local, seq_ctx, go, defer=False, async_on=True)
+    blocking_functional_run = _run_schedule(module, hidden_local, seq_ctx, go, defer=False, async_on=False)
 
     assert defer_run["projected"].shape == (1, _S_LOC, _HIDDEN)
     assert defer_run["raw"].shape == (1, _S_LOC, _HIDDEN)
@@ -531,7 +529,7 @@ def _case_ordering_defer(rank: int, world: int) -> None:
     module, _, seq_ctx, hidden_local = _sp_fixtures(rank, world)
     _install_consumer_recorders(module)
     kda_lever.SP_A2A_DEFER = True
-    os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
+    ulysses_dispatch.A2A_ASYNC = False
     _reset_records()
     module.forward_for_sp(hidden_local, seq_ctx)
     assert _LOG == _DEFERRED_LOG, f"deferred 事件序列不符: {_LOG}"
@@ -542,7 +540,7 @@ def _case_ordering_blocking(rank: int, world: int) -> None:
     module, _, seq_ctx, hidden_local = _sp_fixtures(rank, world)
     _install_consumer_recorders(module)
     kda_lever.SP_A2A_DEFER = False
-    os.environ["XTUNER_KDA_SP_A2A_ASYNC"] = "1"
+    ulysses_dispatch.A2A_ASYNC = True
     _reset_records()
     module.forward_for_sp(hidden_local, seq_ctx)
     assert _LOG == _BLOCKING_LOG, f"blocking 事件序列不符: {_LOG}"
@@ -553,20 +551,20 @@ def _case_parity(rank: int, world: int) -> None:
     module, _, seq_ctx, hidden_local = _sp_fixtures(rank, world)
 
     kda_lever.SP_A2A_DEFER = True
-    os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
+    ulysses_dispatch.A2A_ASYNC = False
     _reset_records()
     module.forward_for_sp(hidden_local, seq_ctx)
     assert _A2A_MECHANISM.count("c10d") == 6, _A2A_MECHANISM
     assert _A2A_MECHANISM.count("functional") == 0, _A2A_MECHANISM
 
     kda_lever.SP_A2A_DEFER = False
-    os.environ["XTUNER_KDA_SP_A2A_ASYNC"] = "1"
+    ulysses_dispatch.A2A_ASYNC = True
     _reset_records()
     module.forward_for_sp(hidden_local, seq_ctx)
     assert _A2A_MECHANISM.count("c10d") == 6, _A2A_MECHANISM
     assert _A2A_MECHANISM.count("functional") == 0, _A2A_MECHANISM
 
-    os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
+    ulysses_dispatch.A2A_ASYNC = False
     _reset_records()
     module.forward_for_sp(hidden_local, seq_ctx)
     assert _A2A_MECHANISM.count("functional") == 6, _A2A_MECHANISM
@@ -580,13 +578,13 @@ def _case_parity_fwd_bwd(rank: int, world: int) -> None:
     go = torch.randn(1, _S_LOC, _HIDDEN, dtype=torch.float32)
 
     kda_lever.SP_A2A_DEFER = True
-    os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
+    ulysses_dispatch.A2A_ASYNC = False
     _reset_records()
     _forward_grad(module, hidden_local, seq_ctx, go)
     assert _A2A_MECHANISM.count("c10d") == 12, _A2A_MECHANISM  # 前向 6（q/k/v/g/beta/out）+ 反向 6
 
     kda_lever.SP_A2A_DEFER = False
-    os.environ["XTUNER_KDA_SP_A2A_ASYNC"] = "1"
+    ulysses_dispatch.A2A_ASYNC = True
     _reset_records()
     _forward_grad(module, hidden_local, seq_ctx, go)
     assert _A2A_MECHANISM.count("c10d") == 12, _A2A_MECHANISM  # 前向 6 + 反向 6
@@ -597,7 +595,7 @@ def _case_send_layout(rank: int, world: int) -> None:
     module, _, seq_ctx, hidden_local = _sp_fixtures(rank, world)
 
     kda_lever.SP_A2A_DEFER = True
-    os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
+    ulysses_dispatch.A2A_ASYNC = False
     _reset_records()
     module.forward_for_sp(hidden_local, seq_ctx)
 
@@ -631,7 +629,7 @@ def _case_beta_pre_sigmoid(rank: int, world: int) -> None:
         module.b_proj.weight.mul_(50.0)  # 放大 raw 值，使"未过 sigmoid"可由越界值直接证得
 
     kda_lever.SP_A2A_DEFER = True
-    os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
+    ulysses_dispatch.A2A_ASYNC = False
     _reset_records()
     module.forward_for_sp(hidden_local, seq_ctx)
 
@@ -665,7 +663,7 @@ def _case_finish_short_conv(rank: int, world: int) -> None:
     proj = _HEADS * _HEAD_DIM
 
     kda_lever.SP_A2A_DEFER = False
-    os.environ["XTUNER_KDA_SP_A2A_ASYNC"] = "1"
+    ulysses_dispatch.A2A_ASYNC = True
     _reset_records()
     module.forward_for_sp(hidden_local, seq_ctx)
     ref_x = list(_CONV_INPUTS)
@@ -675,7 +673,7 @@ def _case_finish_short_conv(rank: int, world: int) -> None:
     assert len(ref_x) == 3 and len(ref_out) == 3, (len(ref_x), len(ref_out))
 
     kda_lever.SP_A2A_DEFER = True
-    os.environ.pop("XTUNER_KDA_SP_A2A_ASYNC", None)
+    ulysses_dispatch.A2A_ASYNC = False
     _reset_records()
     module.forward_for_sp(hidden_local, seq_ctx)
     assert len(_CONV_INPUTS) == 3 and len(_CONV_OUTPUTS) == 3, (len(_CONV_INPUTS), len(_CONV_OUTPUTS))
