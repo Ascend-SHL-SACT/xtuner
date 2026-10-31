@@ -435,16 +435,33 @@ def _parse_sfa_grad_row_chunk(raw: str) -> int:
 # :class:`_SpTndSparseMlaChunkedGradFn`). ``0`` restores the stock single-call backward bit for bit.
 _SFA_GRAD_ROW_CHUNK = _parse_sfa_grad_row_chunk(os.environ.get("XTUNER_SFA_GRAD_ROW_CHUNK", "0"))
 
+# KV-slice length under which the SP>1 offload path keeps every tensor on device instead of
+# round-tripping pinned CPU copies. The chunked grad's workspace request at those spans is
+# already small (measured fresh-process pool growth: ~0.47 GiB + 4.25 KiB per KV token, so
+# <= 1.0 GiB at the 128K default), and the stock single-call request is rows-dominated
+# (~2.7 GiB + 4.25 KiB per KV token at 16K rows) — hence chunking stays on for every call
+# and only the copies are gated. All 30720 run32 16N calls and 47% of the job-22 512N calls
+# sit at or below 128K, where the D2H+H2D round trip (~4.3 GiB per call) bought no memory:
+# the pinned copies only pay off on the long-doc ranks whose slices push the request past
+# the free memory left at the grad call (job dyb-q35-xtuner-21's rank221, kv ~449K). ``0``
+# restores unconditional offloading bit for bit.
+_SFA_GRAD_OFFLOAD_MIN_KV = int(os.environ.get("XTUNER_SFA_GRAD_OFFLOAD_MIN_KV", "131072"))
+
 
 class _SpTndSparseMlaFn(torch.autograd.Function):
-    """SP>1 TND sparse MLA with the KV-slice copies offloaded to pinned CPU.
+    """SP>1 TND sparse MLA with the grad-input tensors offloaded to pinned CPU.
 
     torch_npu's stock autograd keeps the contiguous ``key``/``key_rope`` slice
     copies on device from forward to backward of every layer; at 256K they
     reach ~300 MiB per layer on the ranks whose slice spans nearly the whole
     global sequence and starve the ``aclnnSparseFlashAttentionGrad`` workspace.
-    Forward mirrors the stock TND call, then moves the slice copies to pinned
-    CPU and frees the GPU copies; backward streams them back and runs one
+    Forward mirrors the stock TND call, then — when the packed KV slice exceeds
+    ``_SFA_GRAD_OFFLOAD_MIN_KV`` (short slices keep everything on device; the
+    chunked grad's workspace request is already small there) — moves the slice
+    copies — and, when the grad call is row-chunked, the packed queries, query
+    rope and raw output the chunked backward only consumes per chunk — to
+    pinned CPU and frees the GPU copies; backward streams the key back whole
+    and each query/raw chunk on demand, then runs the chunked
     ``npu_sparse_flash_attention_grad`` with the CP ring backward's grad
     mapping (nope = ``dk + dv``, rope = ``dkr``). ``kv``/``k_rope`` are the
     prefix-extended slice VIEWS, so autograd scatters the returned slice grads
@@ -499,34 +516,67 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
         ctx.mark_non_differentiable(outputs.softmax_lse)
 
         # Offload only when this invocation builds a graph node whose backward
-        # will consume the slices (kv requires grad). Under no_grad (the
-        # checkpoint's original forward) the ctx — and with it the pinned
+        # will consume the slices (kv requires grad) and the packed KV slice is
+        # long enough for the pinned round trip to buy memory. Under no_grad
+        # (the checkpoint's original forward) the ctx — and with it the pinned
         # buffers — would be dropped the instant apply() returns, freeing them
         # while the D2H may still be in flight; skipping there also avoids a
         # wasted ~290 MiB D2H per layer, since the recompute's grad-enabled
-        # forward re-offloads for its own backward. When offloading, the copy
+        # forward re-offloads for its own backward. Short slices skip the
+        # offload entirely (``_SFA_GRAD_OFFLOAD_MIN_KV``): the chunked grad's
+        # workspace request is already small there, so the copies are pure
+        # traffic. When offloading, the copy
         # is enqueued on the current stream, the GPU copies are released to
         # the same stream (so any reuse of their blocks is stream-ordered
         # after the copy), and the pinned buffers stay alive in ctx until
         # backward streams them back with async H2D on that same stream.
-        if kv.requires_grad:
+        if kv.requires_grad and key_tnd.shape[0] > _SFA_GRAD_OFFLOAD_MIN_KV:
             key_cpu = torch.empty(key_tnd.shape, dtype=key_tnd.dtype, pin_memory=True, device="cpu")
             rope_cpu = torch.empty(key_rope_tnd.shape, dtype=key_rope_tnd.dtype, pin_memory=True, device="cpu")
             key_cpu.copy_(key_tnd, non_blocking=True)
             rope_cpu.copy_(key_rope_tnd, non_blocking=True)
             del key_tnd, key_rope_tnd
             key_saved, rope_saved = key_cpu, rope_cpu
+            # The row-chunked grad only consumes per-chunk slices of the queries and of the raw
+            # output, so keeping their full-width tensors on device through backward (~1.2 GiB
+            # queries + ~1.1 GiB raw per layer at SP32/512K) just starves the
+            # ``aclnnSparseFlashAttentionGrad`` workspace of the ranks that are already tens of
+            # MiB short (job dyb-q35-xtuner-20, step-5 backward). Offload them the same way as
+            # the key slices; the chunked backward streams each chunk back on demand. The
+            # single-call backward (chunk disabled) consumes them whole, so keep those on device.
+            # ``raw_output`` is also kept by the downstream einsum against ``w_vc`` for its own
+            # backward, but that node runs BEFORE the SFA grad kernel (consumer before producer)
+            # and drops the einsum's reference there — saving the pinned host copy in ctx instead
+            # of the device tensor lets that release actually return the raw block to the
+            # allocator before the grad kernel allocates its workspace (job dyb-q35-xtuner-21:
+            # 2.39 GiB request vs 1.74 GiB free).
+            if _SFA_GRAD_ROW_CHUNK:
+                q_cpu = torch.empty(query_tnd.shape, dtype=query_tnd.dtype, pin_memory=True, device="cpu")
+                qrope_cpu = torch.empty(
+                    query_rope_tnd.shape, dtype=query_rope_tnd.dtype, pin_memory=True, device="cpu"
+                )
+                raw_cpu = torch.empty(
+                    outputs.raw_output.shape, dtype=outputs.raw_output.dtype, pin_memory=True, device="cpu"
+                )
+                q_cpu.copy_(query_tnd, non_blocking=True)
+                qrope_cpu.copy_(query_rope_tnd, non_blocking=True)
+                raw_cpu.copy_(outputs.raw_output, non_blocking=True)
+                del query_tnd, query_rope_tnd
+                q_saved, qrope_saved, raw_saved = q_cpu, qrope_cpu, raw_cpu
+            else:
+                q_saved, qrope_saved, raw_saved = query_tnd, query_rope_tnd, outputs.raw_output
         else:
             key_saved, rope_saved = key_tnd, key_rope_tnd
+            q_saved, qrope_saved, raw_saved = query_tnd, query_rope_tnd, outputs.raw_output
 
         ctx.scale_value = scale_value
         ctx.save_for_backward(
-            query_tnd,
-            query_rope_tnd,
+            q_saved,
+            qrope_saved,
             key_saved,
             rope_saved,
             sparse_indices_tnd,
-            outputs.raw_output,
+            raw_saved,
             attn_outs[1].float().contiguous(),
             attn_outs[2].float().contiguous(),
             cu_q,
@@ -543,33 +593,54 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
         query_tnd, query_rope_tnd, key_cpu, rope_cpu, sparse_indices_tnd, raw_output, smax, ssum, cu_q, cu_k = (
             ctx.saved_tensors
         )
+        # ``query_tnd``/``query_rope_tnd``/``raw_output`` may be pinned CPU copies when the forward
+        # offloaded them for the chunked grad; the chunked helper streams each chunk back on demand.
+        # ``sparse_indices_tnd`` always stays on device, so it anchors the target device.
+        device = sparse_indices_tnd.device
         if key_cpu.device.type == "cpu":
-            key_tnd = key_cpu.to(query_tnd.device, non_blocking=True)
-            key_rope_tnd = rope_cpu.to(query_tnd.device, non_blocking=True)
+            key_tnd = key_cpu.to(device, non_blocking=True)
+            key_rope_tnd = rope_cpu.to(device, non_blocking=True)
         else:
             key_tnd, key_rope_tnd = key_cpu, rope_cpu
 
         grad_out = grad_output.reshape(query_tnd.shape).contiguous().to(query_tnd.dtype)
 
-        dq, dk, dv, dqr, dkr = torch_npu.npu_sparse_flash_attention_grad(
-            query_tnd,
-            key_tnd,
-            key_tnd,  # value = key
-            sparse_indices_tnd,
-            grad_out,
-            raw_output,
-            smax,
-            ssum,
-            ctx.scale_value,
-            1,  # sparse_block_size
-            query_rope=query_rope_tnd,
-            key_rope=key_rope_tnd,
-            actual_seq_qlen=cu_q,
-            actual_seq_kvlen=cu_k,
-            layout="TND",
-            sparse_mode=3,
-            attention_mode=2,
-        )
+        if _SFA_GRAD_ROW_CHUNK:
+            dq, dk, dv, dqr, dkr = _sfa_grad_chunked(
+                query_tnd,
+                query_rope_tnd,
+                key_tnd,
+                key_rope_tnd,
+                sparse_indices_tnd,
+                grad_out,
+                raw_output,
+                smax,
+                ssum,
+                cu_q,
+                cu_k,
+                ctx.scale_value,
+                _SFA_GRAD_ROW_CHUNK,
+            )
+        else:
+            dq, dk, dv, dqr, dkr = torch_npu.npu_sparse_flash_attention_grad(
+                query_tnd,
+                key_tnd,
+                key_tnd,  # value = key
+                sparse_indices_tnd,
+                grad_out,
+                raw_output,
+                smax,
+                ssum,
+                ctx.scale_value,
+                1,  # sparse_block_size
+                query_rope=query_rope_tnd,
+                key_rope=key_rope_tnd,
+                actual_seq_qlen=cu_q,
+                actual_seq_kvlen=cu_k,
+                layout="TND",
+                sparse_mode=3,
+                attention_mode=2,
+            )
         # Slice grads; autograd scatters them into the full-width buffers and
         # the upstream all-gather reduce-scatters them unchanged.
         return dq, dqr, dk + dv, dkr, None, None, None, None, None, None
@@ -703,13 +774,17 @@ def _sfa_grad_chunked(
     kernel's partial grads are accumulated into full-width bf16 buffers in place.
 
     Args:
-        query_tnd (Tensor): Packed query ``[S, N, Rkv]``.
-        query_rope_tnd (Tensor): Packed query rope ``[S, N, Dr]``.
+        query_tnd (Tensor): Packed query ``[S, N, Rkv]``; may be a pinned CPU copy, in which case each
+            chunk is streamed back to the device with an async H2D on the current stream.
+        query_rope_tnd (Tensor): Packed query rope ``[S, N, Dr]``; may be a pinned CPU copy like
+            ``query_tnd``.
         key_tnd (Tensor): Packed (prefix-extended) key ``[L, 1, Rkv]``.
         key_rope_tnd (Tensor): Packed key rope ``[L, 1, Dr]``.
-        sparse_indices_tnd (Tensor): Per-segment local top-k indices ``[S, 1, topk]``.
+        sparse_indices_tnd (Tensor): Per-segment local top-k indices ``[S, 1, topk]``; always on device
+            and anchors the target device for the chunk fetches and outputs.
         grad_out (Tensor): Output grad reshaped to ``query_tnd``'s shape.
-        raw_output (Tensor): Saved forward output ``[S, N, Rkv]``.
+        raw_output (Tensor): Saved forward output ``[S, N, Rkv]``; may be a pinned CPU copy, in
+            which case each chunk is streamed back to the device with an async H2D like the queries.
         smax (Tensor): Saved forward softmax max ``[1, S, N]`` float32.
         ssum (Tensor): Saved forward softmax sum ``[1, S, N]`` float32.
         cu_q (Tensor): Query cu-seq-lens ``[n_seg + 1]`` int32.
@@ -723,12 +798,20 @@ def _sfa_grad_chunked(
     q_bounds = [int(v) for v in cu_q.tolist()]
     k_bounds = [int(v) for v in cu_k.tolist()]
     n_seg = len(q_bounds) - 1
-    device = query_tnd.device
+    # ``sparse_indices_tnd`` always lives on device; the query/rope sources may be pinned CPU
+    # copies that the offload forward saved (streamed back per chunk below).
+    device = sparse_indices_tnd.device
     seq_len = query_tnd.shape[0]
     kv_len = key_tnd.shape[0]
 
-    dq = torch.empty_like(query_tnd)
-    dq_rope = torch.empty_like(query_rope_tnd)
+    def _fetch(t: Tensor, sl: slice) -> Tensor:
+        v = t[sl]
+        if v.device.type == "cpu":
+            return v.to(device, non_blocking=True)
+        return v.contiguous()
+
+    dq = torch.empty_like(query_tnd, device=device)
+    dq_rope = torch.empty_like(query_rope_tnd, device=device)
     dk = torch.zeros(kv_len, key_tnd.shape[1], key_tnd.shape[2], dtype=query_tnd.dtype, device=device)
     dv = torch.zeros_like(dk)
     dk_rope = torch.zeros(kv_len, key_rope_tnd.shape[1], key_rope_tnd.shape[2], dtype=query_tnd.dtype, device=device)
@@ -758,17 +841,17 @@ def _sfa_grad_chunked(
             k_cum.append(running)
         k_cum.extend([kv_total] * (n_seg - last - 1))
         dq_c, dk_c, dv_c, dqr_c, dkr_c = torch_npu.npu_sparse_flash_attention_grad(
-            query_tnd[row_sl].contiguous(),
+            _fetch(query_tnd, row_sl),
             key_tnd[kv_lo : kv_lo + kv_total],
             key_tnd[kv_lo : kv_lo + kv_total],
             sparse_indices_tnd[row_sl].contiguous(),
-            grad_out[row_sl].contiguous(),
-            raw_output[row_sl].contiguous(),
+            _fetch(grad_out, row_sl),
+            _fetch(raw_output, row_sl),
             (smax[:, row_sl, :] if smax_3d else smax[row_sl]).contiguous(),
             (ssum[:, row_sl, :] if smax_3d else ssum[row_sl]).contiguous(),
             scale_value,
             1,  # sparse_block_size
-            query_rope=query_rope_tnd[row_sl].contiguous(),
+            query_rope=_fetch(query_rope_tnd, row_sl),
             key_rope=key_rope_tnd[kv_lo : kv_lo + kv_total],
             actual_seq_qlen=torch.tensor(
                 [min(max(b - q_lo, 0), q_hi - q_lo) for b in q_bounds], dtype=torch.int32, device=device
