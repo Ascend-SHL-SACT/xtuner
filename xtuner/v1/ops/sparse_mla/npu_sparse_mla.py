@@ -408,6 +408,34 @@ def _sp_mla_offload_enabled() -> bool:
     return os.environ.get("XTUNER_SP_MLA_OFFLOAD", "0") == "1"
 
 
+def _parse_sfa_grad_row_chunk(raw: str) -> int:
+    """Parse ``XTUNER_SFA_GRAD_ROW_CHUNK``; ``<= 0`` selects the stock single grad call.
+
+    Args:
+        raw (str): Raw environment value.
+
+    Returns:
+        int: Positive query-row chunk bound, or ``0`` for the single-call layout.
+    """
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"XTUNER_SFA_GRAD_ROW_CHUNK={raw!r} is not a valid int") from exc
+    return value if value > 0 else 0
+
+
+# Query-row chunk bound for the packed-path ``aclnnSparseFlashAttentionGrad`` call. The kernel's transient
+# workspace scales with the shard's WHOLE query length (~0.2 GiB per 1K query rows at topk=2048 plus the
+# KV-width outputs): a 16K-row SP shard at 512K packs asks 4.4-4.7 GiB in ONE call and device-OOMs the ranks
+# that miss free memory by tens of MiB (job dyb-q35-xtuner-19, step-1 backward, 4.39-4.50 GiB free on 5 ranks).
+# Splitting the grad call into fixed-size query-row chunks caps the per-call transient at ~0.2 GiB per 1K rows
+# independent of the shard length and pack length; every chunk's segment KV spans are end-clipped at the
+# chunk's causal extent so the kernel's per-segment causal mask reproduces the unchunked geometry exactly
+# (measured bitwise-equal dq/dq_rope, reassociation-only dk/dv/dk_rope; see
+# :class:`_SpTndSparseMlaChunkedGradFn`). ``0`` restores the stock single-call backward bit for bit.
+_SFA_GRAD_ROW_CHUNK = _parse_sfa_grad_row_chunk(os.environ.get("XTUNER_SFA_GRAD_ROW_CHUNK", "0"))
+
+
 class _SpTndSparseMlaFn(torch.autograd.Function):
     """SP>1 TND sparse MLA with the KV-slice copies offloaded to pinned CPU.
 
@@ -547,6 +575,218 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
         return dq, dqr, dk + dv, dkr, None, None, None, None, None, None
 
 
+class _SpTndSparseMlaChunkedGradFn(torch.autograd.Function):
+    """SP packed TND sparse MLA with the grad call split into query-row chunks.
+
+    Forward is the stock TND call (same tensors, bitwise-identical outputs); backward replaces the single
+    ``aclnnSparseFlashAttentionGrad`` call with fixed-size query-row chunks so the kernel's transient workspace
+    no longer scales with the shard's whole query length (see ``_SFA_GRAD_ROW_CHUNK``). Each chunk end-clips
+    every touched segment's KV span at the chunk's last row's causal extent so the kernel's per-segment causal
+    mask (row j attends kv ``[0, j + W - Q]`` within the call) reproduces the unchunked geometry exactly, and
+    passes segments the chunk does not touch as zero-length spans (accepted by the kernel). Chunk inputs are
+    contiguous views of the forward tensors, so chunking adds no copies. dq/dq_rope are bitwise-identical to
+    the unchunked grad; dk/dv/dk_rope accumulate the per-chunk kernel partials in place, i.e. the same sums
+    regrouped (reassociation-class differences only). The upstream slice-view scatter and all-gather
+    reduce-scatter contract is identical to :class:`_SpTndSparseMlaFn`.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q_nope: Tensor,
+        q_rope: Tensor,
+        key_tnd: Tensor,
+        key_rope_tnd: Tensor,
+        indices: Tensor,
+        cu_q: Tensor,
+        cu_k: Tensor,
+        kv_slice_offset: int,
+        shard_start: int,
+        seq_len: int,
+        num_heads: int,
+        scale_value: float,
+        row_chunk: int,
+    ) -> SparseMLAOutputs:
+        device = q_nope.device
+        query_tnd = q_nope.contiguous()  # [S, N, Rkv]
+        query_rope_tnd = q_rope.contiguous()  # [S, N, Dr]
+
+        sparse_indices = _rewrite_invalid_indices(indices, shard_start, device)
+        sparse_indices_tnd = _global_to_local_indices(sparse_indices, cu_q, cu_k, kv_slice_offset, seq_len, device)
+
+        attn_outs = torch_npu.npu_sparse_flash_attention(
+            query_tnd,
+            key_tnd,
+            key_tnd,  # value = key (absorbed MLA)
+            sparse_indices=sparse_indices_tnd,
+            block_table=None,
+            actual_seq_lengths_query=cu_q,
+            actual_seq_lengths_kv=cu_k,
+            query_rope=query_rope_tnd,
+            key_rope=key_rope_tnd,
+            scale_value=scale_value,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="TND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=True,
+        )
+        outputs = _parse_attn_outs(attn_outs, seq_len, num_heads, device)
+        ctx.mark_non_differentiable(outputs.softmax_lse)
+        ctx.scale_value = scale_value
+        ctx.row_chunk = row_chunk
+        ctx.save_for_backward(
+            query_tnd,
+            query_rope_tnd,
+            key_tnd,
+            key_rope_tnd,
+            sparse_indices_tnd,
+            outputs.raw_output,
+            attn_outs[1].float().contiguous(),
+            attn_outs[2].float().contiguous(),
+            cu_q,
+            cu_k,
+        )
+        return outputs
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: Tensor,
+        _grad_lse: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, None, None, None, None, None, None, None, None, None]:
+        query_tnd, query_rope_tnd, key_tnd, key_rope_tnd, sparse_indices_tnd, raw_output, smax, ssum, cu_q, cu_k = (
+            ctx.saved_tensors
+        )
+        grad_out = grad_output.reshape(query_tnd.shape).contiguous().to(query_tnd.dtype)
+        dq, dk, dv, dqr, dkr = _sfa_grad_chunked(
+            query_tnd,
+            query_rope_tnd,
+            key_tnd,
+            key_rope_tnd,
+            sparse_indices_tnd,
+            grad_out,
+            raw_output,
+            smax,
+            ssum,
+            cu_q,
+            cu_k,
+            ctx.scale_value,
+            ctx.row_chunk,
+        )
+        # Slice grads; autograd scatters them into the full-width buffers and
+        # the upstream all-gather reduce-scatters them unchanged.
+        return dq, dqr, dk + dv, dkr, None, None, None, None, None, None, None, None, None
+
+
+def _sfa_grad_chunked(
+    query_tnd: Tensor,
+    query_rope_tnd: Tensor,
+    key_tnd: Tensor,
+    key_rope_tnd: Tensor,
+    sparse_indices_tnd: Tensor,
+    grad_out: Tensor,
+    raw_output: Tensor,
+    smax: Tensor,
+    ssum: Tensor,
+    cu_q: Tensor,
+    cu_k: Tensor,
+    scale_value: float,
+    row_chunk: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Run ``npu_sparse_flash_attention_grad`` in query-row chunks of ``row_chunk`` rows.
+
+    Per chunk ``[r0, r1)`` the touched segments' query rows form one contiguous range, so all chunk inputs are
+    views; each touched segment's KV span is end-clipped at ``min(qe, r1) - qs - 1 + (W_s - Q_s) + 1`` (the
+    chunk's last row's causal extent within that segment) and untouched segments are passed zero-length. The
+    kernel's partial grads are accumulated into full-width bf16 buffers in place.
+
+    Args:
+        query_tnd (Tensor): Packed query ``[S, N, Rkv]``.
+        query_rope_tnd (Tensor): Packed query rope ``[S, N, Dr]``.
+        key_tnd (Tensor): Packed (prefix-extended) key ``[L, 1, Rkv]``.
+        key_rope_tnd (Tensor): Packed key rope ``[L, 1, Dr]``.
+        sparse_indices_tnd (Tensor): Per-segment local top-k indices ``[S, 1, topk]``.
+        grad_out (Tensor): Output grad reshaped to ``query_tnd``'s shape.
+        raw_output (Tensor): Saved forward output ``[S, N, Rkv]``.
+        smax (Tensor): Saved forward softmax max ``[1, S, N]`` float32.
+        ssum (Tensor): Saved forward softmax sum ``[1, S, N]`` float32.
+        cu_q (Tensor): Query cu-seq-lens ``[n_seg + 1]`` int32.
+        cu_k (Tensor): KV cu-seq-lens ``[n_seg + 1]`` int32.
+        scale_value (float): Attention scale.
+        row_chunk (int): Query rows per grad call (positive).
+
+    Returns:
+        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: ``(dq, dk, dv, dq_rope, dk_rope)`` full-width grads.
+    """
+    q_bounds = [int(v) for v in cu_q.tolist()]
+    k_bounds = [int(v) for v in cu_k.tolist()]
+    n_seg = len(q_bounds) - 1
+    device = query_tnd.device
+    seq_len = query_tnd.shape[0]
+    kv_len = key_tnd.shape[0]
+
+    dq = torch.empty_like(query_tnd)
+    dq_rope = torch.empty_like(query_rope_tnd)
+    dk = torch.zeros(kv_len, key_tnd.shape[1], key_tnd.shape[2], dtype=query_tnd.dtype, device=device)
+    dv = torch.zeros_like(dk)
+    dk_rope = torch.zeros(kv_len, key_rope_tnd.shape[1], key_rope_tnd.shape[2], dtype=query_tnd.dtype, device=device)
+
+    smax_3d = smax.dim() == 3
+    for r0 in range(0, seq_len, row_chunk):
+        r1 = min(r0 + row_chunk, seq_len)
+        first = next(s for s in range(n_seg) if q_bounds[s + 1] > r0)
+        last = n_seg - 1
+        while q_bounds[last] >= r1:
+            last -= 1
+        q_lo = max(q_bounds[first], r0)
+        q_hi = min(q_bounds[last + 1], r1)
+        row_sl = slice(q_lo, q_hi)
+        # End-clip each touched segment's KV span at the chunk's last row's causal extent; interior segments
+        # clamp back to their full span, so the touched spans stay one contiguous KV range.
+        kv_ends: list[int] = []
+        for s in range(first, last + 1):
+            shift_s = (k_bounds[s + 1] - k_bounds[s]) - (q_bounds[s + 1] - q_bounds[s])
+            kv_ends.append((min(q_bounds[s + 1], r1) - q_bounds[s] - 1) + shift_s + 1)
+        kv_total = sum(kv_ends)
+        kv_lo = k_bounds[first]
+        k_cum = [0] * (first + 1)
+        running = 0
+        for end_s in kv_ends:
+            running += end_s
+            k_cum.append(running)
+        k_cum.extend([kv_total] * (n_seg - last - 1))
+        dq_c, dk_c, dv_c, dqr_c, dkr_c = torch_npu.npu_sparse_flash_attention_grad(
+            query_tnd[row_sl].contiguous(),
+            key_tnd[kv_lo : kv_lo + kv_total],
+            key_tnd[kv_lo : kv_lo + kv_total],
+            sparse_indices_tnd[row_sl].contiguous(),
+            grad_out[row_sl].contiguous(),
+            raw_output[row_sl].contiguous(),
+            (smax[:, row_sl, :] if smax_3d else smax[row_sl]).contiguous(),
+            (ssum[:, row_sl, :] if smax_3d else ssum[row_sl]).contiguous(),
+            scale_value,
+            1,  # sparse_block_size
+            query_rope=query_rope_tnd[row_sl].contiguous(),
+            key_rope=key_rope_tnd[kv_lo : kv_lo + kv_total],
+            actual_seq_qlen=torch.tensor(
+                [min(max(b - q_lo, 0), q_hi - q_lo) for b in q_bounds], dtype=torch.int32, device=device
+            ),
+            actual_seq_kvlen=torch.tensor(k_cum, dtype=torch.int32, device=device),
+            layout="TND",
+            sparse_mode=3,
+            attention_mode=2,
+        )
+        dq[q_lo:q_hi] = dq_c
+        dq_rope[q_lo:q_hi] = dqr_c
+        dk[kv_lo : kv_lo + kv_total] += dk_c
+        dv[kv_lo : kv_lo + kv_total] += dv_c
+        dk_rope[kv_lo : kv_lo + kv_total] += dkr_c
+        del dq_c, dk_c, dv_c, dqr_c, dkr_c
+    return dq, dk, dv, dq_rope, dk_rope
+
+
 # ---------------------------------------------------------------------------
 # Single-sequence path (BSND)
 # ---------------------------------------------------------------------------
@@ -655,6 +895,29 @@ def _sparse_mla_tnd_packed(
         value_tnd = key_tnd
         key_rope_tnd = k_rope[kv_start:kv_end].contiguous()
         kv_slice_offset = kv_start
+
+    if _SFA_GRAD_ROW_CHUNK:
+        # Chunked-grad path: identical stock forward; the backward splits the
+        # aclnnSparseFlashAttentionGrad call into query-row chunks so its
+        # workspace stops scaling with the shard's whole query length
+        # (job dyb-q35-xtuner-19).
+        return SparseMLAOutputs(
+            *_SpTndSparseMlaChunkedGradFn.apply(
+                q_nope,
+                q_rope,
+                key_tnd,
+                key_rope_tnd,
+                indices,
+                cu_seq_q_local,
+                cu_seq_k_local,
+                kv_slice_offset,
+                shard_start,
+                seq_len,
+                num_heads,
+                scale_value,
+                _SFA_GRAD_ROW_CHUNK,
+            )
+        )
 
     # TND tensors (no batch dim)
     query_tnd = q_nope.contiguous()  # [S, N, Rkv]

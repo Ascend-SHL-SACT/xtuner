@@ -46,6 +46,7 @@ os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "1")
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model.moe.glm52 import DSAMLAConfig
 from xtuner.v1.model.utils import apply_activation_checkpointing
+from xtuner.v1.ops.sparse_mla import npu_sparse_mla as npu_sparse_mla_mod
 from xtuner.v1.ops.sparse_mla import sparse_mla
 from xtuner.v1.utils.test_utils import init_data_mesh
 
@@ -908,6 +909,229 @@ class TestNPUSparseMLASP8PackedTND:
                 actual.raw_output, expected.raw_output,
                 atol=BF16_ATOL, rtol=BF16_RTOL,
                 msg=f"SP8 large rank{rank} mismatch")
+# ── 行分块反向 (XTUNER_SFA_GRAD_ROW_CHUNK) 测试 ──────────────────────────
+
+
+def _make_prefix_segment_case(
+    segs: list[tuple[int, int]], num_heads: int = 8, topk: int = 64, seed: int = 0, device: str = "npu"
+):
+    """构造 suffix-aligned 前缀扩展多段 case（SP>1 生产几何的单元级缩影）。
+
+    段内行 j 的因果上界 = ``j + (w_s - q_s)``（段内局部 KV 坐标）；indices 为
+    段内局部坐标，跨窗口 spread 采样并保证对角线（自位置）在列。
+
+    Args:
+        segs (list[tuple[int, int]]): 每段 ``(q_s, w_s)``，w_s >= q_s。
+        num_heads (int): 注意力头数。
+        topk (int): 每行选中 KV 槽位数。
+        seed (int): 随机种子。
+        device (str): 目标设备。
+
+    Returns:
+        tuple: ``(query, query_rope, key, key_rope, indices, cu_q, cu_k)``。
+    """
+    import torch_npu  # noqa: F401
+
+    g = torch.Generator().manual_seed(seed)
+    q_parts, qr_parts, k_parts, kr_parts, i_parts = [], [], [], [], []
+    q_lens, kv_lens = [], []
+    for q_s, w_s in segs:
+        q_parts.append(torch.randn(q_s, num_heads, VALUE_DIM, generator=g).to(device, torch.bfloat16))
+        qr_parts.append(torch.randn(q_s, num_heads, 64, generator=g).to(device, torch.bfloat16))
+        k_parts.append(torch.randn(w_s, 1, VALUE_DIM, generator=g).to(device, torch.bfloat16))
+        kr_parts.append(torch.randn(w_s, 1, 64, generator=g).to(device, torch.bfloat16))
+        pos_hi = torch.arange(q_s, device=device) + (w_s - q_s)
+        base = torch.arange(topk, device=device).unsqueeze(0)
+        idx = (base * (pos_hi + 1).unsqueeze(1) // topk).clamp_(max=pos_hi.unsqueeze(1))
+        idx[:, -1] = pos_hi
+        i_parts.append(idx.unsqueeze(1).to(torch.int32))
+        q_lens.append(q_s)
+        kv_lens.append(w_s)
+    cu_q = torch.tensor([0] + list(torch.tensor(q_lens).cumsum(0)), dtype=torch.int32, device=device)
+    cu_k = torch.tensor([0] + list(torch.tensor(kv_lens).cumsum(0)), dtype=torch.int32, device=device)
+    return (
+        torch.cat(q_parts).contiguous(),
+        torch.cat(qr_parts).contiguous(),
+        torch.cat(k_parts).contiguous(),
+        torch.cat(kr_parts).contiguous(),
+        torch.cat(i_parts).contiguous(),
+        cu_q,
+        cu_k,
+    )
+
+
+def _run_grad_pair(case, grad_out, row_chunk: int):
+    """整段 stock grad 调用与 ``_sfa_grad_chunked`` 各跑一次，返回 (ref5, chunked5)。
+
+    两者输出元组序一致: ``(dq, dk, dv, dq_rope, dk_rope)``。
+    """
+    import torch_npu
+
+    query, query_rope, key, key_rope, indices, cu_q, cu_k = case
+    outs = torch_npu.npu_sparse_flash_attention(
+        query,
+        key,
+        key,
+        sparse_indices=indices,
+        block_table=None,
+        actual_seq_lengths_query=cu_q,
+        actual_seq_lengths_kv=cu_k,
+        query_rope=query_rope,
+        key_rope=key_rope,
+        scale_value=SCALING,
+        sparse_block_size=1,
+        layout_query="TND",
+        layout_kv="TND",
+        sparse_mode=3,
+        attention_mode=2,
+        return_softmax_lse=True,
+    )
+    raw = outs[0].contiguous()
+    smax = outs[1].float().contiguous()
+    ssum = outs[2].float().contiguous()
+    _sync()
+    ref = torch_npu.npu_sparse_flash_attention_grad(
+        query,
+        key,
+        key,
+        indices,
+        grad_out,
+        raw,
+        smax,
+        ssum,
+        SCALING,
+        1,
+        query_rope=query_rope,
+        key_rope=key_rope,
+        actual_seq_qlen=cu_q,
+        actual_seq_kvlen=cu_k,
+        layout="TND",
+        sparse_mode=3,
+        attention_mode=2,
+    )
+    _sync()
+    got = npu_sparse_mla_mod._sfa_grad_chunked(
+        query,
+        query_rope,
+        key,
+        key_rope,
+        indices,
+        grad_out,
+        raw,
+        smax,
+        ssum,
+        cu_q,
+        cu_k,
+        SCALING,
+        row_chunk,
+    )
+    _sync()
+    return ref, got
+
+
+@pytest.mark.skipif(not _npu_available(), reason="requires NPU environment")
+class TestSfaGradRowChunk:
+    """行分块反向与整段调用的等价性（job dyb-q35-xtuner-19 的回归测试）。
+
+    16K 行 shard 一次 grad 调用 workspace 4.4-4.7 GiB，紧 ranks 缺 40-330 MiB
+    OOM；分块后瞬态 ~0.2 GiB/1K 行。dq/dq_rope 逐位等，dk/dv/dk_rope 为同一
+    fp32 和的重分组（重排舍入级，DKV 阈值内）。
+    """
+
+    def test_parse_sfa_grad_row_chunk(self):
+        """env 解析: 非法值报错，<=0 归一为 0（stock），正值透传。"""
+        parse = npu_sparse_mla_mod._parse_sfa_grad_row_chunk
+        assert parse("0") == 0
+        assert parse("1024") == 1024
+        assert parse("-3") == 0
+        with pytest.raises(ValueError, match="not a valid int"):
+            parse("abc")
+
+    def test_chunk_geq_seq_len_matches_stock(self):
+        """chunk >= 总行数时等价单次调用: dq/dq_rope 逐位等，kv 类梯度 DKV 阈值内。
+
+        kernel 的 dk/dv/dkr 本身跨调用非确定（同参数两次调用 1-2 ULP 抖动，
+        原子归约序），逐位门只对 dq/dq_rope 成立。
+        """
+        case = _make_prefix_segment_case([(1024, 1024)], seed=1)
+        grad_out = torch.randn(1024, 8, VALUE_DIM, device="npu", dtype=torch.bfloat16)
+        ref, got = _run_grad_pair(case, grad_out, row_chunk=1 << 30)
+        assert torch.equal(ref[0], got[0]), "dq mismatch"
+        assert torch.equal(ref[3], got[3]), "dq_rope mismatch"
+        for i, name in ((1, "dk"), (2, "dv"), (4, "dk_rope")):
+            torch.testing.assert_close(got[i].float(), ref[i].float(), atol=DKV_ATOL, rtol=DKV_RTOL, msg=name)
+
+    def test_chunked_single_segment_dq_bitwise(self):
+        """单段 mid-cut 分块: dq/dq_rope 逐位等，kv 类梯度在 DKV 阈值内。"""
+        case = _make_prefix_segment_case([(4096, 4096)], seed=2)
+        grad_out = torch.randn(4096, 8, VALUE_DIM, device="npu", dtype=torch.bfloat16)
+        ref, got = _run_grad_pair(case, grad_out, row_chunk=1024)
+        assert torch.equal(ref[0], got[0]), "dq mismatch"
+        assert torch.equal(ref[3], got[3]), "dq_rope mismatch"
+        for i, name in ((1, "dk"), (2, "dv"), (4, "dk_rope")):
+            torch.testing.assert_close(got[i].float(), ref[i].float(), atol=DKV_ATOL, rtol=DKV_RTOL, msg=name)
+
+    def test_chunked_multi_segment_prefix_extended(self):
+        """三段前缀扩展几何、chunk=600 错切段中: dq 逐位等，kv 类梯度阈值内。
+
+        覆盖: 首段 W>Q 前缀扩展、chunk 从段中开始/结束、跨段 chunk、
+        未触及段的零长 cu 条目。
+        """
+        segs = [(512, 1024), (1024, 1024), (512, 512)]
+        case = _make_prefix_segment_case(segs, seed=3)
+        grad_out = torch.randn(sum(q for q, _ in segs), 8, VALUE_DIM, device="npu", dtype=torch.bfloat16)
+        ref, got = _run_grad_pair(case, grad_out, row_chunk=600)
+        assert torch.equal(ref[0], got[0]), "dq mismatch"
+        assert torch.equal(ref[3], got[3]), "dq_rope mismatch"
+        for i, name in ((1, "dk"), (2, "dv"), (4, "dk_rope")):
+            torch.testing.assert_close(got[i].float(), ref[i].float(), atol=DKV_ATOL, rtol=DKV_RTOL, msg=name)
+
+
+@pytest.mark.skipif(not _npu_available(), reason="requires NPU environment")
+class TestSfaGradRowChunkDispatch:
+    def test_packed_backward_uses_row_chunks_and_matches_stock(self, monkeypatch):
+        """SP8 packed 路径: 分块开启时 grad 调用按 chunk 拆分，q 梯度逐位等于 stock。"""
+        import torch_npu
+
+        sp8 = TestNPUSparseMLASP8PackedTND()
+        q, kv, indices, seq_ctx, ss, sz, _total = sp8._make_sp8_packed_inputs(3)
+        local_q = q[ss : ss + sz]
+        local_indices = indices[ss : ss + sz]
+
+        def run_backward(row_chunk_value: int, grad_out: torch.Tensor):
+            monkeypatch.setattr(npu_sparse_mla_mod, "_SFA_GRAD_ROW_CHUNK", row_chunk_value)
+            q_leaf = local_q.detach().clone().requires_grad_(True)
+            kv_leaf = kv.detach().clone().requires_grad_(True)
+            out = sparse_mla(
+                q_leaf,
+                kv_leaf,
+                local_indices,
+                scaling=SCALING,
+                value_dim=VALUE_DIM,
+                backend="torch_npu",
+                seq_ctx=seq_ctx,
+            )
+            calls = {"grad": 0}
+
+            orig_grad = torch_npu.npu_sparse_flash_attention_grad
+
+            def counting_grad(*args, **kwargs):
+                calls["grad"] += 1
+                return orig_grad(*args, **kwargs)
+
+            monkeypatch.setattr(torch_npu, "npu_sparse_flash_attention_grad", counting_grad)
+            out.raw_output.backward(grad_out)
+            _sync()
+            return q_leaf.grad, kv_leaf.grad, calls["grad"]
+
+        # 两次 run 共用同一 grad_out，隔离反向路径差异。
+        grad_out = torch.randn(128, 8, VALUE_DIM, device="npu", dtype=torch.bfloat16)
+        q_stock, kv_stock, _ = run_backward(0, grad_out)
+        q_chunked, kv_chunked, n_calls = run_backward(48, grad_out)
+        # 128 行 shard、chunk=48 → 3 次 grad 调用（stock 走 autograd 内部, 不经 python 属性）。
+        assert n_calls == 3, f"expected 3 chunked grad calls, got {n_calls}"
+        assert torch.equal(q_stock, q_chunked), "q grad mismatch vs stock"
+        torch.testing.assert_close(kv_chunked.float(), kv_stock.float(), atol=DKV_ATOL, rtol=DKV_RTOL)
 
 
 if __name__ == "__main__":
