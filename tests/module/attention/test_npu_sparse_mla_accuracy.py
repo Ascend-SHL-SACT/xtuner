@@ -1132,6 +1132,107 @@ class TestSfaGradRowChunkDispatch:
         assert n_calls == 3, f"expected 3 chunked grad calls, got {n_calls}"
         assert torch.equal(q_stock, q_chunked), "q grad mismatch vs stock"
         torch.testing.assert_close(kv_chunked.float(), kv_stock.float(), atol=DKV_ATOL, rtol=DKV_RTOL)
+    def test_offload_backward_uses_row_chunks_and_matches_stock(self, monkeypatch):
+        """SP_MLA_OFFLOAD=1 臂（512N 生产臂）: 分块开启时 3 次调用，q 梯度逐位等于 stock 单次。"""
+        import torch_npu
+
+        sp8 = TestNPUSparseMLASP8PackedTND()
+        q, kv, indices, seq_ctx, ss, sz, _total = sp8._make_sp8_packed_inputs(3)
+        local_q = q[ss : ss + sz]
+        local_indices = indices[ss : ss + sz]
+        monkeypatch.setattr(npu_sparse_mla_mod, "_sp_mla_offload_enabled", lambda: True)
+        # 本测试几何的 KV slice 远小于生产门控默认值，钉 0 强制走 pinned offload 路径。
+        monkeypatch.setattr(npu_sparse_mla_mod, "_SFA_GRAD_OFFLOAD_MIN_KV", 0)
+
+        def run_backward(row_chunk_value: int, grad_out: torch.Tensor):
+            monkeypatch.setattr(npu_sparse_mla_mod, "_SFA_GRAD_ROW_CHUNK", row_chunk_value)
+            q_leaf = local_q.detach().clone().requires_grad_(True)
+            kv_leaf = kv.detach().clone().requires_grad_(True)
+            out = sparse_mla(
+                q_leaf,
+                kv_leaf,
+                local_indices,
+                scaling=SCALING,
+                value_dim=VALUE_DIM,
+                backend="torch_npu",
+                seq_ctx=seq_ctx,
+            )
+            calls = {"grad": 0}
+
+            orig_grad = torch_npu.npu_sparse_flash_attention_grad
+
+            def counting_grad(*args, **kwargs):
+                calls["grad"] += 1
+                return orig_grad(*args, **kwargs)
+
+            monkeypatch.setattr(torch_npu, "npu_sparse_flash_attention_grad", counting_grad)
+            out.raw_output.backward(grad_out)
+            _sync()
+            return q_leaf.grad, kv_leaf.grad, calls["grad"]
+
+        grad_out = torch.randn(128, 8, VALUE_DIM, device="npu", dtype=torch.bfloat16)
+        q_stock, kv_stock, n_stock = run_backward(0, grad_out)
+        q_chunked, kv_chunked, n_calls = run_backward(48, grad_out)
+        assert n_stock == 1, f"expected 1 stock grad call, got {n_stock}"
+        assert n_calls == 3, f"expected 3 chunked grad calls, got {n_calls}"
+        assert torch.equal(q_stock, q_chunked), "q grad mismatch vs stock"
+        torch.testing.assert_close(kv_chunked.float(), kv_stock.float(), atol=DKV_ATOL, rtol=DKV_RTOL)
+
+    def test_offload_span_gate_skips_pinned_copies_and_matches_stock(self, monkeypatch):
+        """短 slice 门控（XTUNER_SFA_GRAD_OFFLOAD_MIN_KV）: slice ≤ 阈值时 forward 不再分配
+        pinned 拷贝（全部留 device），分块 backward 照常运行且 q 梯度逐位等于 stock。"""
+        sp8 = TestNPUSparseMLASP8PackedTND()
+        q, kv, indices, seq_ctx, ss, sz, _total = sp8._make_sp8_packed_inputs(3)
+        local_q = q[ss : ss + sz]
+        local_indices = indices[ss : ss + sz]
+        monkeypatch.setattr(npu_sparse_mla_mod, "_sp_mla_offload_enabled", lambda: True)
+        monkeypatch.setattr(npu_sparse_mla_mod, "_SFA_GRAD_ROW_CHUNK", 48)
+
+        pin_calls = {"n": 0}
+        orig_empty = torch.empty
+
+        def counting_empty(*args, **kwargs):
+            if kwargs.get("pin_memory"):
+                pin_calls["n"] += 1
+            return orig_empty(*args, **kwargs)
+
+        def run_forward_backward(grad_out: torch.Tensor):
+            # 只暂换 torch.empty 计数 pinned 分配，手动恢复——不动 monkeypatch 的模块属性补丁。
+            torch.empty = counting_empty
+            try:
+                q_leaf = local_q.detach().clone().requires_grad_(True)
+                kv_leaf = kv.detach().clone().requires_grad_(True)
+                out = sparse_mla(
+                    q_leaf,
+                    kv_leaf,
+                    local_indices,
+                    scaling=SCALING,
+                    value_dim=VALUE_DIM,
+                    backend="torch_npu",
+                    seq_ctx=seq_ctx,
+                )
+            finally:
+                torch.empty = orig_empty
+            out.raw_output.backward(grad_out)
+            _sync()
+            return q_leaf.grad, kv_leaf.grad
+
+        # 门控默认 131072 > 本几何 slice 长度: 无 pinned 分配, 梯度与 stock 逐位一致。
+        grad_out = torch.randn(128, 8, VALUE_DIM, device="npu", dtype=torch.bfloat16)
+        q_gated, kv_gated = run_forward_backward(grad_out)
+        assert pin_calls["n"] == 0, f"expected 0 pinned allocs on short slice, got {pin_calls['n']}"
+
+        monkeypatch.setattr(npu_sparse_mla_mod, "_SFA_GRAD_OFFLOAD_MIN_KV", 0)
+        pin_calls["n"] = 0
+        q_offloaded, kv_offloaded = run_forward_backward(grad_out)
+        assert pin_calls["n"] >= 5, f"expected >=5 pinned allocs when gate disabled, got {pin_calls['n']}"
+        assert torch.equal(q_gated, q_offloaded), "q grad mismatch: gated vs offloaded"
+        # dk/dv 走 kernel 原子累加（跨调用非确定），与既有测试一致只做 allclose。
+        torch.testing.assert_close(kv_gated.float(), kv_offloaded.float(), atol=DKV_ATOL, rtol=DKV_RTOL)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])
 
 
 if __name__ == "__main__":
