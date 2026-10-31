@@ -1235,5 +1235,3 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
