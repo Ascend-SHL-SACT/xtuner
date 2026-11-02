@@ -22,6 +22,7 @@ layer -- so ``self.norm``/``lm_head``/MTP never see the 4-stream shape (design d
 via a peer review of this exact expand/collapse boundary).
 """
 
+import os
 import re
 from pathlib import Path
 from typing import Literal, cast
@@ -130,9 +131,17 @@ class Glm53TextMoE(MoE):
             # micro-batch path (moe.py `_micro_batch_forward`).
             if self.config.return_hidden_states:
                 raise RuntimeError("XTUNER_ACTIVATION_OFFLOAD_NPU does not support return_hidden_states=True.")
+            # XTUNER_ACT_OFFLOAD_FIRST_LAYER overrides the chain's first wrapped layer
+            # (default: first_k_dense_replace). Setting 0 also parks the dense layers 0-2's
+            # inputs; layer 0's input is the mHC-expanded embedding copy (hc_mult x
+            # hidden_size, frame-exclusive storage via _expand_hc's .contiguous()), the
+            # largest single resident activation of the pass.
+            first_offload_layer = int(
+                os.environ.get("XTUNER_ACT_OFFLOAD_FIRST_LAYER", str(self.config.first_k_dense_replace))
+            )
             register_activation_offload_npu_hooks(
                 model_layers=self.layers,
-                first_offload_layer=self.config.first_k_dense_replace,
+                first_offload_layer=first_offload_layer,
                 chain_id="glm53_text",
             )
             setattr(
