@@ -168,8 +168,6 @@ class NoPEDSAMLAConfig(MLAConfig):
     # Independent of `sparse_mla_backend` above, which is `flash_mla_cudnn` here and is not
     # even a valid indexer backend -- inheriting it would never have worked.
     # DeepSelect may replace only TopK or both scoring and TopK (cooperative SM90 path).
-    # Opt in with "tilelang_cooperative" for cooperative BF16 scoring + DeepSelect.
-    # Requires SM90+, BF16 Q/K with 32 heads x 128, and an installed DeepSelect module.
     indexer_backend: KPoolIndexerBackend = "tilelang"
     # Bound logits memory with query chunks; cooperative scoring reuses FP32 scratch.
     indexer_topk_query_chunk_size: int | None = Field(default=1024, gt=0)
