@@ -1,7 +1,7 @@
 import torch
 from torch.optim import Optimizer as TorchOptimizer
 
-from xtuner.v1.utils import get_torch_device_module
+from xtuner.v1.utils import get_device, get_torch_device_module
 
 
 class Optimizer(TorchOptimizer):
@@ -24,6 +24,13 @@ class Optimizer(TorchOptimizer):
         # An accelerator device without an index names the current device.
         if target.type != "cpu" and target.index is None:
             target = torch.device(target.type, get_torch_device_module().current_device())
+        # Under torch_npu's transfer_to_npu shim a `torch.device("cuda")` argument keeps type
+        # "cuda" while live tensors report "npu"; alias the requested accelerator to the runtime
+        # accelerator so the per-tensor comparison below sees equivalent devices. No-op when the
+        # types already match (plain CUDA or CPU runs).
+        accel = get_device()
+        if target.type != "cpu" and accel != "cpu" and target.type != accel:
+            target = torch.device(accel, target.index)
 
         moved = False
         for state in self.state.values():
