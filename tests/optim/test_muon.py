@@ -36,6 +36,7 @@ from xtuner.v1.model.base import BaseModel, XTunerBaseModelConfig
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseMLP
 from xtuner.v1.optim import AdamW, SwapAdamW
 from xtuner.v1.optim.muon import Muon, _muonsplit_newton_schulz, muon_update_newton_schulz, zeropower_via_newtonschulz5
+from xtuner.v1.utils.device import get_device
 
 
 # ─── Test: Newton-Schulz functions ───────────────────────────────────────────
@@ -298,7 +299,7 @@ class ReferenceMuon(torch.optim.Optimizer):
                     # Newton-Schulz orthogonalization
                     X = U.to(dtype=torch.bfloat16)
                     N = X.size(-1)
-                    X = X.view(num_experts, -1, N)
+                    X = X.reshape(num_experts, -1, N)
                     need_transpose = X.size(-2) > X.size(-1)
                     if need_transpose:
                         X = X.mT
@@ -309,7 +310,7 @@ class ReferenceMuon(torch.optim.Optimizer):
                         X = a * X + B @ X
                     if need_transpose:
                         X = X.mT
-                    X = X.view(U.shape)
+                    X = X.reshape(U.shape)
 
                     # Weight decay (uses base_lr, not adjusted_lr)
                     base_lr = group["base_lr"]
@@ -537,7 +538,7 @@ class TestMuonSingleGPU(DeterministicDDPTestCase):
         assert engine.put_optimizer_to_device("cuda") is False
         for (param, key), expected in values.items():
             actual = optimizer.state[param][key]
-            assert actual.device.type == ("cpu" if swap else "cuda")
+            assert actual.device.type == ("cpu" if swap else get_device())
             assert torch.equal(actual.cpu(), expected)
 
         for group in optimizer.param_groups:
