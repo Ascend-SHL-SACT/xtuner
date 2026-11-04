@@ -117,16 +117,23 @@ def _parse_row_chunk(raw: str) -> int:
 _SCORE_ROW_CHUNK = _parse_row_chunk(os.environ.get("XTUNER_KPOOL_SCORE_ROW_CHUNK", "1024"))
 
 # SP work-balancing overrides for the indexer scorer (see ``npu_kpool_topk_indices``). The
-# launch scripts export both; unset keeps the caller's config values untouched.
+# launch scripts export both; an unset ``XTUNER_INDEXER_SP_WORK_RATIO`` selects the
+# auto-calibrated fixed work below.
 _ENV_BALANCE_SP: bool | None = (
     None if (raw := os.environ.get("XTUNER_INDEXER_BALANCE_SP")) is None else raw.lower() in ("1", "true", "yes", "on")
 )
 _ENV_WORK_RATIO: float | None = None
-if (raw := os.environ.get("XTUNER_INDEXER_SP_WORK_RATIO")) is not None:
+if (raw := os.environ.get("XTUNER_INDEXER_SP_WORK_RATIO")) is not None and raw.strip():
     try:
         _ENV_WORK_RATIO = float(raw)
     except ValueError as exc:
         raise ValueError(f"XTUNER_INDEXER_SP_WORK_RATIO={raw!r} is not a valid float") from exc
+
+# Auto-calibrated per-query fixed work for balanced SP scoring, in absolute pool units. The
+# batched scorer's per-launch cost scales with rows x chunk-end visible pools, while the
+# position-independent per-row side (TopK, expand, P2P, launch amortization) corresponds to
+# ~4915 pools; an absolute count stays valid across pack lengths where a fixed ratio would not.
+_SP_FIXED_WORK_POOLS = 4915
 
 # Eager-fallback budget: at most 2**28 fp32 score elements per chunk (~1 GiB), matching the
 # pre-merge implementation's ``_score_chunk_elems``.
@@ -182,7 +189,7 @@ def npu_kpool_topk_indices(
     alignment: int = 512,
     query_chunk_size: int | None = None,
     balance_sp: bool = False,
-    sp_full_pool_work_ratio: float = 0.5,
+    sp_full_pool_work_ratio: float | None = None,
 ) -> Tensor:
     """NPU KPool indexer top-k: build pools (A), score + top-k per document segment (B),
     expand back to token ids + tail (C).
@@ -210,8 +217,10 @@ def npu_kpool_topk_indices(
         balance_sp (bool): Redistribute query scoring work with neighbor P2P (same
             protocol as the TileLang backends), then restore attention ownership
             before token expansion and tail selection.
-        sp_full_pool_work_ratio (float): Fixed per-query selection/launch estimate
-            relative to the full pool width. Must be finite and nonnegative.
+        sp_full_pool_work_ratio (float): Fixed per-query selection/launch estimate relative to
+            the full pool width. Kept for call-site parity with the TileLang backends; this
+            backend derives the fixed work from ``_SP_FIXED_WORK_POOLS`` (capped at half the
+            pool width) unless ``XTUNER_INDEXER_SP_WORK_RATIO`` sets an explicit ratio.
 
     Returns:
         Tensor: ``[S, 1, kpool_output_width(index_topk, index_kpool, alignment)]`` int32.
@@ -239,9 +248,14 @@ def npu_kpool_topk_indices(
     if _ENV_BALANCE_SP is not None:
         balance_sp = _ENV_BALANCE_SP
     if _ENV_WORK_RATIO is not None:
-        sp_full_pool_work_ratio = _ENV_WORK_RATIO
-    if not math.isfinite(sp_full_pool_work_ratio) or sp_full_pool_work_ratio < 0:
-        raise ValueError("sp_full_pool_work_ratio must be finite and nonnegative")
+        if not math.isfinite(_ENV_WORK_RATIO) or _ENV_WORK_RATIO < 0:
+            raise ValueError("XTUNER_INDEXER_SP_WORK_RATIO must be finite and nonnegative")
+        per_query_work = round(pool_key.shape[0] * _ENV_WORK_RATIO)
+    else:
+        # Auto default: the calibrated absolute fixed work, capped at half the pool width
+        # (the per-query average visible-pool count). Short packs take the cap and recover
+        # the legacy half-width ratio; full-length packs take the calibrated constant.
+        per_query_work = min(_SP_FIXED_WORK_POOLS, pool_key.shape[0] // 2)
 
     # SP work balancing: the causal score rectangle grows with the query's position, so under
     # a uniform shard the last rank scores ~the full pool width while the first scores almost
@@ -265,7 +279,7 @@ def npu_kpool_topk_indices(
             seq_ctx,
             index_kpool,
             query_alignment,
-            round(pool_key.shape[0] * sp_full_pool_work_ratio),
+            per_query_work,
             query_len=seq_len,
         )
         if partition is not None:
