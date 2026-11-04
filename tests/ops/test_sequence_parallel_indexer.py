@@ -68,7 +68,7 @@ class TestIndexerSPPartition:
             balanced_query_partition((0, 15), 4, 4)
 
 
-def _cpu_selector(q, k, weights, starts, ends, topk, query_chunk_size=None):
+def _cpu_selector(q, k, weights, starts, ends, topk, query_chunk_size=None, selector="torch"):
     scores = torch.einsum("qhd,kd->qhk", q.float(), k.float()).relu()
     scores = torch.einsum("qhk,qh->qk", scores, weights)
     ids = torch.arange(k.shape[0])

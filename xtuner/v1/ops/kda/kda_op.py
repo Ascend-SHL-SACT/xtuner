@@ -13,9 +13,8 @@ entries' segment / pack-size limits, one per chunk-aligned group -- over a
 64-padded rebuild of the pack (``ChunkKDAVarlenFunction``,
 ``XTUNER_KDA_VARLEN=0`` restores the per-segment dense loop): every segment is
 padded to a 64 multiple inside a single packed buffer, so the fla_npu varlen
-entries see only aligned segments (their short-tail split path has a wheel
-bug) and the per-segment pad/slice/cat and autograd CopySlices launches
-disappear.
+entries see only aligned segments and the per-segment pad/slice/cat and
+autograd CopySlices launches disappear.
 
 Eager path: pure-torch reference ported from MindSpeed-MM
 ``mindspeed_mm/fsdp/ops/kda/chunk_kda_naive.py`` (chunked WY representation with
@@ -84,14 +83,6 @@ def _bsnd_to_bnsd(tensor: torch.Tensor) -> torch.Tensor:
 
 def _bnsd_to_bsnd(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.permute(0, 2, 1, 3).contiguous()
-
-
-def _bsh_to_bhs(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.permute(0, 2, 1).contiguous()
-
-
-def _bhs_to_bsh(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.permute(0, 2, 1).contiguous()
 
 
 def _check_intermediates(
@@ -206,7 +197,7 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
             _bsnd_to_bnsd(q),
             _bsnd_to_bnsd(k),
             _bsnd_to_bnsd(v),
-            _bsh_to_bhs(beta),
+            beta.contiguous(),
             g_cumsum,
             Aqk,
             Akk,
@@ -215,9 +206,9 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
             kg,
             v_new,
             h,
-            _bsnd_to_bnsd(do),
+            do.contiguous(),
             float(ctx.scale),
-            raw_g=_bsnd_to_bnsd(g_input) if ctx.use_gate_in_kernel else None,
+            raw_g=g_input.contiguous() if ctx.use_gate_in_kernel else None,
             A_log=A_log if ctx.use_gate_in_kernel else None,
             dt_bias=gate_dt_bias,
             initial_state=None,
@@ -229,10 +220,11 @@ class ChunkKDAAscendCFunction(torch.autograd.Function):
             disable_recompute=True,
             use_exp2=True,
             state_v_first=False,
+            layout="BNSD",
         )
 
         dq, dk, dv = map(_bnsd_to_bsnd, (dq_h, dk_h, dv_h))
-        db, dg = _bhs_to_bsh(db_h), _bnsd_to_bsnd(dg_h)
+        db, dg = db_h, dg_h
         if dbias is not None:
             dbias = dbias.reshape(dt_bias.shape)
 
@@ -597,8 +589,7 @@ class ChunkKDAVarlenFunction(torch.autograd.Function):
 
     Every packed segment is zero-padded to a multiple of ``CHUNK_SIZE`` inside
     a single rebuilt pack, so the fla_npu varlen entries only ever see aligned
-    segments (their short-tail split path is broken in the installed wheel)
-    and the whole pack -- forward and backward -- costs one kernel launch plus
+    segments and the whole pack -- forward and backward -- costs one kernel launch plus
     a handful of monotone repack gathers instead of a per-segment loop, until the
     pack passes the varlen entries' per-launch limits (forward: 1024 segments;
     backward: 64K padded tokens and a head-scaled bound); beyond them the pack
@@ -706,12 +697,14 @@ class ChunkKDAVarlenFunction(torch.autograd.Function):
         )
         do_p = _repack_padded(do, gather_pos, cu_t, pad_cu_t, ctx.cu_padded[-1], ctx.max_padded_len)
 
-        # The varlen bwd entry takes rank-3 head-major activations and an
+        # The varlen bwd entry (fla_npu >= 26.10 unified single-layout contract)
+        # takes rank-3 NTD head-major q/k/v, token-major d_o/beta/raw_g, and an
         # [H, K] dt_bias; the forward entry above takes the flat [H * K] one.
-        # One bwd launch per group: token gradients concatenate along dim 1,
-        # the shared A_log / dt_bias gradients sum across groups (the same
-        # rule the fla_npu per-segment fallback applies). The per-group
-        # intermediates saved by the forward are already group-scoped.
+        # One bwd launch per group: head-major token gradients (dq/dk/dv) and
+        # token-major ones (dg/db) concatenate along their token dim (dim 1 /
+        # dim 0 respectively), the shared A_log / dt_bias gradients sum across
+        # groups (the same rule the fla_npu per-segment fallback applies). The
+        # per-group intermediates saved by the forward are already group-scoped.
         dq_parts, dk_parts, dv_parts, db_parts, dg_parts = [], [], [], [], []
         dA = None
         dbias = None
@@ -721,7 +714,7 @@ class ChunkKDAVarlenFunction(torch.autograd.Function):
                 _bsnd_to_htd(q_n[:, row_start:row_end]),
                 _bsnd_to_htd(k_n[:, row_start:row_end]),
                 _bsnd_to_htd(v_p[:, row_start:row_end]),
-                _bsh_to_bhs(beta_p[:, row_start:row_end]).squeeze(0),
+                beta_p[:, row_start:row_end].squeeze(0).contiguous(),
                 _squeeze_batch_dim(gk),
                 _squeeze_batch_dim(Aqk),
                 _squeeze_batch_dim(Akk),
@@ -730,9 +723,9 @@ class ChunkKDAVarlenFunction(torch.autograd.Function):
                 _squeeze_batch_dim(kg),
                 _squeeze_batch_dim(v_new),
                 h.squeeze(0),
-                _bsnd_to_htd(do_p[:, row_start:row_end]),
+                do_p[:, row_start:row_end].squeeze(0).contiguous(),
                 float(ctx.scale),
-                raw_g=_bsnd_to_htd(g_p[:, row_start:row_end]),
+                raw_g=g_p[:, row_start:row_end].squeeze(0).contiguous(),
                 A_log=A_log,
                 dt_bias=dt_bias.reshape(ctx.kda_heads, ctx.kda_dim).contiguous(),
                 initial_state=None,
@@ -746,6 +739,7 @@ class ChunkKDAVarlenFunction(torch.autograd.Function):
                 disable_recompute=True,
                 use_exp2=True,
                 state_v_first=False,
+                layout="NTD",
             )
             dq_parts.append(dq_h)
             dk_parts.append(dk_h)
@@ -760,17 +754,18 @@ class ChunkKDAVarlenFunction(torch.autograd.Function):
         dq_h = dq_parts[0] if len(dq_parts) == 1 else torch.cat(dq_parts, dim=1)
         dk_h = dk_parts[0] if len(dk_parts) == 1 else torch.cat(dk_parts, dim=1)
         dv_h = dv_parts[0] if len(dv_parts) == 1 else torch.cat(dv_parts, dim=1)
-        db_h = db_parts[0] if len(db_parts) == 1 else torch.cat(db_parts, dim=1)
-        dg_h = dg_parts[0] if len(dg_parts) == 1 else torch.cat(dg_parts, dim=1)
+        db_h = db_parts[0] if len(db_parts) == 1 else torch.cat(db_parts, dim=0)
+        dg_h = dg_parts[0] if len(dg_parts) == 1 else torch.cat(dg_parts, dim=0)
 
         # l2norm_bwd must consume the normalized q/k saved above (not the raw
         # inputs) and runs in the padded layout -- dy has to match y's shape;
-        # gradients scatter back to packed positions after.
+        # gradients scatter back to packed positions after. dg/db come back
+        # token-major, so their BSND view is a plain unsqueeze(0).
         dq = l2norm_bwd(q_n, q_rstd, _htd_to_bsnd(dq_h)).index_select(1, real_pos)
         dk = l2norm_bwd(k_n, k_rstd, _htd_to_bsnd(dk_h)).index_select(1, real_pos)
         dv = _htd_to_bsnd(dv_h).index_select(1, real_pos)
-        dg = _htd_to_bsnd(dg_h).index_select(1, real_pos)
-        db = db_h.unsqueeze(0).permute(0, 2, 1).contiguous().index_select(1, real_pos)
+        dg = dg_h.unsqueeze(0).index_select(1, real_pos)
+        db = db_h.unsqueeze(0).index_select(1, real_pos)
         if dbias is not None:
             dbias = dbias.reshape(dt_bias.shape)
 
