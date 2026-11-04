@@ -37,6 +37,8 @@ from xtuner.v1.ops.sparse_mla import (
     get_sparse_mla,
 )
 from xtuner.v1.ops.sparse_mla.flash_mla import _FLASH_MLA_HEAD_ALIGNMENT
+from xtuner.v1.quantization.kv.config import KVQuantConfig, kv_fakequant_enabled
+from xtuner.v1.quantization.kv.kernels import int8_fake_quant_dynamic
 from xtuner.v1.utils.dtensor import materialize_full
 from xtuner.v1.utils.init_weight import init_params
 
@@ -184,6 +186,10 @@ class NoPEDSAMLAConfig(MLAConfig):
     # them on the RMSNorm class default (1e-6) silently deviates from the checkpoint
     # definition. The default keeps the old behaviour for callers that have no config.
     rms_norm_eps: float = 1e-6
+    # KV-cache-aware QAT: fake-quant the compressed-KV latent (the tensor a deployed engine
+    # stores as its int8 KV cache) during training so the master weights adapt to it. None
+    # keeps the forward bit-identical to the unquantized path.
+    kv_quant_cfg: KVQuantConfig | None = None
 
     @model_validator(mode="after")
     def _check(self) -> "NoPEDSAMLAConfig":
@@ -221,8 +227,16 @@ class NoPEDSAMLAConfig(MLAConfig):
         if not self.freeze_dsa_indexer:
             raise ValueError("freeze_dsa_indexer=False is not supported until the indexer has a differentiable output")
         del layer_type, rope_scaling_cfg, generate_config  # NoPE: no rotary, unused.
+        module_dump = self.model_dump()
+        # `kv_quant_cfg` is passed explicitly below: model_dump would flatten the nested pydantic
+        # model to a dict.
+        module_dump.pop("kv_quant_cfg", None)
         return NoPEDSAMultiLatentAttention(
-            **self.model_dump(), hidden_size=hidden_size, layer_idx=layer_idx, float8_cfg=float8_cfg
+            **module_dump,
+            hidden_size=hidden_size,
+            layer_idx=layer_idx,
+            float8_cfg=float8_cfg,
+            kv_quant_cfg=self.kv_quant_cfg,
         )
 
 
@@ -254,6 +268,7 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
         freeze_dsa_indexer: bool,
         indexer_balance_sp: bool = False,
         indexer_sp_full_pool_work_ratio: float = 0.5,
+        kv_quant_cfg: KVQuantConfig | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -273,6 +288,9 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
                 bias=False,
                 float8_cfg=None,
             )
+
+        # KV-cache-aware QAT gate, resolved once here so the forward only checks a boolean.
+        self._ckv_fakequant = kv_fakequant_enabled(kv_quant_cfg, "nope_dsa_ckv")
 
         self.index_topk = index_topk
         self.index_kpool = index_kpool
@@ -381,6 +399,11 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
         query/output) is the cheaper SP path -- the same choice KDA and GLM-5.2 make.
         """
         kv_compressed = self.kv_a_layernorm(self.kv_a_proj_with_mqa(hidden_states))  # [1, S, Rkv]
+        # This latent is what a deployed engine stores as its (int8) KV cache: fake-quant it
+        # with an STE backward so the weights train against the quantized values. Applied
+        # before the SP gather, so it stays rank-local and deterministic.
+        if self._ckv_fakequant:
+            kv_compressed = int8_fake_quant_dynamic(kv_compressed)
         key_states = kv_compressed.squeeze(0).unsqueeze(1).contiguous()
         return gather_for_sequence_parallel(key_states, dim=0, sp_mesh=seq_ctx.sequence_parallel_mesh)
 

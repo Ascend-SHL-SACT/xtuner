@@ -6,6 +6,7 @@ from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.loss import CELossConfig
 from xtuner.v1.model import get_model_config_from_hf
+from xtuner.v1.quantization.kv import kv_quant_config_from_env
 from xtuner.v1.train import TrainerConfig
 from xtuner.v1.train.trainer import LoadCheckpointConfig
 
@@ -54,6 +55,11 @@ model_cfg.dispatcher = _get_dispatcher()
 model_cfg.ep_size = ep_size
 model_cfg.compile_cfg = _get_bool_env("MODEL_COMPILE", False)
 model_cfg.float8_cfg = _get_float8_config()
+# KV-cache-aware QAT (XTUNER_QUANT_KV): fake-quant the DSA compressed-KV latent with an
+# STE backward so the weights adapt to a deployed int8 KV cache. Off by default (bit-identical).
+model_cfg.attention.kv_quant_cfg = kv_quant_config_from_env()
+if model_cfg.attention.kv_quant_cfg is not None and model_cfg.float8_cfg is not None:
+    raise ValueError("FP8 and KV-cache-aware QAT are mutually exclusive; unset FP8 or XTUNER_QUANT_KV.")
 model_cfg.lm_loss_cfg = loss_cfg
 model_cfg.attention.sparse_mla_backend = os.environ.get("SPARSE_MLA_BACKEND", "flash_mla_cudnn").strip().lower()
 if "INDEXER_BACKEND" in os.environ:
