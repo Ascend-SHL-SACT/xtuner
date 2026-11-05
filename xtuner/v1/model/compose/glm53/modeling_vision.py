@@ -39,6 +39,15 @@ from .glm53_config import Glm53VisionConfig
 DEVICE = get_device()
 DEVICE_MODULE = get_torch_device_module()
 
+# MindSpeed-MM port (fsdp/ops/npu_patch/npu_fused_operator.py): env-gated NPU fused ViT
+# RMSNorm/rotary, both default off (byte-identical production path). The fused rotary is
+# bitwise-identical to the eager path; the fused RMSNorm is within 1 bf16 ulp of it (the NPU
+# kernel's fp32 rstd differs from torch's reduction by ~1 fp32 ulp; parity probe:
+# shell/xtuner1017/claude_added/vit_fused_parity_probe_20261105.py).
+_VIT_FUSED_NORM_ENABLED = os.getenv("XTUNER_VIT_FUSED_NORM", "0") == "1"
+_VIT_FUSED_ROTARY_ENABLED = os.getenv("XTUNER_VIT_FUSED_ROTARY", "0") == "1"
+_FUSED_ONES_GAMMA_CACHE: dict[tuple[tuple[int, ...], torch.dtype, torch.device], torch.Tensor] = {}
+
 
 def _vision_embed_before_sp() -> bool:
     # Default 0: shard-then-embed. Set XTUNER_GLM53_VISION_EMBED_BEFORE_SP=1 for parity.
@@ -135,11 +144,29 @@ class Glm53VisionRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # bf16-only: npu_rms_norm rejects a bf16 gamma with fp32 input, and the eager path is
+        # the correct (and cheap) fallback for every dtype the fused kernel does not serve.
+        if _VIT_FUSED_NORM_ENABLED and hidden_states.dtype is torch.bfloat16 and hidden_states.device.type == "npu":
+            return _vit_rms_norm_fused_npu(hidden_states, self.weight, self.variance_epsilon)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+
+def _vit_rms_norm_fused_npu(hidden_states: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
+    from xtuner.v1.ops.rms_norm import npu_rms_norm
+
+    key = (tuple(weight.shape), weight.dtype, weight.device)
+    ones = _FUSED_ONES_GAMMA_CACHE.get(key)
+    if ones is None:
+        ones = torch.ones_like(weight)
+        _FUSED_ONES_GAMMA_CACHE[key] = ones
+    # gamma=ones keeps the eager two-rounding structure (normalize+cast inside the kernel, affine
+    # in bf16 afterwards). Passing `weight` directly would fuse the affine into the fp32 cast
+    # (one rounding) and diverge from the `Glm53VisionRMSNorm` semantics.
+    return weight * npu_rms_norm(hidden_states, ones, epsilon)
 
 
 def _shard_patches_for_sequence_parallel(
@@ -213,9 +240,24 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _vit_rotary_fused_npu(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch_npu
+
+    # fp32 math over the [seq, 1, dim] cos/sin broadcast matches the eager composition bitwise
+    # (parity probe f2_3d); `.contiguous()` is a no-op insurance for the call-site views.
+    cos_f, sin_f = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = torch_npu.npu_rotary_mul(q.float().contiguous(), cos_f, sin_f).to(q.dtype)
+    k_embed = torch_npu.npu_rotary_mul(k.float().contiguous(), cos_f, sin_f).to(k.dtype)
+    return q_embed, k_embed
+
+
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _VIT_FUSED_ROTARY_ENABLED and q.device.type == "npu":
+        return _vit_rotary_fused_npu(q, k, cos, sin)
     orig_q_dtype, orig_k_dtype = q.dtype, k.dtype
     q, k = q.float(), k.float()
     cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
