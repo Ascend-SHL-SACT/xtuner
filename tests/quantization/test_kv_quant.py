@@ -72,6 +72,14 @@ class TestInt8FakeQuantDynamic:
 
 
 class TestInt8FakeQuantStatic:
+    def test_per_channel_scale_broadcast(self):
+        # Power-of-two scale keeps the division/multiplication exact in fp32.
+        scale = torch.tensor([2.0**-3] * 3 + [2.0**-5] * 5)
+        levels = torch.arange(-127, 128, dtype=torch.float32)
+        x = (levels[:, None] * scale[None, :])[:64]  # [64, 8], every entry on the grid
+        out = int8_fake_quant_static(x, scale)
+        assert torch.equal(out, x)
+
     def test_clamp_out_of_range(self):
         scale = torch.full((4,), 0.125)
         x = torch.tensor([[100.0, -100.0, 12.0, -12.0], [15.9, -15.9, 0.0, 1.0]])
@@ -164,7 +172,7 @@ class TestKVQuantConfig:
         assert cfg is not None and cfg.kv_quant == "per_token_dynamic"
 
     def test_env_parses_static_modes(self, monkeypatch: pytest.MonkeyPatch):
-        for mode in ("per_tensor_static",):
+        for mode in ("per_channel_static", "per_tensor_static"):
             monkeypatch.setenv("XTUNER_QUANT_KV", mode)
             cfg = kv_quant_config_from_env()
             assert cfg is not None and cfg.kv_quant == mode
@@ -172,10 +180,12 @@ class TestKVQuantConfig:
             assert cfg.kv_calib_num_batches == 64
 
     def test_env_calib_batches_override(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("XTUNER_QUANT_KV", "per_tensor_static")
+        monkeypatch.setenv("XTUNER_QUANT_KV", "per_channel_static")
         monkeypatch.setenv("XTUNER_QUANT_KV_CALIB_BATCHES", "8")
         cfg = kv_quant_config_from_env()
         assert cfg is not None and cfg.kv_calib_num_batches == 8
+        monkeypatch.setenv("XTUNER_QUANT_KV", "per_tensor_static")
+        assert kv_quant_config_from_env().kv_calib_num_batches == 8
         # The override only touches the static modes; setting it under dynamic is an error
         # instead of a silent ignore.
         monkeypatch.setenv("XTUNER_QUANT_KV", "per_token_dynamic")
@@ -183,7 +193,7 @@ class TestKVQuantConfig:
             kv_quant_config_from_env()
 
     def test_env_calib_batches_override_invalid(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("XTUNER_QUANT_KV", "per_tensor_static")
+        monkeypatch.setenv("XTUNER_QUANT_KV", "per_channel_static")
         for bad in ("0", "-3", "abc"):
             monkeypatch.setenv("XTUNER_QUANT_KV_CALIB_BATCHES", bad)
             with pytest.raises(ValueError, match="XTUNER_QUANT_KV_CALIB_BATCHES"):
@@ -191,7 +201,7 @@ class TestKVQuantConfig:
 
     def test_calib_batches_must_be_positive(self):
         with pytest.raises(ValidationError):
-            KVQuantConfig(kv_quant="per_tensor_static", kv_calib_num_batches=0)
+            KVQuantConfig(kv_quant="per_channel_static", kv_calib_num_batches=0)
 
     def test_env_invalid_raises(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("XTUNER_QUANT_KV", "int4")
@@ -237,12 +247,38 @@ class _FakeModel(nn.Module):
         return seq_ctx
 
 
-def _expected_scale(attn: _FakeAttn, batches: list[torch.Tensor]) -> torch.Tensor:
-    amaxes = [attn.kv_a_layernorm(batch).detach().float().abs().amax() for batch in batches]
+def _expected_scale(attn: _FakeAttn, batches: list[torch.Tensor], mode: str) -> torch.Tensor:
+    amaxes = []
+    for batch in batches:
+        out = attn.kv_a_layernorm(batch).detach().float().abs()
+        amaxes.append(out.amax() if mode == "per_tensor_static" else out.amax(dim=(0, 1)))
     return torch.stack(amaxes).amax(dim=0).div(127.0).clamp_min(1e-12)
 
 
 class TestKvScaleCalibration:
+    def test_per_channel_calibration_freezes_scale(self):
+        torch.manual_seed(0)
+        model = _FakeModel(["per_channel_static"] * 2, calib_batches=3)
+        batches = [torch.randn(1, 16, 8) for _ in range(3)]
+        assert needs_kv_calibration(model)
+
+        calibrator = KVScaleLazyCalibrator(model)
+        for batch in batches:
+            model(seq_ctx=batch)
+            calibrator.on_train_step_end()
+
+        assert not needs_kv_calibration(model)
+        assert not calibrator.active
+        # Downstream attns see the upstream attn's output, so the expected inputs chain through.
+        inputs = batches
+        for attn in model.attns:
+            assert attn._kv_scale_ready
+            assert not attn._kv_calibrating
+            scale = attn._kv_scale
+            assert scale is not None and scale.dtype == torch.float32 and scale.shape == (8,)
+            assert torch.allclose(scale, _expected_scale(attn, inputs, "per_channel_static"))
+            inputs = [attn.kv_a_layernorm(b) for b in inputs]
+
     def test_per_tensor_calibration_freezes_scalar(self):
         torch.manual_seed(0)
         model = _FakeModel(["per_tensor_static"], calib_batches=2)
@@ -256,14 +292,14 @@ class TestKvScaleCalibration:
         attn = model.attns[0]
         scale = attn._kv_scale
         assert scale is not None and scale.ndim == 0
-        assert torch.allclose(scale, _expected_scale(attn, batches))
+        assert torch.allclose(scale, _expected_scale(attn, batches, "per_tensor_static"))
 
     def test_calibration_freezes_only_after_threshold(self):
         # Regression for run38/run40's init-time pass: calibration must ride the training
         # loop's own forwards, stay in passthrough until kv_calib_num_batches steps are
         # collected, and freeze exactly at the threshold -- without touching any dataloader.
         torch.manual_seed(0)
-        model = _FakeModel(["per_tensor_static"], calib_batches=2)
+        model = _FakeModel(["per_channel_static"], calib_batches=2)
         calibrator = KVScaleLazyCalibrator(model)
         assert calibrator.active
 
@@ -285,7 +321,7 @@ class TestKvScaleCalibration:
         # While calibrating, the hook must see the unquantized LayerNorm output -- the frozen
         # scale has to cover the exact values the deployment kernel will quantize.
         torch.manual_seed(0)
-        model = _FakeModel(["per_tensor_static"], calib_batches=1)
+        model = _FakeModel(["per_channel_static"], calib_batches=1)
         batches = [torch.randn(1, 16, 8)]
         seen: list[torch.Tensor] = []
         handle = model.attns[0].kv_a_layernorm.register_forward_hook(
@@ -300,9 +336,9 @@ class TestKvScaleCalibration:
         assert torch.equal(seen[0], model.attns[0].kv_a_layernorm(batches[0]).detach())
 
     def test_calibration_noop_when_all_ready(self):
-        model = _FakeModel(["per_tensor_static"] * 2)
+        model = _FakeModel(["per_channel_static"] * 2)
         for attn in model.attns:
-            attn._kv_scale = torch.tensor(0.5)
+            attn._kv_scale = torch.full((8,), 0.5)
             attn._kv_scale_ready = True
 
         calibrator = KVScaleLazyCalibrator(model)
@@ -310,7 +346,7 @@ class TestKvScaleCalibration:
         model(seq_ctx=torch.randn(1, 8, 8))
         calibrator.on_train_step_end()
         for attn in model.attns:
-            assert torch.equal(attn._kv_scale, torch.tensor(0.5))
+            assert torch.equal(attn._kv_scale, torch.full((8,), 0.5))
 
     def test_calibration_noop_without_static_modules(self):
         model = _FakeModel(["per_token_dynamic"])
@@ -320,7 +356,7 @@ class TestKvScaleCalibration:
         calibrator.on_train_step_end()
 
     def test_calibration_inconsistent_num_batches_raises(self):
-        model = _FakeModel(["per_tensor_static"] * 2)
+        model = _FakeModel(["per_channel_static", "per_tensor_static"])
         model.attns[1].kv_calib_num_batches = 5
         with pytest.raises(ValueError, match="Inconsistent kv_calib_num_batches"):
             KVScaleLazyCalibrator(model)
@@ -350,7 +386,7 @@ class TestKvScaleCalibration:
 
     def test_sidecar_roundtrip(self, tmp_path):
         torch.manual_seed(0)
-        model = _FakeModel(["per_tensor_static"] * 2, calib_batches=1)
+        model = _FakeModel(["per_channel_static", "per_tensor_static"], calib_batches=1)
         calibrator = KVScaleLazyCalibrator(model)
         model(seq_ctx=torch.randn(1, 16, 8))
         calibrator.on_train_step_end()
@@ -361,27 +397,42 @@ class TestKvScaleCalibration:
 
         # A fresh, differently-seeded model with the same tree picks the scales up by name.
         torch.manual_seed(7)
-        fresh = _FakeModel(["per_tensor_static"] * 2)
+        fresh = _FakeModel(["per_channel_static", "per_tensor_static"])
         assert needs_kv_calibration(fresh)
         maybe_load_kv_scale_sidecar(fresh, tmp_path)
         assert not needs_kv_calibration(fresh)
         for name, attn in zip(("attns.0", "attns.1"), fresh.attns):
             assert attn._kv_scale_ready and torch.equal(attn._kv_scale, saved[name])
 
-    def test_sidecar_shape_mismatch_raises(self, tmp_path):
-        # A [C] vector would silently broadcast where the frozen grid needs a scalar: the load
-        # must fail fast instead of quantizing on the wrong grid.
-        torch.save({"attns.0": torch.full((8,), 0.5)}, tmp_path / "kv_scale_sidecar.pt")
-        model = _FakeModel(["per_tensor_static"])
+    def test_sidecar_mode_mismatch_raises(self, tmp_path):
+        # A sidecar frozen under per_channel_static must fail fast on a model that expects the
+        # per_tensor_static grid (and the reverse below): the [C] vector / 0-dim scalar would
+        # otherwise broadcast through and silently quantize on the wrong grid.
+        torch.manual_seed(0)
+        src = _FakeModel(["per_channel_static"] * 2, calib_batches=1)
+        calibrator = KVScaleLazyCalibrator(src)
+        src(seq_ctx=torch.randn(1, 16, 8))
+        calibrator.on_train_step_end()
+        maybe_save_kv_scale_sidecar(src, tmp_path)
         with pytest.raises(ValueError, match="different kv_quant mode"):
-            maybe_load_kv_scale_sidecar(model, tmp_path)
+            maybe_load_kv_scale_sidecar(_FakeModel(["per_tensor_static"] * 2, calib_batches=1), tmp_path)
+
+    def test_sidecar_mode_mismatch_reverse_raises(self, tmp_path):
+        torch.manual_seed(0)
+        src = _FakeModel(["per_tensor_static"] * 2, calib_batches=1)
+        calibrator = KVScaleLazyCalibrator(src)
+        src(seq_ctx=torch.randn(1, 16, 8))
+        calibrator.on_train_step_end()
+        maybe_save_kv_scale_sidecar(src, tmp_path)
+        with pytest.raises(ValueError, match="different kv_quant mode"):
+            maybe_load_kv_scale_sidecar(_FakeModel(["per_channel_static"] * 2, calib_batches=1), tmp_path)
 
     def test_sidecar_save_skips_partial_ready(self, tmp_path):
         # A checkpoint fired while lazy calibration is still collecting must not write a
         # partial sidecar: the resume load fails on any missing scale, so the save is
         # all-or-nothing.
-        model = _FakeModel(["per_tensor_static"] * 2)
-        model.attns[0]._kv_scale = torch.tensor(0.5)
+        model = _FakeModel(["per_channel_static", "per_tensor_static"])
+        model.attns[0]._kv_scale = torch.full((8,), 0.5)
         model.attns[0]._kv_scale_ready = True
 
         maybe_save_kv_scale_sidecar(model, tmp_path)
@@ -393,18 +444,18 @@ class TestKvScaleCalibration:
         assert not (tmp_path / "kv_scale_sidecar.pt").exists()
 
     def test_sidecar_missing_is_noop(self, tmp_path):
-        model = _FakeModel(["per_tensor_static"])
+        model = _FakeModel(["per_channel_static"])
         maybe_load_kv_scale_sidecar(model, tmp_path)
         assert not model.attns[0]._kv_scale_ready
 
     def test_sidecar_none_checkpoint_path_is_noop(self):
-        model = _FakeModel(["per_tensor_static"])
+        model = _FakeModel(["per_channel_static"])
         maybe_load_kv_scale_sidecar(model, None)
         assert not model.attns[0]._kv_scale_ready
 
     def test_sidecar_unknown_module_raises(self, tmp_path):
         torch.save({"ghost_module": torch.tensor(0.5)}, tmp_path / "kv_scale_sidecar.pt")
-        model = _FakeModel(["per_tensor_static"])
+        model = _FakeModel(["per_channel_static"])
         with pytest.raises(ValueError, match="absent from this model"):
             maybe_load_kv_scale_sidecar(model, tmp_path)
 
@@ -413,6 +464,16 @@ class TestKVQuantSPShardLocality:
     # SP splits the sequence before the fake-quant runs, so quantizing the whole sequence must
     # equal quantizing its shards independently and concatenating -- the CPU property test that
     # stands in for the 2-rank check (W3).
+    def test_per_channel_static_shard_concat_bitwise(self):
+        torch.manual_seed(0)
+        x = torch.randn(1, 32, 8)
+        scale = torch.rand(8) + 0.5
+        whole = int8_fake_quant_static(x, scale)
+        sharded = torch.cat(
+            [int8_fake_quant_static(x[:, :13], scale), int8_fake_quant_static(x[:, 13:], scale)], dim=1
+        )
+        assert torch.equal(whole, sharded)
+
     def test_per_tensor_static_shard_concat_bitwise(self):
         # per_tensor broadcasts one scalar: whole-sequence and shard-wise quantization agree.
         torch.manual_seed(0)
@@ -472,18 +533,15 @@ def _export_tree(specs: dict[str, tuple[str, torch.Tensor | None]]) -> nn.Module
 
 class TestHfKvScaleKeyMapping:
     def test_layer_path_maps_to_hf_k_scale(self):
-        key = _hf_scale_key(
-            "language_model.layers.3._checkpoint_wrapped_module.self_attn", _glm_like_to_hf_key, "fa_k.scale"
-        )
-        assert key == "model.language_model.layers.3.self_attn.fa_k.scale"
+        key = _hf_scale_key("language_model.layers.3._checkpoint_wrapped_module.self_attn", _glm_like_to_hf_key)
+        assert key == "model.language_model.layers.3.self_attn.k_scale"
 
     def test_mtp_path_maps_to_hf_k_scale(self):
         key = _hf_scale_key(
             "language_model.mtp_block.layers.0._checkpoint_wrapped_module.decoder_layer.self_attn",
             _glm_like_to_hf_key,
-            "fa_k.scale",
         )
-        assert key == "model.language_model.layers.45.self_attn.fa_k.scale"
+        assert key == "model.language_model.layers.45.self_attn.k_scale"
 
 
 class TestHfKvScaleExport:
@@ -565,6 +623,20 @@ class TestHfKvScaleExport:
         # while an unknown quant_method there makes upstream vLLM reject the checkpoint.
         assert (tmp_path / "config.json").read_text() == config_before
 
+    def test_export_per_channel_scale_is_a_vector(self, tmp_path):
+        scale = torch.rand(8) + 0.5
+        root = _export_tree({"layers.3.self_attn": ("per_channel_static", scale)})
+
+        maybe_write_hf_kv_scales(root, tmp_path)
+
+        scales = load_file(tmp_path / "kv_scale.safetensors")
+        assert scales["model.language_model.layers.3.self_attn.k_scale"].shape == (8,)
+        meta = json.loads((tmp_path / "kv_scale_meta.json").read_text())
+        assert meta["kv_quant_mode"] == "per_channel_static"
+        assert "consumer_recipe" not in meta
+        # The generic per-channel export has no ModelSlim consumer, so no recipe is written.
+        assert not (tmp_path / "quant_model_description.json").exists()
+
     def test_export_skips_until_all_scales_frozen(self, tmp_path):
         # All-or-nothing like the training sidecar: one unfrozen module means no artifacts at
         # all, so a mid-calibration export never describes a grid the weights do not carry.
@@ -589,6 +661,18 @@ class TestHfKvScaleExport:
         # A plain run must not grow files, and must not require an export layout to exist.
         maybe_write_hf_kv_scales(root, tmp_path)
         assert list(tmp_path.iterdir()) == []
+
+    def test_export_mixed_modes_raise(self, tmp_path):
+        root = _export_tree(
+            {
+                "layers.3.self_attn": ("per_tensor_static", torch.tensor(0.04)),
+                "layers.7.self_attn": ("per_channel_static", torch.rand(8) + 0.5),
+            }
+        )
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm5_next_text"}))
+
+        with pytest.raises(ValueError, match="Inconsistent kv_quant modes"):
+            maybe_write_hf_kv_scales(root, tmp_path)
 
 
 class TestPerTensorModelSlimConsumer:

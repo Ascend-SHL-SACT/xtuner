@@ -1,7 +1,7 @@
 """In-training calibration and scale persistence for the static KV quantization modes.
 
 Per-token dynamic quantization derives its scale from the data itself on every forward, but the
-static mode (``per_tensor_static``) needs one frozen scale per module:
+static modes (``per_channel_static`` / ``per_tensor_static``) need one frozen scale per module:
 the activation scale cannot be re-derived from the weights, so it is calibrated over the first
 ``kv_calib_num_batches`` training steps (amax over ``kv_a_layernorm`` outputs, MAX-reduced across
 all ranks so DP shards and SP sequence shards agree on the same grid), frozen, and persisted to a
@@ -80,10 +80,11 @@ class KVScaleLazyCalibrator:
             self._handles.append(module.kv_a_layernorm.register_forward_hook(self._record_hook(name)))
 
     def _record_hook(self, name: str) -> Callable[[nn.Module, tuple, torch.Tensor], None]:
+        modules_by_name = self._modules_by_name
         records = self._records
 
         def hook(_module: nn.Module, _args: tuple, output: torch.Tensor) -> None:
-            amax = _kv_amax(output)
+            amax = _kv_amax(modules_by_name[name]._kv_quant_mode, output)
             prev = records[name]
             records[name] = amax if prev is None else torch.maximum(prev, amax)
 
@@ -135,11 +136,15 @@ def _named_static_kv_modules(model: nn.Module) -> list[tuple[str, StaticKVQuantM
     ]
 
 
-def _kv_amax(x: torch.Tensor) -> torch.Tensor:
+def _kv_amax(mode: str, x: torch.Tensor) -> torch.Tensor:
     # abs and amax are exact in the input dtype (amax returns one of the elements), so widening
     # only the reduced result is bitwise identical to float()-first while skipping a full fp32
     # copy of ``x`` on every observed forward during collection.
-    return x.detach().abs().amax().float()
+    x = x.detach().abs()
+    if mode == "per_tensor_static":
+        return x.amax().float()
+    # per_channel_static: one amax per latent channel, reducing every leading (token) axis.
+    return x.amax(dim=tuple(range(x.ndim - 1))).float()
 
 
 def needs_kv_calibration(model: nn.Module) -> bool:
@@ -187,13 +192,18 @@ def maybe_load_kv_scale_sidecar(model: nn.Module, checkpoint_path: str | Path | 
             raise ValueError(f"{sidecar} is missing a scale for {name!r}.")
         scale = scales[name]
         layernorm_weight = cast(torch.Tensor, module.kv_a_layernorm.weight)
-        # Shape must match the frozen grid: a [C] vector would silently broadcast where a
-        # scalar is required, so a cross-mode sidecar would quantize on the wrong grid.
-        shape_ok = scale.ndim == 0
+        # Shape must match the module's mode: a [C] vector silently broadcasts as per-channel
+        # and a scalar as per-tensor, so a cross-mode sidecar would quantize on the wrong grid.
+        if module._kv_quant_mode == "per_tensor_static":
+            shape_ok = scale.ndim == 0
+            expected = "a 0-dim scalar"
+        else:
+            shape_ok = scale.shape == layernorm_weight.shape
+            expected = f"one scale per latent channel {tuple(layernorm_weight.shape)}"
         if not shape_ok:
             raise ValueError(
                 f"{sidecar} scale for {name!r} has shape {tuple(scale.shape)} but mode "
-                f"{module._kv_quant_mode!r} expects a 0-dim scalar: the sidecar was written under a different "
+                f"{module._kv_quant_mode!r} expects {expected}: the sidecar was written under a different "
                 "kv_quant mode or architecture."
             )
         module._kv_scale = scale.to(layernorm_weight.device)
