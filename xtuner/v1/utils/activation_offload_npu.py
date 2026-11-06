@@ -43,10 +43,11 @@ colliding in the shared registry or the pinned-buffer cache.
 """
 
 import os
+from collections import deque
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from functools import partial
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
@@ -54,11 +55,16 @@ from xtuner.v1.utils import log_rank0
 from xtuner.v1.utils.activation_offload import OffloadManager, SwapTensor
 
 
+if TYPE_CHECKING:
+    from xtuner.v1.ops.attn_imp import AttnOpOutputs
+
+
 __all__ = [
     "activation_offload_npu_enabled",
     "make_activation_offload_npu_ctx",
     "offload_stream",
     "register_activation_offload_npu_hooks",
+    "vit_flash_attn_skip_recompute",
 ]
 
 
@@ -173,6 +179,82 @@ def make_activation_offload_npu_ctx(
         return original_ctx(block_idx, [tensor for tensor in tensors if not tensor.is_floating_point()])
 
     return _ctx
+
+
+def vit_flash_attn_skip_recompute(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: Any,
+    max_seqlen_k: Any,
+    softmax_scale: float,
+    deterministic: bool,
+    module: Any,
+) -> "AttnOpOutputs":
+    """NPU ViT flash attention with the checkpoint recompute skipped.
+
+    Drop-in for ``attn_imp.flash_attention`` for the GLM-5.3-Flash vision tower on NPU (same
+    BNSD ``[1, heads, total_seq, dim]`` input views, same ``{"raw_output": [1, T, H, D]}``
+    return shape), but the attention runs through ``_VitFlashAttnSkipRecompute``: the no_grad
+    checkpoint forward stashes ``(attn_output, softmax_max, softmax_sum)`` as device tensors
+    and the grad-enabled replay restores them, so the backward feeds
+    ``npu_fusion_attention_grad`` with the exact tensors the forward produced instead of
+    recomputing the attention. The stash stays device-resident (see the module note below).
+    ``dropout_p`` is fixed at 0.0 -- the caller gates on ``attention_dropout == 0.0``. The
+    checkpoint phase is read from the ambient grad mode here (``Function.apply`` forces
+    no_grad inside forward, so the Function itself cannot see it) and passed down as the
+    ``is_replay`` flag.
+
+    Args:
+        q (torch.Tensor): Query, ``[1, num_heads, total_seq, head_dim]`` (BNSD, batch 1).
+        k (torch.Tensor): Key, same layout as ``q``.
+        v (torch.Tensor): Value, same layout as ``q``.
+        cu_seqlens_q (torch.Tensor): Cumulative query sequence ends, length ``n_seqs + 1``.
+        cu_seqlens_k (torch.Tensor): Cumulative key sequence ends, length ``n_seqs + 1``.
+        max_seqlen_q (Any): Max query sequence length (unused by NFA, kept for signature parity).
+        max_seqlen_k (Any): Max key sequence length (unused by NFA, kept for signature parity).
+        softmax_scale (float): Softmax scale applied by the kernel.
+        deterministic (bool): Deterministic mode; no NPU knob, only forwards into the varlen
+            wrapper's warning, same as the production path.
+        module (Any): The calling attention module; half of the stash key (with the q shape).
+
+    Returns:
+        AttnOpOutputs: ``{"raw_output": [1, total_seq, num_heads, head_dim], "softmax_lse": None}``.
+    """
+    if q.size(0) != 1:
+        raise RuntimeError(f"vit_flash_attn_skip_recompute expects batch size 1, got {q.size(0)}")
+    # Same BNSD -> TND view chain as attn_imp.flash_attention, so the kernel sees the identical
+    # (strided) layout and the forward stays bitwise with the production path.
+    q_tnd = q.transpose(1, 2).squeeze(0)
+    k_tnd = k.transpose(1, 2).squeeze(0)
+    v_tnd = v.transpose(1, 2).squeeze(0)
+    # Same actual_seq building as npu_flash_varlen_attn; the backward's grad call needs them and
+    # the Function must not carry device tensors it does not grad through.
+    actual_seq_qlen = (
+        tuple(cu_seqlens_q[1:].tolist()) if isinstance(cu_seqlens_q, torch.Tensor) else tuple(cu_seqlens_q[1:])
+    )
+    actual_seq_kvlen = (
+        tuple(cu_seqlens_k[1:].tolist()) if isinstance(cu_seqlens_k, torch.Tensor) else tuple(cu_seqlens_k[1:])
+    )
+    out = _VitFlashAttnSkipRecompute.apply(
+        q_tnd,
+        k_tnd,
+        v_tnd,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        deterministic,
+        actual_seq_qlen,
+        actual_seq_kvlen,
+        module,
+        torch.is_grad_enabled(),
+    )
+    return {"raw_output": out[None], "softmax_lse": None}
 
 
 # Live offloads keyed by layer index, one pass per entry and one SwapTensor per
@@ -452,3 +534,140 @@ def _has_offload_hooks(layer: torch.nn.Module) -> bool:
     hooks = [*layer._forward_pre_hooks.values(), *layer._forward_hooks.values()]
     ours = (_forward_input_pre_hook, _park_layer_input_after_forward)
     return any(getattr(hook, "func", hook) in ours for hook in hooks)
+
+
+# ViT flash-attention recompute skip (MindSpeed-MM port,
+# fsdp/ops/flash_attn/skip_recompute_flash_attn.py): the checkpointed GLM-5.3-Flash vision
+# blocks recompute their attention at the backward replay, a full NFA forward per block per
+# pack. _VitFlashAttnSkipRecompute stashes (attn_output, softmax_max, softmax_sum) at the
+# no_grad original forward -- the lse pair is exactly what an NFA backward would otherwise
+# recompute -- and restores them at the grad-enabled replay, so the backward calls
+# npu_fusion_attention_grad directly and the attention recompute disappears.
+#
+# The checkpoint phase is discriminated by the wrapper, not inside the Function: autograd's
+# Function.apply forces no_grad around forward, so torch.is_grad_enabled() inside forward is
+# always False and the replay would silently recompute instead of restoring. vit_flash_attn_
+# skip_recompute reads the ambient grad mode -- visible there, the reentrant checkpoint runs
+# the original forward under no_grad and the replay under grad -- and passes it down as the
+# is_replay flag, the same discriminator the park/refill hooks above use at hook level.
+#
+# The stashed tensors stay device-resident until their replay: the stash depth within one
+# checkpoint pass equals the number of tower blocks (24 for GLM-5.3-Flash), so the bytes ride
+# the step's peak and parking them to host would add copy work to the launch-bound tower
+# loop -- the device-memory cost is the accepted trade for skipping the attention recompute.
+# The offload hooks' resize-to-0 CPU park is also unsafe here: a parked tensor refilled
+# through storage resize does not survive ctx.save_for_backward.
+#
+# The stash is keyed by (attention module, q shape) and consumed LIFO: with one
+# forward+backward per pack the replay order is the exact reverse of the push order. The
+# shape in the key keeps the FSDP-alignment dummy visual forward (a few patches, same
+# modules) in its own lane instead of interleaving with the real packs. A no_grad push
+# without a matching replay (forward-only probes, or a frozen vision tower whose wrapped
+# blocks skip replay) sinks below the live entries and is dropped by the in-flight cap; a
+# pop whose shape does not match the replayed q fails loudly instead of handing wrong
+# tensors to the grad kernel.
+_MAX_INFLIGHT_ATTN_STASH = 32
+_attn_stash: dict[tuple[Any, tuple[int, ...]], deque[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
+
+
+class _VitFlashAttnSkipRecompute(torch.autograd.Function):
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: Any,
+        max_seqlen_k: Any,
+        softmax_scale: float,
+        deterministic: bool,
+        actual_seq_qlen: tuple[int, ...],
+        actual_seq_kvlen: tuple[int, ...],
+        module: Any,
+        is_replay: bool,
+    ) -> torch.Tensor:
+        stash = _attn_stash.setdefault((module, tuple(q.shape)), deque())
+        if is_replay:
+            # Checkpoint replay: restore the entry the no_grad original forward stashed
+            # instead of recomputing the attention; the backward's grad call consumes the
+            # exact tensors that forward produced. Correctness rests on the trainer pairing
+            # every checkpoint forward with its backward before the next one (LIFO): the q
+            # restored here is a qkv-proj product recomputed during the replay, so its
+            # storage differs from the push-time one and no data_ptr fingerprint can
+            # discriminate a legitimate replay from a same-shape cross-graph pop.
+            if not stash:
+                raise RuntimeError(
+                    "ViT skip-recompute stash is empty at the replay entry: either the no_grad "
+                    "forward did not stash for this attention module (a frozen vision tower "
+                    "replays without a stashing forward; keep the gate off for it), or the block "
+                    "runs outside the vision checkpoint (VISION_RECOMPUTE_RATIO < 1.0 "
+                    "leaves trailing blocks unwrapped; keep it at 1.0 with the gate on)."
+                )
+            out, smax, ssum = stash.pop()
+            if out.shape != q.shape:
+                raise RuntimeError(
+                    f"ViT skip-recompute stash misalignment: stashed attn output {tuple(out.shape)} "
+                    f"does not match the replayed q {tuple(q.shape)}."
+                )
+        else:
+            # no_grad original forward: compute the attention and stash (output, lse pair).
+            from xtuner.v1.ops.flash_attn.npu import npu_flash_varlen_attn
+
+            out, smax, ssum = npu_flash_varlen_attn(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p=0.0,
+                softmax_scale=softmax_scale,
+                causal=False,
+                deterministic=deterministic,
+                return_lse=True,
+            )
+            if len(stash) >= _MAX_INFLIGHT_ATTN_STASH:
+                stash.popleft()
+                log_rank0.warning(
+                    f"ViT skip-recompute stash held {_MAX_INFLIGHT_ATTN_STASH} in-flight entries for one "
+                    "attention module; dropped the oldest, whose replay cannot run (forward-only or "
+                    "frozen-vision passes stash without a matching checkpoint replay)."
+                )
+            stash.append((out, smax, ssum))
+        ctx.actual_seq_qlen = actual_seq_qlen
+        ctx.actual_seq_kvlen = actual_seq_kvlen
+        ctx.scale = softmax_scale
+        ctx.save_for_backward(q, k, v, out, smax, ssum)
+        return out
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+        import torch_npu
+
+        q, k, v, attn_output, softmax_max, softmax_sum = ctx.saved_tensors
+        # MindSpeed skip_recompute_flash_attn's grad call; inner_precise=0/sparse_mode=0 are
+        # both the MindSpeed recipe and the op schema defaults the production forward runs with.
+        grad_q, grad_k, grad_v, *_ = torch_npu.npu_fusion_attention_grad(
+            q,
+            k,
+            v,
+            grad_output,
+            q.shape[1],
+            "TND",
+            softmax_max=softmax_max,
+            softmax_sum=softmax_sum,
+            attention_in=attn_output,
+            pse=None,
+            padding_mask=None,
+            atten_mask=None,
+            actual_seq_qlen=ctx.actual_seq_qlen,
+            actual_seq_kvlen=ctx.actual_seq_kvlen,
+            scale_value=ctx.scale,
+            keep_prob=1.0,
+            inner_precise=0,
+            sparse_mode=0,
+        )
+        return (grad_q, grad_k, grad_v) + (None,) * 10
