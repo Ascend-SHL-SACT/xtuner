@@ -38,7 +38,7 @@ from xtuner.v1.ops.sparse_mla import (
 )
 from xtuner.v1.ops.sparse_mla.flash_mla import _FLASH_MLA_HEAD_ALIGNMENT
 from xtuner.v1.quantization.kv.config import KVQuantConfig, kv_fakequant_enabled
-from xtuner.v1.quantization.kv.kernels import int8_fake_quant_dynamic
+from xtuner.v1.quantization.kv.kernels import int8_fake_quant_dynamic, int8_fake_quant_static
 from xtuner.v1.utils.dtensor import materialize_full
 from xtuner.v1.utils.init_weight import init_params
 
@@ -288,7 +288,16 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
             )
 
         # KV-cache-aware QAT gate, resolved once here so the forward only checks a boolean.
+        # Static modes additionally carry a frozen scale. It is deliberately NOT a registered
+        # buffer: a plain attribute survives meta-device construction, DCP state dicts never
+        # pick it up, and the lazy calibrator / checkpoint sidecar fills it before the first
+        # quantized forward.
         self._ckv_fakequant = kv_fakequant_enabled(kv_quant_cfg, "nope_dsa_ckv")
+        self._kv_quant_mode: str = kv_quant_cfg.kv_quant if kv_quant_cfg is not None and self._ckv_fakequant else ""
+        self._kv_scale: torch.Tensor | None = None
+        self._kv_scale_ready = False
+        self._kv_calibrating = False
+        self.kv_calib_num_batches = kv_quant_cfg.kv_calib_num_batches if kv_quant_cfg is not None else 0
 
         self.index_topk = index_topk
         self.index_kpool = index_kpool
@@ -399,9 +408,23 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
         kv_compressed = self.kv_a_layernorm(self.kv_a_proj_with_mqa(hidden_states))  # [1, S, Rkv]
         # This latent is what a deployed engine stores as its (int8) KV cache: fake-quant it
         # with an STE backward so the weights train against the quantized values. Applied
-        # before the SP gather, so it stays rank-local and deterministic.
+        # before the SP gather, so it stays rank-local and deterministic. During the lazy
+        # calibration's collection steps the raw tensor flows through so the calibrator's
+        # running max sees the exact values the frozen scale must cover.
         if self._ckv_fakequant:
-            kv_compressed = int8_fake_quant_dynamic(kv_compressed)
+            if self._kv_quant_mode == "per_token_dynamic":
+                kv_compressed = int8_fake_quant_dynamic(kv_compressed)
+            elif self._kv_calibrating:
+                pass
+            elif not self._kv_scale_ready:
+                raise ValueError(
+                    f"kv_quant={self._kv_quant_mode} requires frozen KV scales before the first forward: resume "
+                    "from a checkpoint carrying kv_scale_sidecar.pt, or keep the trainer's lazy calibration "
+                    "(kv_calib_num_batches > 0) enabled."
+                )
+            else:
+                assert self._kv_scale is not None  # implied by _kv_scale_ready
+                kv_compressed = int8_fake_quant_static(kv_compressed, self._kv_scale)
         key_states = kv_compressed.squeeze(0).unsqueeze(1).contiguous()
         return gather_for_sequence_parallel(key_states, dim=0, sp_mesh=seq_ctx.sequence_parallel_mesh)
 
