@@ -4,21 +4,26 @@ The training side persists the scales to ``kv_scale_sidecar.pt`` next to the DCP
 resume reproduces the exact quantization grid; the deployment side needs the same scales inside
 the exported HF checkpoint in a format a deployment engine actually consumes.
 
-The export format targets the strictest verified consumer: ``per_tensor_static`` ships
-vllm-ascend's ModelSlim/FAKQuant artifact set. That path does not read
-``config.json`` at all: its detection keys on the presence of ``quant_model_description.json``
-in the model directory (``detect_quantization_method``/``maybe_update_config``), and the
-ascend quantization method activates precisely when ``config.json`` declares *no*
-``quantization_config`` (``override_quantization_method``). Writing one there would instead
-make upstream vLLM reject the whole checkpoint at config time (``ValueError`` on unknown
-``quant_method``). So the export ships the ModelSlim artifact set: a
-``quant_model_description.json`` recipe declaring ``fa_quant_type: FAKQuant`` plus one
-``.fa_*.{scale,offset}`` weight entry per quantized attention layer, following the shapes the
-consumer's ``AscendFAQuantAttentionMethod.create_weights`` registers (``[num_kv_heads, 1]``;
-MLA latent caches have exactly one KV head) and the symmetric-int8 convention of the training
-kernel (``scale = amax / 127``, no zero point, so all offsets are zero; the Q/V entries the
-scheme registers but the MLA runtime never reads are exported at their identity values so the
-loader initializes them instead of leaving ``torch.empty`` garbage).
+The export format is chosen per mode against the strictest verified consumer:
+
+- ``per_tensor_static`` targets vllm-ascend's ModelSlim/FAKQuant path. That path does not read
+  ``config.json`` at all: its detection keys on the presence of ``quant_model_description.json``
+  in the model directory (``detect_quantization_method``/``maybe_update_config``), and the
+  ascend quantization method activates precisely when ``config.json`` declares *no*
+  ``quantization_config`` (``override_quantization_method``). Writing one there would instead
+  make upstream vLLM reject the whole checkpoint at config time (``ValueError`` on unknown
+  ``quant_method``). So this mode ships the ModelSlim artifact set: a
+  ``quant_model_description.json`` recipe declaring ``fa_quant_type: FAKQuant`` plus one
+  ``.fa_*.{scale,offset}`` weight entry per quantized attention layer, following the shapes the
+  consumer's ``AscendFAQuantAttentionMethod.create_weights`` registers (``[num_kv_heads, 1]``;
+  MLA latent caches have exactly one KV head) and the symmetric-int8 convention of the training
+  kernel (``scale = amax / 127``, no zero point, so all offsets are zero; the Q/V entries the
+  scheme registers but the MLA runtime never reads are exported at their identity values so the
+  loader initializes them instead of leaving ``torch.empty`` garbage).
+- ``per_channel_static`` has no model-slim consumer anywhere (the FAKQuant K scale is a single
+  per-tensor scalar), so it keeps the generic ecosystem-convention export: float32
+  ``.k_scale`` weight entries riding the standard weight pipeline, described by a companion
+  ``kv_scale_meta.json`` that no loader auto-reads.
 """
 
 import json
@@ -33,8 +38,12 @@ from torch import nn
 from .calibrate import StaticKVQuantModule, _named_static_kv_modules
 
 
-# Export artifact names.
+# Generic export artifact names. The scale tensor name follows the MLA-family checkpoint
+# convention: the cached compressed-KV latent is the "K" entry of the cache (MLA/DSA never cache
+# a separate V), hence ``k_scale`` on the attention module. A per-tensor scale is a 0-dim scalar,
+# a per-channel scale a ``[kv_lora_rank]`` vector -- the same shapes the training sidecar stores.
 _HF_KV_SCALES_FILENAME = "kv_scale.safetensors"
+_HF_KV_SCALE_SUFFIX = "k_scale"
 _HF_INDEX_FILENAME = "model.safetensors.index.json"
 _KV_SCALE_META_FILENAME = "kv_scale_meta.json"
 _KV_QUANT_PRODUCER = "xtuner-kv-qat"
@@ -67,7 +76,7 @@ _MODELSLIM_FA_OFFSET_DTYPE = torch.int8
 def _hf_scale_key(
     module_name: str,
     to_hf_key_list: Callable[[str], list[str]],
-    suffix: str,
+    suffix: str = _HF_KV_SCALE_SUFFIX,
 ) -> str:
     # Training-side module path -> exported HF weight name: drop the text-model root, drop the
     # activation-checkpointing wrapper segments, append the scale tensor name, and let the model
@@ -92,6 +101,21 @@ def _to_hf_key_list_fn(model: nn.Module) -> Callable[[str], list[str]]:
             "scales get the same HF weight names as the rest of the checkpoint."
         )
     return cast("Callable[[str], list[str]]", to_hf_key_list)
+
+
+def _kv_scale_export_entries(
+    modules: list[tuple[str, StaticKVQuantModule]],
+    to_hf_key_list: Callable[[str], list[str]],
+) -> dict[str, torch.Tensor]:
+    entries: dict[str, torch.Tensor] = {}
+    for name, module in modules:
+        scale = module._kv_scale
+        assert scale is not None  # implied by _kv_scale_ready
+        key = _hf_scale_key(name, to_hf_key_list)
+        if key in entries:
+            raise ValueError(f"HF scale key {key!r} collides between {name!r} and an earlier module.")
+        entries[key] = scale.detach().to(device="cpu", dtype=torch.float32).clone()
+    return entries
 
 
 def _modelslim_per_tensor_export(
@@ -135,17 +159,27 @@ def _modelslim_per_tensor_export(
     return entries, description
 
 
-def _kv_scale_export(model: nn.Module) -> tuple[dict[str, torch.Tensor], str, dict[str, str]]:
-    # Collect the frozen scales into the ModelSlim FAKQuant artifact set, or an empty dict when
-    # the export must be a no-op: no static-mode module (feature off), or calibration still
-    # collecting (a partial export would describe a quantization grid the checkpoint does not
-    # fully carry).
+def _kv_scale_export(model: nn.Module) -> tuple[dict[str, torch.Tensor], str, dict[str, str] | None]:
+    # Collect the frozen scales keyed by HF weight name, or ``None`` when the export must be a
+    # no-op: no static-mode module (feature off), or calibration still collecting (a partial
+    # export would describe a quantization grid the checkpoint does not fully carry). The export
+    # metadata records a single ``kv_quant_mode``, so mixed modes must fail loudly. Per-tensor
+    # scales return the ModelSlim artifact set (``description`` non-None); per-channel scales
+    # return the generic ``.k_scale`` entries (``description`` None).
     modules = _named_static_kv_modules(model)
     if not modules or any(not module._kv_scale_ready for _, module in modules):
-        return {}, "", {}
-    mode = modules[0][1]._kv_quant_mode
-    entries, description = _modelslim_per_tensor_export(modules, _to_hf_key_list_fn(model))
-    return entries, mode, description
+        return {}, "", None
+    modes = {module._kv_quant_mode for _, module in modules}
+    if len(modes) > 1:
+        raise ValueError(f"Inconsistent kv_quant modes across static KV quant modules: {sorted(modes)}.")
+    mode = modes.pop()
+    to_hf_key_list = _to_hf_key_list_fn(model)
+    if mode == "per_tensor_static":
+        entries, description = _modelslim_per_tensor_export(modules, to_hf_key_list)
+        return entries, mode, description
+    if mode != "per_channel_static":
+        raise ValueError(f"Static-mode KV quant export does not support kv_quant mode {mode!r}.")
+    return _kv_scale_export_entries(modules, to_hf_key_list), mode, None
 
 
 def maybe_write_hf_kv_scales(model: nn.Module, hf_dir: str | Path) -> None:
@@ -153,13 +187,15 @@ def maybe_write_hf_kv_scales(model: nn.Module, hf_dir: str | Path) -> None:
 
     Rank 0 only; a no-op when the model has no static-mode KV quant module or calibration has
     not frozen the scales yet (all-or-nothing, mirroring :func:`maybe_save_kv_scale_sidecar`).
-    Writes the ModelSlim-consumable artifact set (see the module docstring):
-    ``quant_model_description.json`` plus ``kv_scale.safetensors`` entries named
+    Per-tensor static mode writes the ModelSlim-consumable artifact set (see the module
+    docstring): ``quant_model_description.json`` plus ``kv_scale.safetensors`` entries named
     ``<HF layer path>.fa_{q,k,v}.{scale,offset}`` appended to ``model.safetensors.index.json``
-    when present. ``config.json`` is deliberately left untouched: the ModelSlim path activates
-    on the description-file presence only when ``config.json`` carries no
-    ``quantization_config``, while any XTuner-specific ``quant_method`` there would make
-    upstream vLLM reject the whole checkpoint.
+    when present. Per-channel static mode writes the generic export: ``kv_scale.safetensors``
+    with one float32 ``.k_scale`` tensor per static-mode attention module and a
+    ``kv_scale_meta.json`` scheme record. ``config.json`` is deliberately left untouched in
+    every mode: the ModelSlim path activates on the description-file presence only when
+    ``config.json`` carries no ``quantization_config``, while any XTuner-specific ``quant_method``
+    there would make upstream vLLM reject the whole checkpoint.
 
     Args:
         model (nn.Module): The training model the static-mode modules live in.
@@ -181,13 +217,15 @@ def maybe_write_hf_kv_scales(model: nn.Module, hf_dir: str | Path) -> None:
             weight_map[key] = _HF_KV_SCALES_FILENAME
         index_path.write_text(json.dumps(index, indent=4) + "\n")
 
-    (hf_dir / _MODELSLIM_DESCRIPTION_FILENAME).write_text(json.dumps(description, indent=2, sort_keys=True) + "\n")
+    if description is not None:
+        (hf_dir / _MODELSLIM_DESCRIPTION_FILENAME).write_text(json.dumps(description, indent=2, sort_keys=True) + "\n")
 
     meta = {
         "format_version": _EXPORT_FORMAT_VERSION,
         "kv_quant_mode": mode,
         "kv_scales_file": _HF_KV_SCALES_FILENAME,
         "producer": _KV_QUANT_PRODUCER,
-        "consumer_recipe": _MODELSLIM_DESCRIPTION_FILENAME,
     }
+    if description is not None:
+        meta["consumer_recipe"] = _MODELSLIM_DESCRIPTION_FILENAME
     (hf_dir / _KV_SCALE_META_FILENAME).write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")

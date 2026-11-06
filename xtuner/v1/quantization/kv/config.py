@@ -17,7 +17,10 @@ _DEFAULT_KV_QUANT_SCOPE: list[Literal["nope_dsa_ckv"]] = ["nope_dsa_ckv"]
 
 # The static modes freeze their scale once (lazy in-training calibration or checkpoint
 # sidecar) instead of deriving it per forward call.
-STATIC_KV_QUANT_MODES: tuple[Literal["per_tensor_static"], ...] = ("per_tensor_static",)
+STATIC_KV_QUANT_MODES: tuple[Literal["per_channel_static", "per_tensor_static"], ...] = (
+    "per_channel_static",
+    "per_tensor_static",
+)
 
 
 class KVQuantConfig(BaseModel):
@@ -29,11 +32,12 @@ class KVQuantConfig(BaseModel):
     bit-identical to the unquantized path.
 
     Args:
-        kv_quant (Literal["off", "per_token_dynamic", "per_tensor_static"]):
+        kv_quant (Literal["off", "per_token_dynamic", "per_channel_static", "per_tensor_static"]):
             Quantization mode for the compressed-KV latent. ``"per_token_dynamic"`` scales
-            each token by its own ``amax / 127``. ``"per_tensor_static"`` freezes one scale
-            per layer (scalar); the frozen scale comes from the first ``kv_calib_num_batches``
-            training steps or from a checkpoint sidecar.
+            each token by its own ``amax / 127``. ``"per_channel_static"`` and
+            ``"per_tensor_static"`` freeze one scale per latent channel (shape
+            ``[kv_lora_rank]``) or one per layer (scalar); the frozen scale comes from the
+            first ``kv_calib_num_batches`` training steps or from a checkpoint sidecar.
         kv_quant_scope (list[Literal["nope_dsa_ckv"]]): Closed set of face names the KV
             fake-quant applies to. ``"nope_dsa_ckv"`` maps to the post-``kv_a_layernorm``
             injection point in NoPE-DSA attention. Extend the Literal when a new face lands.
@@ -43,7 +47,7 @@ class KVQuantConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kv_quant: Literal["off", "per_token_dynamic", "per_tensor_static"] = "off"
+    kv_quant: Literal["off", "per_token_dynamic", "per_channel_static", "per_tensor_static"] = "off"
     # Closed Literal instead of free strings: a typo'd face name must fail at config time
     # rather than silently gating the fake-quant off.
     kv_quant_scope: list[Literal["nope_dsa_ckv"]] = Field(default_factory=lambda: list(_DEFAULT_KV_QUANT_SCOPE))
@@ -95,11 +99,14 @@ def kv_quant_config_from_env() -> KVQuantConfig | None:
         if os.environ.get(_KV_QUANT_CALIB_BATCHES_ENV, "").strip():
             raise ValueError(
                 f"{_KV_QUANT_CALIB_BATCHES_ENV} only applies to the static KV quant modes; unset it or switch "
-                "to 'per_tensor_static'."
+                "to 'per_channel_static'/'per_tensor_static'."
             )
         return KVQuantConfig(kv_quant="per_token_dynamic")
+    if raw == "per_channel_static":
+        return KVQuantConfig(kv_quant="per_channel_static", kv_calib_num_batches=_kv_calib_batches_from_env())
     if raw == "per_tensor_static":
         return KVQuantConfig(kv_quant="per_tensor_static", kv_calib_num_batches=_kv_calib_batches_from_env())
     raise ValueError(
-        f"{_KV_QUANT_ENV}={raw!r} is invalid; expected 'off', 'per_token_dynamic' or 'per_tensor_static'."
+        f"{_KV_QUANT_ENV}={raw!r} is invalid; expected 'off', 'per_token_dynamic', "
+        "'per_channel_static' or 'per_tensor_static'."
     )
