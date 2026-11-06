@@ -29,7 +29,10 @@ class _Int8FakeQuant(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         if ctx.clip:
             (mask,) = ctx.saved_tensors
-            grad_output = grad_output * mask.to(grad_output.dtype)
+            # torch.where avoids materializing a mask-sized float copy on every backward
+            # pass (the N3 review item) and never turns a masked-out grad into NaN.
+            zero = torch.zeros((), dtype=grad_output.dtype, device=grad_output.device)
+            grad_output = torch.where(mask, grad_output, zero)
         return grad_output, None, None
 
 
@@ -53,11 +56,20 @@ def int8_fake_quant_static(x: torch.Tensor, scale: torch.Tensor, clip: bool = Fa
     Args:
         x (torch.Tensor): Input with the quantization axis last, e.g. ``[B, S, C]``.
         scale (torch.Tensor): Frozen scale broadcast against the last axis of ``x`` (e.g.
-            per-channel ``[C]`` or per-token ``[B, S, 1]``).
+            per-channel ``[C]`` or per-tensor scalar). Must be float32 on the same device as
+            ``x``: fp32 keeps the quantization math aligned with the deployment kernel.
         clip (bool): When ``True``, zero gradients of values outside the int8 range instead of
             passing them through.
 
     Returns:
         torch.Tensor: Dequantized tensor with the same shape and dtype as ``x``.
     """
+    if scale.dtype != torch.float32:
+        raise ValueError(f"scale must be float32 (deployment-aligned), got {scale.dtype}.")
+    if scale.device != x.device:
+        raise ValueError(f"scale must live on x's device ({x.device}), got {scale.device}.")
+    try:
+        torch.broadcast_shapes(x.shape, scale.shape)
+    except RuntimeError as e:
+        raise ValueError(f"scale shape {tuple(scale.shape)} cannot broadcast against x shape {tuple(x.shape)}.") from e
     return _Int8FakeQuant.apply(x, scale, clip)

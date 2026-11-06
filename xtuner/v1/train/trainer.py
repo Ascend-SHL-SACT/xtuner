@@ -57,6 +57,13 @@ from xtuner.v1.patch import (
 from xtuner.v1.profiler import profiling_memory, profiling_time
 from xtuner.v1.profiler.prober import ProberList
 from xtuner.v1.profiler.prober_utils import setup_prober_list
+from xtuner.v1.quantization.kv.calibrate import (
+    KVScaleLazyCalibrator,
+    maybe_load_kv_scale_sidecar,
+    maybe_save_kv_scale_sidecar,
+    needs_kv_calibration,
+)
+from xtuner.v1.quantization.kv.export import maybe_write_hf_kv_scales
 from xtuner.v1.utils import (
     XTUNER_DETERMINISTIC,
     ParallelConfigException,
@@ -879,6 +886,13 @@ class Trainer:
             getattr(self._engine.model, "ep_tp_mesh", None),
             getattr(self._engine.model, "hsdp_mesh", None),
         )
+        # KV-cache-aware QAT (static modes): restore frozen scales from a resume sidecar, then
+        # ride the training loop's own forwards for whatever is still missing -- the lazy
+        # calibrator owns no dataloader. Both are no-ops for every other configuration.
+        maybe_load_kv_scale_sidecar(self._engine.model, self._load_checkpoint_cfg.checkpoint_path)
+        self._kv_calibrator = (
+            KVScaleLazyCalibrator(self._engine.model) if needs_kv_calibration(self._engine.model) else None
+        )
         time_before_get_data = time.time()
         for data_batch in self._data_iter():
             time_before_train_step = time.time()
@@ -889,6 +903,10 @@ class Trainer:
             with self._maybe_profiling():
                 engine_input = self._prepare_model_input(data_batch)
                 train_step_info = self._engine.train_step(engine_input)
+                if self._kv_calibrator is not None:
+                    # Freeze before the AFTER_TRAIN_STEP hooks so a checkpoint saved at this
+                    # step writes a complete scale sidecar.
+                    self._kv_calibrator.on_train_step_end()
                 hooks = self.hooks_config.get_hooks(HookStage.AFTER_TRAIN_STEP)
                 for hook in hooks:
                     hook(
@@ -1337,6 +1355,10 @@ class Trainer:
             )
         else:
             self._engine.save_dcp(weights_dir=weights_path)
+
+        # Frozen static-mode KV scales cannot be re-derived from the weights; keep them next to
+        # the DCP dir so a resume reproduces the exact quantization grid.
+        maybe_save_kv_scale_sidecar(self._engine.model, checkpoint_path)
 
         # Save dataloader
         self._save_dataloader(dataloader_path)
@@ -1958,6 +1980,9 @@ class Trainer:
             finalize_done.wait()
 
     def _finalize_hf_save(self, finalized_hf_path: Path, step: int, epoch: int, delete_hf_dirs: bool) -> None:
+        # Frozen static-mode KV scales cannot be re-derived from the weights; carry them into the
+        # exported HF checkpoint the same way the DCP sidecar carries them into a resume.
+        maybe_write_hf_kv_scales(self._engine.model, finalized_hf_path)
         latest_hf_link = self.exp_dir / "hf-latest"
         save_hf_path = finalized_hf_path
 
