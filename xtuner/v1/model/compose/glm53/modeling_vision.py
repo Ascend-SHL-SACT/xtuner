@@ -29,6 +29,7 @@ from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_device, get_torch_device_m
 from xtuner.v1.utils.activation_offload_npu import (
     activation_offload_npu_enabled,
     register_activation_offload_npu_hooks,
+    vit_flash_attn_skip_recompute,
 )
 from xtuner.v1.utils.init_weight import default_init_weights
 from xtuner.v1.utils.misc import clean_param_name
@@ -47,6 +48,15 @@ DEVICE_MODULE = get_torch_device_module()
 _VIT_FUSED_NORM_ENABLED = os.getenv("XTUNER_VIT_FUSED_NORM", "0") == "1"
 _VIT_FUSED_ROTARY_ENABLED = os.getenv("XTUNER_VIT_FUSED_ROTARY", "0") == "1"
 _FUSED_ONES_GAMMA_CACHE: dict[tuple[tuple[int, ...], torch.dtype, torch.device], torch.Tensor] = {}
+
+# MindSpeed-MM port (fsdp/ops/flash_attn/skip_recompute_flash_attn.py): env-gated skip of the
+# checkpointed ViT attention recompute -- the no_grad forward stashes (attn_output, softmax_max,
+# softmax_sum) and the replay restores them, so the backward runs npu_fusion_attention_grad on
+# the stashed tensors instead of recomputing the attention. Grad parity probe:
+# shell/xtuner1017/claude_added/vit_skip_recompute_grad_probe_20261105.py (bitwise forward; grads
+# bitwise at small T, within 1-2 bf16 ulp at ~14.7k patches -- the fused recompute+grad kernel's
+# reduction order, inside the production run-to-run backward jitter band).
+_VIT_SKIP_RECOMPUTE_ENABLED = os.getenv("XTUNER_VIT_SKIP_RECOMPUTE_ATTN", "0") == "1"
 
 
 def _vision_embed_before_sp() -> bool:
@@ -349,19 +359,43 @@ class Glm53VisionAttention(nn.Module):
                 for states in (query_states, key_states, value_states)
             )
 
-        attn_op_outputs = self.attn_impl_func(
-            query_states,
-            key_states,
-            value_states,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            dropout_p=0.0 if not self.training else self.attention_dropout,
-            softmax_scale=self.scale,
-            causal=False,
-            deterministic=XTUNER_DETERMINISTIC,
-        )
+        # Skip-recompute path (see the gate comment): same inputs/return shape as the
+        # attn_impl_func dispatch below, with the stash/restore Function inside. Requires the
+        # full vision checkpoint (VISION_RECOMPUTE_RATIO >= 1.0): blocks outside the
+        # checkpoint replay without a stashing forward and fail loudly. The device check mirrors
+        # the fused-op gates above -- the stash path is NPU-only.
+        if (
+            _VIT_SKIP_RECOMPUTE_ENABLED
+            and self.training
+            and self.attention_dropout == 0.0
+            and query_states.device.type == "npu"
+        ):
+            attn_op_outputs = vit_flash_attn_skip_recompute(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=self.scale,
+                deterministic=XTUNER_DETERMINISTIC,
+                module=self,
+            )
+        else:
+            attn_op_outputs = self.attn_impl_func(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                dropout_p=0.0 if not self.training else self.attention_dropout,
+                softmax_scale=self.scale,
+                causal=False,
+                deterministic=XTUNER_DETERMINISTIC,
+            )
 
         raw_output = attn_op_outputs["raw_output"]
         if sequence_parallel_mesh is not None and sp_size > 1:

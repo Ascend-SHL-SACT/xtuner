@@ -21,6 +21,7 @@ def npu_flash_varlen_attn(
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
+    return_lse=False,
 ):
     """NPU varlen flash attention over packed sequences (TND layout).
 
@@ -54,9 +55,15 @@ def npu_flash_varlen_attn(
         return_attn_probs (bool): Accepted for signature compatibility; attention probabilities are
             not returned (Default: False).
         block_table (torch.Tensor | None): Paged-attention block table; unsupported on NPU (Default: None).
+        return_lse (bool): Return the kernel's lse pair alongside the output for callers that feed
+            ``npu_fusion_attention_grad`` directly (the ViT skip-recompute path); non-causal calls
+            only (``return_lse=True`` with ``causal=True`` raises NotImplementedError); the default
+            keeps the single-tensor contract (Default: False).
 
     Returns:
-        torch.Tensor: Attention output, ``[total_seq, num_heads, v_head_dim]``.
+        torch.Tensor: Attention output, ``[total_seq, num_heads, v_head_dim]``. With
+        ``return_lse=True``, a ``(attn_output, softmax_max, softmax_sum)`` tuple instead, where the
+        lse pair is exactly what an NFA backward would otherwise recompute.
     """
     if softcap != 0.0:
         raise NotImplementedError("npu_flash_varlen_attn does not support softcap")
@@ -66,6 +73,8 @@ def npu_flash_varlen_attn(
         raise NotImplementedError(f"npu_flash_varlen_attn does not support sliding window {window_size}")
     if block_table is not None:
         raise NotImplementedError("npu_flash_varlen_attn does not support paged attention (block_table)")
+    if return_lse and causal:
+        raise NotImplementedError("npu_flash_varlen_attn only supports return_lse on the non-causal branch")
     if deterministic:
         warnings.warn(
             "npu_flash_varlen_attn ignores deterministic=True: torch_npu NFA has no deterministic "
@@ -76,7 +85,7 @@ def npu_flash_varlen_attn(
 
     scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
     if not causal:
-        fa_out = torch_npu.npu_fusion_attention(
+        fa_out_full = torch_npu.npu_fusion_attention(
             q,
             k,
             v,
@@ -92,7 +101,12 @@ def npu_flash_varlen_attn(
             actual_seq_kvlen=tuple(cu_seqlens_k[1:].tolist())
             if isinstance(cu_seqlens_k, torch.Tensor)
             else cu_seqlens_k[1:],
-        )[0]
+        )
+        if return_lse:
+            # (attn_output, softmax_max, softmax_sum) -- the unpack order MindSpeed's
+            # skip_recompute_flash_attn uses for the same op.
+            return fa_out_full[0], fa_out_full[1], fa_out_full[2]
+        fa_out = fa_out_full[0]
     else:
         fa_out = torch_npu.npu_fusion_attention(
             q,
