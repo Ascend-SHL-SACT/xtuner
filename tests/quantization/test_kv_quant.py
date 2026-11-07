@@ -9,9 +9,11 @@ from safetensors.torch import load_file
 from torch import nn
 
 from xtuner.v1.quantization.kv import (
+    STATIC_KV_QUANT_MODES,
     KVQuantConfig,
     KVScaleLazyCalibrator,
     int8_fake_quant_dynamic,
+    int8_fake_quant_dynamic_block,
     int8_fake_quant_static,
     kv_fakequant_enabled,
     kv_quant_config_from_env,
@@ -21,6 +23,7 @@ from xtuner.v1.quantization.kv import (
     needs_kv_calibration,
 )
 from xtuner.v1.quantization.kv.export import _hf_scale_key
+from xtuner.v1.quantization.kv.kernels import _DYNAMIC_BLOCK_TILE
 
 # Relative import: a regular "tests" package in site-packages shadows the repo's
 # tests/ namespace, so absolute "tests.quantization..." can never resolve.
@@ -30,6 +33,7 @@ from ._modelslim_consumer_ref import (
     _fa_quant_weight_loader,
     detect_quantization_method,
 )
+from ._sfa_c8_dynamic_block_ref import SFA_QSFA_TILE_SIZE, custom_kv_rmsnorm_rope_quant_int8
 
 
 class TestInt8FakeQuantDynamic:
@@ -132,6 +136,105 @@ class TestInt8FakeQuantStatic:
             int8_fake_quant_static(x, torch.full((7,), 0.5))
 
 
+class TestInt8FakeQuantDynamicBlock:
+    # Grid contract of the deployment kernel (torch_npu.npu_dynamic_block_quant, probed
+    # on-device): one fp32 scale = amax * (1/127) per (1, 128) token tile, int8 levels in
+    # [-127, 127], dequant y * scale, all-zero tile -> scale 0 / levels 0.
+
+    def test_tile_scales_differ_from_per_token(self):
+        # Tile 0 carries the row amax (1.0), tile 1 half of it: the block kernel must place
+        # tile 1's 0.5 anchor on its own 127-level (scale 0.5/127), while a whole-token scale
+        # (1/127) pushes the same entry to the 63-level -- different dequantized values.
+        x = torch.zeros(1, 1, 2 * _DYNAMIC_BLOCK_TILE)
+        x[0, 0, 0] = 1.0
+        x[0, 0, _DYNAMIC_BLOCK_TILE] = 0.5
+        out = int8_fake_quant_dynamic_block(x)
+        scale_tile1 = 0.5 * (1.0 / 127.0)
+        anchor = out[0, 0, _DYNAMIC_BLOCK_TILE].item()
+        assert anchor == pytest.approx(127 * scale_tile1, abs=1e-6)
+        assert (out.float() - x).abs().max().item() <= 0.5 * scale_tile1 + 1e-6
+        per_token = int8_fake_quant_dynamic(x)
+        assert per_token[0, 0, _DYNAMIC_BLOCK_TILE].item() != anchor
+
+    def test_matches_torch_mirror_bitwise(self):
+        # The kernel must be exactly its documented formula: fp32 amax * (1/127) per tile,
+        # round-half-even of the safe division, clamp to [-127, 127], dequant y * scale.
+        torch.manual_seed(1)
+        x = (torch.randn(4, 6, 4 * _DYNAMIC_BLOCK_TILE) * 0.05).bfloat16()
+        out = int8_fake_quant_dynamic_block(x)
+        x32 = x.float()
+        tiles = x32.reshape(*x32.shape[:-1], -1, _DYNAMIC_BLOCK_TILE)
+        scale = tiles.abs().amax(dim=-1, keepdim=True).mul_(1.0 / 127.0)
+        safe = torch.where(scale > 0, scale, torch.ones_like(scale))
+        q = torch.clamp(torch.round(tiles / safe), -127.0, 127.0)
+        assert torch.equal(out, q.mul(scale).reshape(x32.shape).to(x.dtype))
+
+    def test_grid_and_tight_error(self):
+        # fp32 input: the dequant contract q * scale is an fp32 product; a bf16 output cast
+        # adds one bf16 ulp on top of scale/2 (the NPU parity test budgets for that).
+        torch.manual_seed(2)
+        x = torch.randn(3, 5, 512) * 0.05
+        out = int8_fake_quant_dynamic_block(x)
+        tiles = x.float().reshape(3, 5, 4, 128)
+        scale = tiles.abs().amax(dim=-1, keepdim=True).mul_(1.0 / 127.0)
+        err = (out.float() - x.float()).reshape(3, 5, 4, 128)
+        assert torch.all(err.abs() <= 0.5 * scale + 1e-6)
+        levels = out.float().reshape(3, 5, 4, 128) / scale
+        assert torch.all((levels - levels.round()).abs() <= 1e-4)
+
+    def test_zero_tile_no_nan(self):
+        x = torch.zeros(2, 1, 512)
+        x[1, 0, 0] = 1.0
+        out = int8_fake_quant_dynamic_block(x)
+        assert torch.isfinite(out).all()
+        assert torch.equal(out[0], torch.zeros_like(out[0]))
+
+    def test_ste_backward_passthrough_bitwise(self):
+        x = torch.randn(2, 3, 512, requires_grad=True)
+        out = int8_fake_quant_dynamic_block(x)
+        grad = torch.randn_like(out)
+        out.backward(grad)
+        assert x.grad is not None
+        assert torch.equal(x.grad, grad)
+
+    def test_last_dim_must_be_tile_multiple(self):
+        with pytest.raises(ValueError, match="multiple"):
+            int8_fake_quant_dynamic_block(torch.randn(2, 100))
+
+
+class TestDynamicBlock128Config:
+    def test_env_parses_dynamic_block_mode(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("XTUNER_QUANT_KV", "dynamic_block_1x128")
+        cfg = kv_quant_config_from_env()
+        assert cfg is not None and cfg.kv_quant == "dynamic_block_1x128"
+        assert kv_fakequant_enabled(cfg, "nope_dsa_ckv")
+
+    def test_env_calib_batches_rejected_for_dynamic_block(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("XTUNER_QUANT_KV", "dynamic_block_1x128")
+        monkeypatch.setenv("XTUNER_QUANT_KV_CALIB_BATCHES", "8")
+        with pytest.raises(ValueError, match="XTUNER_QUANT_KV_CALIB_BATCHES"):
+            kv_quant_config_from_env()
+
+    def test_dynamic_block_is_outside_static_machinery(self):
+        # The dynamic-block mode needs no calibration, sidecar or export (the deployment
+        # kernel derives its scales per forward): it must stay out of STATIC_KV_QUANT_MODES
+        # so the static-only machinery never collects or persists anything for it.
+        assert "dynamic_block_1x128" not in STATIC_KV_QUANT_MODES
+        model = _FakeModel(["dynamic_block_1x128"], calib_batches=2)
+        assert not needs_kv_calibration(model)
+        calibrator = KVScaleLazyCalibrator(model)
+        assert not calibrator.active
+        calibrator.on_train_step_end()  # no-op, no hooks installed
+        assert model.attns[0]._kv_scale is None
+
+    def test_fake_attn_dispatches_dynamic_block(self):
+        torch.manual_seed(3)
+        x = (torch.randn(1, 8, 512) * 0.05).bfloat16()
+        model = _FakeModel(["dynamic_block_1x128"], channels=512)
+        out = model(seq_ctx=x)
+        assert torch.equal(out, int8_fake_quant_dynamic_block(model.attns[0].kv_a_layernorm(x)))
+
+
 class TestKVQuantConfig:
     def test_default_is_off(self):
         cfg = KVQuantConfig()
@@ -216,6 +319,8 @@ class _FakeAttn(nn.Module):
         kv = self.kv_a_layernorm(seq_ctx)
         if self._kv_quant_mode == "per_token_dynamic":
             kv = int8_fake_quant_dynamic(kv)
+        elif self._kv_quant_mode == "dynamic_block_1x128":
+            kv = int8_fake_quant_dynamic_block(kv)
         elif self._kv_calibrating:
             pass
         elif not self._kv_scale_ready:
@@ -692,3 +797,52 @@ class TestPerTensorModelSlimConsumer:
         assert layer.quant_kscale.shape == (1, 512)
         assert torch.allclose(layer.quant_kscale, reciprocal)
         assert layer.fak_offset.item() == 0.0
+
+
+def _npu_available() -> bool:
+    try:
+        import torch_npu  # noqa: F401
+
+        return torch.npu.device_count() > 0
+    except (ImportError, RuntimeError):
+        return False
+
+
+@pytest.mark.gpu
+class TestDynamicBlockNpuOpParity:
+    # The training kernel vs the exact op vllm-ascend calls on the serving path (verbatim
+    # excerpt in _sfa_c8_dynamic_block_ref.py). Scales must match the op BITWISE (the probe
+    # showed the op computes amax * (1/127) in fp32); int8 levels may differ on ~0.03%
+    # knife-edge values by exactly one level (CANN-internal rounding path), which is
+    # immaterial against the scale/2 grid error the dequant contract guarantees.
+
+    @pytest.mark.skipif(not _npu_available(), reason="requires an NPU device")
+    def test_matches_deployment_op(self):
+        for seed in range(4):
+            torch.manual_seed(seed)
+            x = (torch.randn(8, 512) * 0.05).bfloat16().to("npu")
+            y_ref, scale_bytes = custom_kv_rmsnorm_rope_quant_int8(x, 512)
+            scale_ref = scale_bytes.view(torch.float32)  # unpack the consumer byte transport
+
+            out = int8_fake_quant_dynamic_block(x)
+
+            # Scale parity, bitwise: our kernel and the op must derive identical fp32 scales.
+            tiles = x.float().view(8, 4, _DYNAMIC_BLOCK_TILE)
+            scale_kernel = tiles.abs().amax(dim=-1, keepdim=True).mul_(1.0 / 127.0)
+            assert scale_kernel.view(8, 4).dtype == torch.float32
+            assert torch.equal(scale_kernel.view(8, 4), scale_ref)
+            assert _DYNAMIC_BLOCK_TILE == SFA_QSFA_TILE_SIZE
+
+            # Level parity within one int8 level on the shared grid.
+            s4 = scale_ref.view(8, 4, 1)
+            q_mirror = torch.clamp(torch.round(tiles / torch.where(s4 > 0, s4, torch.ones_like(s4))), -127.0, 127.0)
+            diff = (q_mirror - y_ref.float().view(8, 4, _DYNAMIC_BLOCK_TILE)).abs()
+            assert diff.max().item() <= 1.0
+            assert (diff > 0).float().mean().item() < 0.005
+
+            # Dequant contract: our fake-quant output stays within the scale/2 grid error.
+            # The kernel casts the fp32 product back to bf16, which adds one bf16 rounding
+            # step (relative ulp <= 2^-7) on top of the fp32 contract bound.
+            err = (out.float() - x.float()).view(8, 4, _DYNAMIC_BLOCK_TILE)
+            bf16_ulp = x.float().abs().view(8, 4, _DYNAMIC_BLOCK_TILE) * (2.0**-7)
+            assert torch.all(err.abs() <= 0.5 * s4 + bf16_ulp + 1e-6)

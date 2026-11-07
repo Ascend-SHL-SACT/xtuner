@@ -14,7 +14,7 @@ from .calibrate import (
 )
 from .config import STATIC_KV_QUANT_MODES, KVQuantConfig, kv_fakequant_enabled, kv_quant_config_from_env
 from .export import maybe_write_hf_kv_scales
-from .kernels import int8_fake_quant_dynamic, int8_fake_quant_static
+from .kernels import int8_fake_quant_dynamic, int8_fake_quant_dynamic_block, int8_fake_quant_static
 
 
 __all__ = [
@@ -22,6 +22,7 @@ __all__ = [
     "KVQuantConfig",
     "KVScaleLazyCalibrator",
     "int8_fake_quant_dynamic",
+    "int8_fake_quant_dynamic_block",
     "int8_fake_quant_static",
     "kv_fakequant_enabled",
     "kv_quant_config_from_env",

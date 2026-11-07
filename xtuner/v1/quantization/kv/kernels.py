@@ -42,12 +42,73 @@ def int8_fake_quant_dynamic(x: torch.Tensor, clip: bool = False) -> torch.Tensor
     Args:
         x (torch.Tensor): Input with the quantization axis last, e.g. ``[B, S, C]``.
         clip (bool): When ``True``, zero gradients of values outside the int8 range instead of
-            passing them through.
+            passing them through. Meaningful only for a caller-supplied static scale: a dynamic
+            scale derives from the amax itself, so the clip boundary ``127 * scale`` equals the
+            amax and clipping is a semantic no-op (fp32 rounding can even spuriously zero the
+            amax element's gradient).
 
     Returns:
         torch.Tensor: Dequantized tensor with the same shape and dtype as ``x``.
     """
     return _Int8FakeQuant.apply(x, None, clip)
+
+
+# The deployment kernel's only supported block shape (torch_npu.npu_dynamic_block_quant,
+# row_block_size=1 / col_block_size=128): one symmetric-int8 scale per token per 128-channel
+# tile of the ckv latent. Hardcoded to the consumer contract; not a free parameter.
+_DYNAMIC_BLOCK_TILE = 128
+
+
+class _Int8FakeQuantDynamicBlock(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, clip: bool) -> torch.Tensor:
+        if x.shape[-1] % _DYNAMIC_BLOCK_TILE != 0:
+            raise ValueError(
+                f"Last dimension {x.shape[-1]} must be a multiple of the dynamic-block tile {_DYNAMIC_BLOCK_TILE}."
+            )
+        x32 = x.float()
+        tiles = x32.reshape(*x32.shape[:-1], x32.shape[-1] // _DYNAMIC_BLOCK_TILE, _DYNAMIC_BLOCK_TILE)
+        # On-device probe of the deployment op (claude_added/probe_npu_dynamic_block_20261106.py):
+        # scale = amax * (1/127) in fp32 -- multiplying by the reciprocal constant, not dividing;
+        # an all-zero tile yields scale == 0 with y == 0 (no NaN, no minimum-scale clamp).
+        scale = tiles.abs().amax(dim=-1, keepdim=True).mul_(1.0 / 127.0)
+        safe = torch.where(scale > 0, scale, torch.ones_like(scale))
+        ctx.clip = clip
+        if clip:
+            ctx.save_for_backward(tiles.abs().le(127.0 * scale).reshape(x32.shape))
+        q = torch.clamp(torch.round(tiles / safe), -127.0, 127.0)
+        return q.mul(scale).reshape(x32.shape).to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.clip:
+            (mask,) = ctx.saved_tensors
+            zero = torch.zeros((), dtype=grad_output.dtype, device=grad_output.device)
+            grad_output = torch.where(mask, grad_output, zero)
+        return grad_output, None
+
+
+def int8_fake_quant_dynamic_block(x: torch.Tensor, clip: bool = False) -> torch.Tensor:
+    """Fake-quantize ``x`` on the symmetric int8 grid with one dynamic scale per (1, 128) tile.
+
+    Grid-aligned with the deployment kernel vllm-ascend SFA C8 uses for this latent
+    (``torch_npu.npu_dynamic_block_quant(row_block_size=1, col_block_size=128)``): per-token,
+    per-128-channel-tile fp32 scales, int8 levels clamped to [-127, 127], straight-through
+    backward. The last dimension must be a multiple of 128 (the ckv latent is 512).
+
+    Args:
+        x (torch.Tensor): Input with the quantization axis last, e.g. ``[B, S, C]`` where
+            ``C`` is a multiple of 128.
+        clip (bool): When ``True``, zero gradients of values outside the int8 range instead of
+            passing them through. Meaningful only for a caller-supplied static scale: a dynamic
+            tile scale derives from the tile amax itself, so the clip boundary ``127 * scale``
+            equals the amax and clipping is a semantic no-op (fp32 rounding can even spuriously
+            zero the amax element's gradient).
+
+    Returns:
+        torch.Tensor: Dequantized tensor with the same shape and dtype as ``x``.
+    """
+    return _Int8FakeQuantDynamicBlock.apply(x, clip)
 
 
 def int8_fake_quant_static(x: torch.Tensor, scale: torch.Tensor, clip: bool = False) -> torch.Tensor:

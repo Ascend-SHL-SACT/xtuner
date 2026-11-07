@@ -29,11 +29,13 @@ class KVQuantConfig(BaseModel):
     bit-identical to the unquantized path.
 
     Args:
-        kv_quant (Literal["off", "per_token_dynamic", "per_tensor_static"]):
+        kv_quant (Literal["off", "per_token_dynamic", "dynamic_block_1x128", "per_tensor_static"]):
             Quantization mode for the compressed-KV latent. ``"per_token_dynamic"`` scales
-            each token by its own ``amax / 127``. ``"per_tensor_static"`` freezes one scale
-            per layer (scalar); the frozen scale comes from the first ``kv_calib_num_batches``
-            training steps or from a checkpoint sidecar.
+            each token by its own ``amax / 127``. ``"dynamic_block_1x128"`` scales each token
+            per 128-channel tile (``amax * (1/127)``) -- the grid the deployed engine's
+            ``npu_dynamic_block_quant`` applies to this latent. ``"per_tensor_static"`` freezes
+            one scale per layer (scalar); the frozen scale comes from the first
+            ``kv_calib_num_batches`` training steps or from a checkpoint sidecar.
         kv_quant_scope (list[Literal["nope_dsa_ckv"]]): Closed set of face names the KV
             fake-quant applies to. ``"nope_dsa_ckv"`` maps to the post-``kv_a_layernorm``
             injection point in NoPE-DSA attention. Extend the Literal when a new face lands.
@@ -43,7 +45,7 @@ class KVQuantConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kv_quant: Literal["off", "per_token_dynamic", "per_tensor_static"] = "off"
+    kv_quant: Literal["off", "per_token_dynamic", "dynamic_block_1x128", "per_tensor_static"] = "off"
     # Closed Literal instead of free strings: a typo'd face name must fail at config time
     # rather than silently gating the fake-quant off.
     kv_quant_scope: list[Literal["nope_dsa_ckv"]] = Field(default_factory=lambda: list(_DEFAULT_KV_QUANT_SCOPE))
@@ -82,7 +84,7 @@ def kv_quant_config_from_env() -> KVQuantConfig | None:
     """Build a :class:`KVQuantConfig` from the ``XTUNER_QUANT_KV`` environment variable.
 
     The static modes also read the optional ``XTUNER_QUANT_KV_CALIB_BATCHES`` override of
-    ``kv_calib_num_batches``; setting that variable with ``per_token_dynamic`` is an error.
+    ``kv_calib_num_batches``; setting that variable with a dynamic mode is an error.
 
     Returns:
         KVQuantConfig | None: Parsed config, or ``None`` when the variable is unset or selects
@@ -98,8 +100,16 @@ def kv_quant_config_from_env() -> KVQuantConfig | None:
                 "to 'per_tensor_static'."
             )
         return KVQuantConfig(kv_quant="per_token_dynamic")
+    if raw == "dynamic_block_1x128":
+        if os.environ.get(_KV_QUANT_CALIB_BATCHES_ENV, "").strip():
+            raise ValueError(
+                f"{_KV_QUANT_CALIB_BATCHES_ENV} only applies to the static KV quant modes; unset it or switch "
+                "to 'per_tensor_static'."
+            )
+        return KVQuantConfig(kv_quant="dynamic_block_1x128")
     if raw == "per_tensor_static":
         return KVQuantConfig(kv_quant="per_tensor_static", kv_calib_num_batches=_kv_calib_batches_from_env())
     raise ValueError(
-        f"{_KV_QUANT_ENV}={raw!r} is invalid; expected 'off', 'per_token_dynamic' or 'per_tensor_static'."
+        f"{_KV_QUANT_ENV}={raw!r} is invalid; expected 'off', 'per_token_dynamic', "
+        "'dynamic_block_1x128' or 'per_tensor_static'."
     )
