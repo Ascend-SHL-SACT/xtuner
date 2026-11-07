@@ -38,7 +38,11 @@ from xtuner.v1.ops.sparse_mla import (
 )
 from xtuner.v1.ops.sparse_mla.flash_mla import _FLASH_MLA_HEAD_ALIGNMENT
 from xtuner.v1.quantization.kv.config import KVQuantConfig, kv_fakequant_enabled
-from xtuner.v1.quantization.kv.kernels import int8_fake_quant_dynamic, int8_fake_quant_static
+from xtuner.v1.quantization.kv.kernels import (
+    int8_fake_quant_dynamic,
+    int8_fake_quant_dynamic_block,
+    int8_fake_quant_static,
+)
 from xtuner.v1.utils.dtensor import materialize_full
 from xtuner.v1.utils.init_weight import init_params
 
@@ -414,6 +418,12 @@ class NoPEDSAMultiLatentAttention(MultiLatentAttention):
         if self._ckv_fakequant:
             if self._kv_quant_mode == "per_token_dynamic":
                 kv_compressed = int8_fake_quant_dynamic(kv_compressed)
+            elif self._kv_quant_mode == "dynamic_block_1x128":
+                # The deployment grid for this latent: vllm-ascend SFA C8 quantizes it with
+                # torch_npu.npu_dynamic_block_quant(row_block_size=1, col_block_size=128) --
+                # one fp32 scale per token per 128-channel tile -- so train against the same
+                # tiles rather than a whole-token scale.
+                kv_compressed = int8_fake_quant_dynamic_block(kv_compressed)
             elif self._kv_calibrating:
                 pass
             elif not self._kv_scale_ready:
