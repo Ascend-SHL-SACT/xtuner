@@ -24,6 +24,8 @@ import torch_npu
 
 from xtuner.v1.data_proto import SequenceContext
 
+from .kpool_npu import pack_visible_tail_enabled
+
 
 def npu_dsa_topk_indices(
     q: torch.Tensor,
@@ -52,6 +54,14 @@ def npu_dsa_topk_indices(
     Returns:
         ``[S, 1, K]`` int32 tensor. Invalid slots padded with -1.
     """
+    # This producer pads -1 at arbitrary in-span slots. Under the pack gate the
+    # consumer passes rows through unrewritten, and the kernel backward reads an
+    # in-span -1 as a raw negative index (AICORE exception), so fail loudly here.
+    if pack_visible_tail_enabled():
+        raise RuntimeError(
+            "npu_dsa_topk_indices pads -1 inside the causal read span and must not run "
+            "while XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL is enabled"
+        )
     # Contract (see DSATopKIndicesProtocol): implementations own the full
     # Indexer score scaling, including ``Ni**-0.5``; the caller passes the raw
     # float32 ``weights_proj`` output. The TND/BSND paths below additionally
