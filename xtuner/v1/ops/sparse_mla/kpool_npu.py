@@ -68,16 +68,22 @@ except ImportError:  # triton-ascend unavailable (CPU CI / reference boxes): eag
     triton = None  # type: ignore[assignment]
     tl = None  # type: ignore[assignment]
 
-__all__ = ["npu_kpool_topk_indices"]
+__all__ = ["npu_kpool_topk_indices", "pack_visible_tail_enabled", "pack_visible_tail_into"]
 
 # Batched indexer scoring (one score launch per document segment into a whole-call score
 # buffer + one whole-shard topk) instead of the per-segment pad -> score -> topk -> scatter
 # chain. Setting it to ``0`` restores the legacy per-segment path bit for bit.
 _BATCHED_SCORE = os.environ.get("XTUNER_GLM53_KPOOL_BATCHED_SCORE", "1") == "1"
 
+# Span-dense packed index rows (built by ``pack_visible_tail_into`` below): each row dense
+# with distinct visible tokens inside its causal read span, -1 only beyond it. The default
+# ``0`` keeps the legacy -1-padded layout bit for bit.
+_PACK_VISIBLE_TAIL = os.environ.get("XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL", "0") == "1"
+
 
 def _parse_row_chunk(raw: str) -> int:
-    """Parse ``XTUNER_KPOOL_SCORE_ROW_CHUNK``; ``<= 0`` selects the whole-shard layout.
+    """Parse ``XTUNER_KPOOL_SCORE_ROW_CHUNK``; ``<= 0`` selects the whole-shard
+    layout.
 
     Args:
         raw (str): Raw environment value.
@@ -173,6 +179,116 @@ _POOL_INDEX_CACHE: weakref.WeakKeyDictionary[SequenceContext, dict[tuple[int, in
 )
 
 
+def pack_visible_tail_enabled() -> bool:
+    """Whether span-dense packed index rows are enabled.
+
+    Returns:
+        bool: True when ``XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL=1`` (default off). The
+            GLM-5.2 per-token ``npu_dsa_topk_indices`` producer pads -1 inside the
+            read span and must not run while this gate is on (it raises instead).
+    """
+    return _PACK_VISIBLE_TAIL
+
+
+def pack_visible_tail_into(
+    out: Tensor,
+    sel_all: Tensor,
+    row_prefix: Tensor,
+    row_doc_start: Tensor,
+    slot_offsets: Tensor,
+    tail: Tensor,
+    *,
+    index_topk: int,
+    index_kpool: int,
+) -> None:
+    """Expand selected pool ids into span-dense packed rows, written in place
+    into ``out``.
+
+    The kernel cannot take the reference path's -1-padded layout as is: its backward
+    reads an in-span -1 slot as a raw negative index and raises an AICORE exception,
+    which is why ``_rewrite_invalid_indices`` rewrites -1 to the query's own global
+    position by default. That rewrite makes rows duplicate-laden, and the kernel
+    accumulates duplicate slots per-slot (multiset softmax, not dedup): the forward
+    deviates from the reference "invalid slot contributes nothing" semantics, and with
+    duplicates present the backward dkv is no longer the gradient of the forward
+    (cross-row shared positions are corrupted).
+
+    The layout built here is the only form that is both exact and safe: each row is
+    DENSE with distinct visible tokens inside the kernel's causal read span
+    ``[0, min(qpos + 1, width))`` and holds -1 ONLY BEYOND it. The kernel's forward
+    skips out-of-span -1 slots and its backward never reads them (the span rule,
+    verified on 910C for forward and backward; MindSpeed-MM's glm5_next packs the
+    same layout upstream).
+
+    Row shape (width = index_topk, tail token count ``t = (local_pos + 1) % kpool``):
+
+    - short rows (visible tokens ``p + 1 <= width``): ``[0..p]`` + -1 padding;
+    - long rows: the kpool-expanded selected pools truncated to ``width - t`` slots,
+      then the ``t``-token document tail ending at the query itself -- exactly full.
+
+    Duplicates are impossible by construction: selected pool ids are all below
+    ``row_prefix`` while the tail spans the first ``t`` tokens of pool ``row_prefix``.
+
+    Pure tensor ops only (no SequenceContext, no torch_npu), so the pack is
+    unit-testable on CPU.
+
+    Args:
+        out (Tensor): ``[S, index_topk]`` int32 pre-filled with -1; the packed rows
+            are written in place.
+        sel_all (Tensor): ``[S, index_topk // index_kpool]`` int32 per-row selected
+            pool ids (document-local columns); short rows may hold out-of-range
+            pad values, which this function never reads.
+        row_prefix (Tensor): ``[S]`` int32 number of complete visible pools per row.
+        row_doc_start (Tensor): ``[S]`` int32 global id of each row's first token.
+        slot_offsets (Tensor): ``[index_kpool]`` int32 intra-pool slot offsets.
+        tail (Tensor): ``[S, index_kpool - 1]`` int32 visible tail token global ids,
+            left-aligned and -1-padded (``_visible_tail_tokens`` output; ``[S, 0]``
+            when ``index_kpool == 1``).
+        index_topk (int): Semantic token budget; equals the packed row width.
+        index_kpool (int): Pool size.
+    """
+    seq_len = out.shape[0]
+    device = out.device
+    select_k = index_topk // index_kpool
+    assert out.shape[1] == index_topk
+
+    # Visible tail token count t = (local_pos + 1) % kpool, recovered from the -1
+    # padding of the tail tensor.
+    tail_count = (tail >= 0).sum(-1, dtype=torch.int32)
+    # History length in tokens: short rows carry ``prefix * kpool == p + 1 - t``
+    # visible tokens; long rows truncate the pool expand to ``index_topk - t`` so
+    # the tail fits and the row is exactly full. minimum() picks per row -- no
+    # branch needed.
+    history_len = torch.minimum(row_prefix * index_kpool, index_topk - tail_count)
+
+    # Short rows are rebuilt as the column arange: topk guarantees the valid pool-id
+    # SET equals ``[0, row_prefix)`` but not the order, and the canonical order
+    # keeps rows comparable to the reference expand. Slots at or past ``row_prefix``
+    # are zeroed -- they sit at/after ``history_len`` and never win the where below.
+    # Long rows keep the topk pool ids (all valid, all distinct). The where result
+    # is a fresh tensor, so the in-place mul_/add_ are safe.
+    long_row = row_prefix >= select_k
+    col_ids = torch.arange(select_k, device=device, dtype=torch.int32)
+    short_ids = col_ids * (col_ids.unsqueeze(0) < row_prefix.unsqueeze(-1))
+    compact_sel = torch.where(long_row.unsqueeze(-1), sel_all, short_ids).to(torch.int32)
+    compact_sel.mul_(index_kpool).add_(row_doc_start.unsqueeze(-1))
+    hist_tok = (compact_sel.unsqueeze(-1) + slot_offsets).view(seq_len, index_topk)
+
+    # Column classification via ``past_history = pos - history_len``: negative =
+    # history segment; ``[0, t)`` = tail segment (``tail[:, :1]`` is the first tail
+    # token when ``t > 0`` and a -1 placeholder when ``t == 0``, where ``is_tail``
+    # is all-False so nothing lands). Remaining columns keep the pre-filled -1,
+    # beyond the causal read span.
+    past_history = torch.arange(index_topk, device=device, dtype=torch.int32).unsqueeze(0) - history_len.unsqueeze(-1)
+    is_history = past_history < 0
+    is_tail = (past_history >= 0) & (past_history < tail_count.unsqueeze(-1))
+    # ``out`` doubles as the where "else" input and the output: elementwise, no
+    # cross-element dependency; the aliasing is verified on NPU.
+    torch.where(is_history, hist_tok, out, out=out)
+    if tail.shape[1]:
+        torch.where(is_tail, tail[:, :1] + past_history, out, out=out)
+
+
 @torch.no_grad()
 def npu_kpool_topk_indices(
     q: Tensor,
@@ -209,7 +325,8 @@ def npu_kpool_topk_indices(
         index_topk (int): Semantic token budget (e.g. 2048); must be divisible by
             ``index_kpool``.
         index_kpool (int): Pool size.
-        always_select_tail (bool): Whether to append the incomplete trailing pool.
+        always_select_tail (bool): Whether to append the incomplete trailing pool. Required
+            under ``XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL=1``.
         alignment (int): Output width alignment of the chosen SparseMLA forward backend
             (``torch_npu`` uses 1 -- the kernel takes any index width).
         query_chunk_size (int | None): Eager-fallback query-chunk bound; ignored by the fused
@@ -223,9 +340,17 @@ def npu_kpool_topk_indices(
             pool width) unless ``XTUNER_INDEXER_SP_WORK_RATIO`` sets an explicit ratio.
 
     Returns:
-        Tensor: ``[S, 1, kpool_output_width(index_topk, index_kpool, alignment)]`` int32.
+        Tensor: ``[S, 1, kpool_output_width(index_topk, index_kpool, alignment)]`` int32;
+            with ``XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL=1`` the width is ``index_topk`` and each
+            row is dense with distinct visible tokens inside its causal read span, holding -1
+            only beyond it (see :func:`pack_visible_tail_into`).
     """
     assert index_topk % index_kpool == 0
+    pack = pack_visible_tail_enabled()
+    if pack and not always_select_tail:
+        # Without the visible tail the pack cannot fill the causal read span, and the
+        # kernel's backward reads in-span -1 slots as raw negative indices.
+        raise ValueError("XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL=1 requires always_select_tail=True")
     # SP: queries stay sharded; the key side gathers *before* pooling, because a pool can
     # straddle the shard seam (see build_pools).
     sp_mesh = seq_ctx.sequence_parallel_mesh
@@ -236,7 +361,9 @@ def npu_kpool_topk_indices(
 
     q_local = q.squeeze(0).contiguous()  # [S, NH, Di]
     seq_len, device = q_local.shape[0], q_local.device
-    width = kpool_output_width(index_topk, index_kpool, alignment)
+    # Pack gate: rows shrink to index_topk (the tail moves inside the row), so the
+    # separate tail columns and the alignment no longer apply.
+    width = index_topk if pack else kpool_output_width(index_topk, index_kpool, alignment)
     out = torch.full((seq_len, width), -1, dtype=torch.int32, device=device)
 
     select_k = index_topk // index_kpool
@@ -391,6 +518,23 @@ def npu_kpool_topk_indices(
         # ``_SEL_PAD`` and fail the test; the incomplete trailing pool of a document is
         # never below the prefix either, so its out-of-document arithmetic slots are always
         # masked back to -1, matching ``pool_index``'s padding.
+        if pack:
+            # Span-dense packed rows (see :func:`pack_visible_tail_into`): dense with
+            # distinct visible tokens inside each row's causal read span, -1 only
+            # beyond it. The tail is packed inside the row, so no separate tail
+            # columns exist.
+            pack_visible_tail_into(
+                out,
+                sel_all,
+                row_prefix,
+                row_doc_start,
+                slot_offsets,
+                _visible_tail_tokens(seq_ctx, seq_len, index_kpool, device),
+                index_topk=index_topk,
+                index_kpool=index_kpool,
+            )
+            return out.unsqueeze(1)
+
         valid = sel_all < row_prefix.unsqueeze(-1)
         sel_all.mul_(index_kpool).add_(row_doc_start.unsqueeze(-1))
         tok = sel_all.unsqueeze(-1) + slot_offsets
@@ -408,7 +552,8 @@ def _pool_index_cache_on() -> bool:
 
 
 def _cached_pool_index(seq_ctx: SequenceContext, seq_len: int, index_kpool: int, device: torch.device) -> Tensor:
-    """``build_pool_index`` behind the per-context pool-index cache (``_POOL_INDEX_CACHE``).
+    """``build_pool_index`` behind the per-context pool-index cache
+    (``_POOL_INDEX_CACHE``).
 
     Args:
         seq_ctx (SequenceContext): Packed-sequence metadata (document boundaries).
@@ -447,7 +592,8 @@ kpool.build_pool_index = _cached_pool_index
 def _segment_ranges(
     seq_ctx: SequenceContext, query_len: int, index_kpool: int, shard_start: int | None = None
 ) -> list[tuple[int, int, int, int, int]]:
-    """Intersect the local query shard with the packed documents, in pool space.
+    """Intersect the local query shard with the packed documents, in pool
+    space.
 
     Args:
         seq_ctx (SequenceContext): Packed-sequence and SP metadata; ``cu_seq_lens_q`` is
@@ -566,7 +712,8 @@ def _score_and_topk_batched(
     index_head_dim: int,
     row_chunk: int = 0,
 ) -> Tensor:
-    """Score every document segment with one kernel launch each, then topk the shard once.
+    """Score every document segment with one kernel launch each, then topk the
+    shard once.
 
     Replaces the per-segment pad -> score -> topk -> scatter chain with: one ``finfo.min``
     prefill of a whole-call ``[S, W]`` fp32 score buffer (``W`` = max segment pool count plus
@@ -1055,7 +1202,8 @@ if triton is not None:
         valid_candidates: torch.Tensor | None = None,
         scale: float | None = None,
     ) -> torch.Tensor:
-        """Functional entry; mirrors MindSpeed-MM's ``lightning_indexer_score``.
+        """Functional entry; mirrors MindSpeed-MM's
+        ``lightning_indexer_score``.
 
         Args:
             q (torch.Tensor): Indexer queries ``[B, S, NH, D]``.
@@ -1080,7 +1228,8 @@ if triton is not None:
         num_pools: int,
         scale: float,
     ) -> None:
-        """Launch the fused scoring kernel straight into caller-provided (possibly strided) buffers.
+        """Launch the fused scoring kernel straight into caller-provided
+        (possibly strided) buffers.
 
         Batched-path entry for :func:`npu_kpool_topk_indices`: instead of allocating a fresh
         contiguous ``[R, P_padded]`` score tensor per document segment, the kernel writes into a

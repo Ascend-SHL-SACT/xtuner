@@ -15,7 +15,8 @@ Three paths:
 Key implementation notes:
   - ``sparse_mode=3`` (RightDownCausal): kernel applies per-segment causal
     mask internally. Requires valid (non -1) indices at training scale;
-    -1 is rewritten to query's own global position (self-attention).
+    -1 is rewritten to query's own global position (self-attention) unless
+    the span-dense pack gate is on (see :func:`kpool_npu.pack_visible_tail_into`).
   - ``self_pos`` must use GLOBAL position (``arange(S) + shard_start``)
     for correct global→local conversion. Using local position causes
     V1 kernel backward to produce NaN (sparse_mode=3 + multi-segment TND).
@@ -46,6 +47,7 @@ from torch import Tensor
 
 from xtuner.v1.data_proto import SequenceContext
 
+from .kpool_npu import pack_visible_tail_enabled
 from .npu_indexer import _compute_prefix_extended_kv_slice, get_sp_mode_and_slice
 from .protocol import SparseMLAOutputs
 
@@ -88,8 +90,8 @@ def npu_sfa_rope_padded(
     *,
     seq_ctx: SequenceContext | None = None,
 ) -> SparseMLAOutputs:
-    """``torch_npu`` sparse-MLA entry: zero-pads NoPE absorbed inputs, passes the rest
-    through.
+    """``torch_npu`` sparse-MLA entry: zero-pads NoPE absorbed inputs, passes
+    the rest through.
 
     Args:
         q (Tensor | tuple[Tensor, Tensor]): Either a rope-tailed absorbed query
@@ -100,8 +102,9 @@ def npu_sfa_rope_padded(
             first.
         kv (Tensor): SP-gathered compressed KV, ``[S_g, 1, Rkv]`` (NoPE) or
             ``[S_g, 1, Rkv + Dr]`` (rope-tailed).
-        indices (Tensor): Top-k token ids ``[S, 1, K]`` int32, ``-1``-padded (the kernel
-            rewrites ``-1`` slots to the query's own position).
+        indices (Tensor): Top-k token ids ``[S, 1, K]`` int32, ``-1``-padded (rewritten to the
+            query's own position unless the pack gate is on; see
+            :func:`kpool_npu.pack_visible_tail_into`).
         scaling (float | None): Softmax scale; passed through to :func:`npu_sparse_mla`.
         value_dim (int | None): Value dimension (``Rkv``); passed through, and its equality
             with ``q.shape[-1]`` is the NoPE discriminator.
@@ -349,7 +352,15 @@ def _rewrite_invalid_indices(
     ``self_pos`` must be GLOBAL (``arange(S) + shard_start``) for correct
     global→local conversion downstream. Using local position causes V1
     kernel backward NaN (sparse_mode=3 + multi-segment TND).
+
+    Under ``XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL=1`` the -1s sit beyond each
+    row's causal read span (see :func:`kpool_npu.pack_visible_tail_into`):
+    the kernel forward skips them and its backward never reads them, so they
+    pass through unchanged -- rewriting them to self would turn the packed
+    tail into duplicate slots (multiset accumulation).
     """
+    if pack_visible_tail_enabled():
+        return indices.to(torch.int32)
     S = indices.shape[0]
     self_pos = torch.arange(S, device=device, dtype=indices.dtype) + shard_start
     return torch.where(
@@ -389,7 +400,11 @@ def _global_to_local_indices(
     # materializes a new [S, K] buffer, so the extra out-of-place clamp (and
     # the previous defensive clone) each doubled the transient footprint of
     # the global-width index conversion.
-    local_indices = local_indices.clamp_(min=0)
+    # Pack gate: -1 must pass through (it sits beyond the read span). -1 - offset
+    # is <= -1, so clamp(min=-1) maps every negative to exactly -1 while valid
+    # globals (>= 0) are untouched -- no extra mask tensor needed.
+    clamp_min = -1 if pack_visible_tail_enabled() else 0
+    local_indices = local_indices.clamp_(min=clamp_min)
     return local_indices.unsqueeze(1).contiguous()
 
 
@@ -409,7 +424,8 @@ def _sp_mla_offload_enabled() -> bool:
 
 
 def _parse_sfa_grad_row_chunk(raw: str) -> int:
-    """Parse ``XTUNER_SFA_GRAD_ROW_CHUNK``; ``<= 0`` selects the stock single grad call.
+    """Parse ``XTUNER_SFA_GRAD_ROW_CHUNK``; ``<= 0`` selects the stock single
+    grad call.
 
     Args:
         raw (str): Raw environment value.
@@ -766,7 +782,8 @@ def _sfa_grad_chunked(
     scale_value: float,
     row_chunk: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Run ``npu_sparse_flash_attention_grad`` in query-row chunks of ``row_chunk`` rows.
+    """Run ``npu_sparse_flash_attention_grad`` in query-row chunks of
+    ``row_chunk`` rows.
 
     Per chunk ``[r0, r1)`` the touched segments' query rows form one contiguous range, so all chunk inputs are
     views; each touched segment's KV span is end-clipped at ``min(qe, r1) - qs - 1 + (W_s - Q_s) + 1`` (the
