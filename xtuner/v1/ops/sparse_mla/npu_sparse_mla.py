@@ -39,6 +39,7 @@ Reference: mindspeed/core/transformer/experimental_attention_variant/dsa_fused.p
 """
 
 import os
+from collections.abc import Callable, Mapping
 from functools import lru_cache
 
 import torch
@@ -46,6 +47,13 @@ import torch_npu
 from torch import Tensor
 
 from xtuner.v1.data_proto import SequenceContext
+from xtuner.v1.utils import log_rank0
+from xtuner.v1.utils.activation_offload_npu import (
+    sfa_stash_key,
+    sfa_stash_pop,
+    sfa_stash_prefetch,
+    sfa_stash_push,
+)
 
 from .kpool_npu import pack_visible_tail_enabled
 from .npu_indexer import _compute_prefix_extended_kv_slice, get_sp_mode_and_slice
@@ -463,6 +471,72 @@ _SFA_GRAD_ROW_CHUNK = _parse_sfa_grad_row_chunk(os.environ.get("XTUNER_SFA_GRAD_
 # restores unconditional offloading bit for bit.
 _SFA_GRAD_OFFLOAD_MIN_KV = int(os.environ.get("XTUNER_SFA_GRAD_OFFLOAD_MIN_KV", "131072"))
 
+# Skip the SFA forward recompute inside reentrant activation checkpoint's
+# backward: the no-grad original forward stashes the kernel outputs and the
+# grad-enabled replay pops them instead of re-running the kernel (op_replay
+# "sfa" scope, MindSpeed-MM port; the stash lives in activation_offload_npu).
+# Rides the SP>1 offload Function path (``XTUNER_SP_MLA_OFFLOAD=1``, the
+# launch default); the stock and chunked-grad paths keep their recompute.
+# The stash's LIFO pairing is only verified for intra_layer_micro_batch=1
+# (see the topology comment in activation_offload_npu), so the gate read
+# below force-disables the feature at import when IMB>1 -- both launch
+# configs source IMB from INTRA_LAYER_MICRO_BATCH.
+
+
+def _sfa_skip_recompute_enabled(env: Mapping[str, str]) -> bool:
+    """Whether the SFA skip-recompute stash may run for this process.
+
+    Reads the gate and the micro-batching invariant once, at import. A
+    non-numeric IMB crashes the config layer regardless, so it does not
+    disable the gate here.
+
+    Args:
+        env (`Mapping[str, str]`): Environment mapping to read.
+
+    Returns:
+        bool: True only when the gate is on and IMB is 1.
+    """
+    if env.get("XTUNER_SFA_SKIP_RECOMPUTE", "0") != "1":
+        return False
+    try:
+        micro_batch = int(env.get("INTRA_LAYER_MICRO_BATCH", "1"))
+    except ValueError:
+        return True
+    if micro_batch > 1:
+        log_rank0.warning(
+            "XTUNER_SFA_SKIP_RECOMPUTE requires intra_layer_micro_batch=1 "
+            "(INTRA_LAYER_MICRO_BATCH): with interleaved microbatches the stash "
+            "would cross-pair same-shape entries and silently corrupt gradients. "
+            "Force-disabling the skip-recompute stash for this run; training "
+            "proceeds with the stock checkpoint recompute."
+        )
+        return False
+    return True
+
+
+_SFA_SKIP_RECOMPUTE = _sfa_skip_recompute_enabled(os.environ)
+
+_is_checkpoint_replay_fn: Callable[[], bool] | None = None
+
+
+def _checkpoint_replay() -> bool:
+    """Whether an ``apply_activation_checkpointing`` wrapper is currently
+    replaying its forward in backward.
+
+    Returns:
+        bool: True only inside a checkpoint replay; False for original
+        forwards (grad-enabled or not) and any un-checkpointed call.
+    """
+    global _is_checkpoint_replay_fn
+    if _is_checkpoint_replay_fn is None:
+        # Lazy import: the model package imports this module mid-init, so a
+        # module-level import would cycle through a partially-initialized
+        # ``xtuner.v1.model``.
+        from xtuner.v1.model.utils.checkpointing import is_checkpoint_replay
+
+        _is_checkpoint_replay_fn = is_checkpoint_replay
+    return _is_checkpoint_replay_fn()
+
 
 class _SpTndSparseMlaFn(torch.autograd.Function):
     """SP>1 TND sparse MLA with the grad-input tensors offloaded to pinned CPU.
@@ -498,9 +572,17 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
         kv_start: int,
         shard_start: int,
         scale_value: float,
+        is_replay: bool,
     ) -> SparseMLAOutputs:
         device = q_nope.device
         seq_len, num_heads, _ = q_nope.shape
+
+        stash_key = sfa_stash_key(q_nope, kv)
+        # Offload mode: issue the H2D refill before the contiguous copies and
+        # index transforms so the transfer overlaps them (d2h doc: refill
+        # adjacent to consumption). Device mode (or gate off) yields None and
+        # the pop below reads the device-resident entry directly.
+        stash_prefetch = sfa_stash_prefetch(stash_key) if is_replay and _SFA_SKIP_RECOMPUTE else None
 
         query_tnd = q_nope.contiguous()  # [S, N, Rkv]
         query_rope_tnd = q_rope.contiguous()  # [S, N, Dr]
@@ -510,24 +592,43 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
         sparse_indices = _rewrite_invalid_indices(indices, shard_start, device)
         sparse_indices_tnd = _global_to_local_indices(sparse_indices, cu_q, cu_k, kv_start, seq_len, device)
 
-        attn_outs = torch_npu.npu_sparse_flash_attention(
-            query_tnd,
-            key_tnd,
-            key_tnd,  # value = key (absorbed MLA)
-            sparse_indices=sparse_indices_tnd,
-            block_table=None,
-            actual_seq_lengths_query=cu_q,
-            actual_seq_lengths_kv=cu_k,
-            query_rope=query_rope_tnd,
-            key_rope=key_rope_tnd,
-            scale_value=scale_value,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="TND",
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=True,
+        # Checkpoint replay: reuse the original forward's kernel outputs
+        # instead of re-running the SFA forward. The index transforms still
+        # run so save_for_backward sees the same tensors as the recompute.
+        # A stash miss returns None and falls through to the real kernel:
+        # the recompute is always numerically correct, so a broken push/pop
+        # pairing degrades to the stock path with a rank-0 warning instead
+        # of crashing the training run. A miss-recompute is itself a replay,
+        # so it does not push -- nothing will ever pop it and it could only
+        # mispair with the next step's original forward.
+        stash_outs = (
+            sfa_stash_pop(stash_key, q_nope, kv, prefetch=stash_prefetch)
+            if is_replay and _SFA_SKIP_RECOMPUTE
+            else None
         )
+        if stash_outs is None:
+            attn_outs = torch_npu.npu_sparse_flash_attention(
+                query_tnd,
+                key_tnd,
+                key_tnd,  # value = key (absorbed MLA)
+                sparse_indices=sparse_indices_tnd,
+                block_table=None,
+                actual_seq_lengths_query=cu_q,
+                actual_seq_lengths_kv=cu_k,
+                query_rope=query_rope_tnd,
+                key_rope=key_rope_tnd,
+                scale_value=scale_value,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="TND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=True,
+            )
+            if _SFA_SKIP_RECOMPUTE and not is_replay:
+                sfa_stash_push(stash_key, attn_outs[0], attn_outs[1], attn_outs[2])
+        else:
+            attn_outs = stash_outs
         outputs = _parse_attn_outs(attn_outs, seq_len, num_heads, device)
         ctx.mark_non_differentiable(outputs.softmax_lse)
 
@@ -605,7 +706,7 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
         ctx,
         grad_output: torch.Tensor,
         _grad_lse: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None, None, None, None]:
         query_tnd, query_rope_tnd, key_cpu, rope_cpu, sparse_indices_tnd, raw_output, smax, ssum, cu_q, cu_k = (
             ctx.saved_tensors
         )
@@ -659,7 +760,7 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
             )
         # Slice grads; autograd scatters them into the full-width buffers and
         # the upstream all-gather reduce-scatters them unchanged.
-        return dq, dqr, dk + dv, dkr, None, None, None, None, None, None
+        return dq, dqr, dk + dv, dkr, None, None, None, None, None, None, None
 
 
 class _SpTndSparseMlaChunkedGradFn(torch.autograd.Function):
@@ -987,6 +1088,14 @@ def _sparse_mla_tnd_packed(
                     kv_start,
                     shard_start,
                     scale_value,
+                    # Discriminator for the skip-recompute stash: read outside
+                    # apply() because Function.forward always sees no_grad.
+                    # Checkpoint replay -- not bare grad mode -- is the actual
+                    # "this is a recompute" signal: with recompute_ratio < 1
+                    # the trailing layers' original forwards run grad-enabled
+                    # outside any checkpoint, and popping a stash entry there
+                    # would silently consume a foreign same-shape entry.
+                    _checkpoint_replay(),
                 )
             )
         # Gate off: stock autograd (HEAD behavior) keeps the slice copies on
