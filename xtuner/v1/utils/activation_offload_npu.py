@@ -43,7 +43,7 @@ colliding in the shared registry or the pinned-buffer cache.
 """
 
 import os
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from functools import partial
@@ -64,6 +64,10 @@ __all__ = [
     "make_activation_offload_npu_ctx",
     "offload_stream",
     "register_activation_offload_npu_hooks",
+    "sfa_stash_key",
+    "sfa_stash_pop",
+    "sfa_stash_prefetch",
+    "sfa_stash_push",
     "vit_flash_attn_skip_recompute",
 ]
 
@@ -671,3 +675,370 @@ class _VitFlashAttnSkipRecompute(torch.autograd.Function):
             sparse_mode=0,
         )
         return (grad_q, grad_k, grad_v) + (None,) * 10
+
+
+# ---------------------------------------------------------------------------
+# SFA forward-output stash: skip the checkpoint replay's SFA recompute
+# ---------------------------------------------------------------------------
+# Port of MindSpeed-MM op_replay's "sfa" scope, restricted to the sparse-MLA
+# Function path: the no-grad original forward stashes the raw
+# npu_sparse_flash_attention kernel outputs and the grad-enabled checkpoint
+# replay pops them instead of re-running the kernel. One call stashes ~270
+# MiB at the 30B production shape ([8192, 32, 512] bf16 output + two
+# [8192, 32] fp32 stats) and the 12 DSA-layer calls per microbatch (11 cycle
+# DSA + MTP) share one shape, so the live stash peaks at 12 entries per lane.
+# XTUNER_SFA_SKIP_RECOMPUTE (read in npu_sparse_mla) gates the whole feature;
+# XTUNER_SFA_STASH_OFFLOAD selects the stash's residency and is read here,
+# once, at import.
+#
+# Device-resident mode keeps the stashed tensors on the NPU until their
+# replay. Offload mode parks them in pinned host memory instead, d2h-doc
+# choreography throughout: the push issues the D2H right after the kernel on
+# the shared offload stream (gate event recorded on the working stream,
+# non_blocking copy, record_stream release of the source blocks), the op
+# prefetches the H2D refill before its index transforms so the transfer
+# overlaps them, and the pop waits on the refill event and returns fresh
+# device tensors -- bitwise equal to the originals, same dtype both ways. The
+# entry holds no device reference, so offload mode's forward device-memory
+# footprint matches the feature-off run. Every copy of a device shares the
+# one offload stream, so returning a pinned buffer to the pool while its last
+# read or write is still in flight is safe: any later copy touching it is
+# FIFO-ordered after it, and no cross-step events are needed. The pool keeps
+# each shape family's high-water buffers pinned for reuse: training pads
+# every microbatch to one shape, so one family holds ~3.2 GiB per rank
+# (cap 16 x ~270 MiB) for the whole run, while an eval-only lane can fill
+# its family's cap (~4.2 GiB) with orphan pushes that nothing ever pops.
+# That bound is per shape family, not global: variable-length evaluation
+# adds a family per distinct length, and pinned host usage is invisible to
+# device-side monitoring -- the free-list LRU cap below bounds the number
+# of resident families, and dropped buffers only return memory to the
+# caching host allocator, which keeps the process's pinned footprint at its
+# high-water mark rather than releasing it to the OS.
+#
+# The replay discriminator is is_checkpoint_replay (the ContextVar
+# apply_activation_checkpointing sets), read at the call site outside
+# apply(): Function.forward always sees no_grad, and grad mode alone would
+# misread an UN-checkpointed grad-enabled forward (recompute_ratio < 1 leaves
+# trailing layers unwrapped) as a replay and pop a foreign same-shape entry.
+#
+# LIFO pairing holds for the production topology, not as a general autograd
+# guarantee (the engine is a priority queue; branch order is
+# scheduler-dependent). The load-bearing invariants: every DSA call sits
+# inside a per-layer reentrant checkpoint (recompute_ratio=1.0; MTP via
+# share_weights), each checkpoint's replay+inner backward is atomic, the MTP
+# block taps the trunk's final output so the tap node's two consumers force
+# the whole MTP branch to finish before any main-chain replay starts, the
+# losses are combined into one backward, and intra_layer_micro_batch=1 --
+# with IMB>1 the interleaved microbatches' pushes and pops cross-pair
+# same-shape entries and overflow the cap, so the gate read in
+# npu_sparse_mla force-disables the feature at import when
+# INTRA_LAYER_MICRO_BATCH>1. Orphan no-grad pushes (eval, probes) never
+# pop: they sink below live entries and are cap-evicted; in offload mode
+# they park pinned memory only.
+#
+# Guards warn and fall back to the kernel recompute instead of raising: the
+# recompute is always numerically correct, so a detectable mispair (empty
+# lane, shape mismatch, prefetch/pop divergence) degrades to the stock path
+# with a rank-0 warning rather than crashing the training run. A miss
+# recompute is itself a replay, so the call site does not push its outputs
+# -- nothing would ever pop them and they could only mispair with the next
+# step's original forward. Both contracts are equally blind to the one
+# corruption mode that matters -- a same-shape cross-graph mispair, which
+# only the invariants above prevent. The pop's shape check is
+# defense-in-depth only (the lane key already fixes both shapes; it cannot
+# detect a same-shape mispair), and the module-global shape-keyed stash
+# assumes one live same-shape model per process -- two interleaved models
+# would cross-pop.
+#
+# Stashed tensors are the original forward's outputs, so an in-place mutation
+# downstream would corrupt them in device-resident mode -- the DSA call site
+# only reads them via einsum, the same contract the ViT stash above relies
+# on; offload mode's pinned copies freeze the values at park time.
+
+_SFA_STASH_OFFLOAD = os.environ.get("XTUNER_SFA_STASH_OFFLOAD", "0") == "1"
+_MAX_INFLIGHT_SFA_STASH = 16
+# Pinned free-lists are keyed per exact shape family (see section comment):
+# under variable-length evaluation a new family appears per distinct length,
+# so the pool below drops the least-recently-used family's free-list -- and
+# with it the last references to those buffers -- once more families than
+# this are resident. The hot family is always the most recently used, so a
+# live lane never loses its buffers to the cap.
+_MAX_SFA_PINNED_FAMILIES = 4
+_SfaStashKey = tuple[tuple[int, ...], tuple[int, ...]]
+_SfaStashEntry = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+_SfaPinnedKey = tuple[tuple[int, ...], torch.dtype]
+_sfa_pinned_pool: OrderedDict[_SfaPinnedKey, deque[torch.Tensor]] = OrderedDict()
+
+
+def _acquire_sfa_pinned(shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+    """Take a pinned host buffer of exactly this shape and dtype from the pool,
+    allocating a new one only when the free-list for this shape family is empty.
+
+    Args:
+        shape (`torch.Size`): Buffer shape to acquire.
+        dtype (`torch.dtype`): Buffer dtype to acquire.
+
+    Returns:
+        `torch.Tensor`: A pinned CPU tensor of the requested shape and dtype.
+    """
+    key = (tuple(shape), dtype)
+    free = _sfa_pinned_pool.get(key)
+    if free:
+        _sfa_pinned_pool.move_to_end(key)
+        return free.pop()
+    return torch.empty(shape, dtype=dtype, pin_memory=True, device="cpu")
+
+
+def _release_sfa_pinned(buffer: torch.Tensor) -> None:
+    """Return a pinned buffer to its shape family's free-list for reuse.
+
+    Safe while the buffer's last copy is still in flight: all copies share the
+    one offload stream, so any later write FIFO-follows that read. The family
+    becomes the pool's most recently used; families beyond
+    ``_MAX_SFA_PINNED_FAMILIES`` have their free-lists dropped in LRU order.
+
+    Args:
+        buffer (`torch.Tensor`): The pinned CPU tensor to recycle.
+    """
+    key = (tuple(buffer.shape), buffer.dtype)
+    _sfa_pinned_pool.setdefault(key, deque()).append(buffer)
+    _sfa_pinned_pool.move_to_end(key)
+    while len(_sfa_pinned_pool) > _MAX_SFA_PINNED_FAMILIES:
+        # popitem drops the LRU family's free-list and with it the last
+        # references to those buffers; the caching host allocator reclaims
+        # the blocks once any still-in-flight copy has completed -- the same
+        # lifecycle the ACT/DSA offloads above use for their pinned staging.
+        _sfa_pinned_pool.popitem(last=False)
+
+
+class _SfaStashParked:
+    """One stashed SFA forward parked in pinned host memory.
+
+    Holds only the pinned copies, their shapes/dtypes, and the refill event --
+    no device tensor -- so parked entries add zero forward device memory.
+
+    Args:
+        attn_output (`torch.Tensor`): Raw kernel attention output.
+        softmax_max (`torch.Tensor`): Kernel softmax max statistic.
+        softmax_sum (`torch.Tensor`): Kernel softmax sum statistic.
+    """
+
+    def __init__(self, attn_output: torch.Tensor, softmax_max: torch.Tensor, softmax_sum: torch.Tensor) -> None:
+        outputs = (attn_output, softmax_max, softmax_sum)
+        self.device = attn_output.device
+        self.shapes = tuple(tuple(t.shape) for t in outputs)
+        self.dtypes = tuple(t.dtype for t in outputs)
+        stream = offload_stream(self.device)
+        # Gate the D2H on the kernel that produced these outputs: record on
+        # the working stream (where the kernel was enqueued, FIFO after it)
+        # and make the offload stream wait before reading the sources.
+        gate = torch.cuda.Event()
+        gate.record()
+        stream.wait_event(gate)
+        self.buffers = [_acquire_sfa_pinned(t.shape, t.dtype) for t in outputs]
+        with torch.cuda.stream(stream):
+            for buf, t in zip(self.buffers, outputs):
+                buf.copy_(t, non_blocking=True)
+                # The sources are freed on the working stream once the
+                # original forward is done with them; record_stream defers
+                # the allocator's reuse of their blocks until this copy has
+                # read them.
+                t.record_stream(stream)
+        self.h2d_event: torch.cuda.Event | None = None
+        self.restored: list[torch.Tensor] = []
+
+    def prefetch(self) -> None:
+        # Idempotent: at most one in-flight refill per entry.
+        if self.h2d_event is not None:
+            return
+        stream = offload_stream(self.device)
+        # Same gate logic as the park: a fresh block handed out by the
+        # allocator may carry a prior owner's still-queued kernels, and the
+        # H2D write must not overtake them. The fresh tensors are allocated
+        # OUTSIDE the offload-stream context on purpose: allocating inside it
+        # would home their blocks in the offload stream's pool, where a later
+        # offload-stream allocation could reuse them under still-running
+        # consumer kernels. On the working stream the blocks return to the
+        # working pool on free, and record_stream below tracks the H2D write.
+        gate = torch.cuda.Event()
+        gate.record()
+        stream.wait_event(gate)
+        restored = [
+            torch.empty(shape, dtype=dtype, device=self.device) for shape, dtype in zip(self.shapes, self.dtypes)
+        ]
+        with torch.cuda.stream(stream):
+            for buf, fresh in zip(self.buffers, restored):
+                fresh.copy_(buf, non_blocking=True)
+                fresh.record_stream(stream)
+            self.h2d_event = torch.cuda.Event()
+            self.h2d_event.record()
+        self.restored = restored
+
+    def consume(self) -> _SfaStashEntry:
+        # No prefetch issued (or it was lost): blocking self-rescue refill --
+        # the pop still returns the right values, just without overlap.
+        if self.h2d_event is None:
+            self.prefetch()
+        # Async enqueue on the caller's current (working) stream: consumer
+        # kernels queue behind the H2D and run once it completes.
+        torch.cuda.current_stream().wait_event(self.h2d_event)
+        self.release()
+        return (self.restored[0], self.restored[1], self.restored[2])
+
+    def release(self) -> None:
+        # FIFO-safe on the shared offload stream (see _release_sfa_pinned);
+        # idempotent for consume-then-cap-evict paths that can no longer fire.
+        for buffer in self.buffers:
+            _release_sfa_pinned(buffer)
+        self.buffers = []
+
+
+_sfa_stash: dict[_SfaStashKey, deque[_SfaStashEntry | _SfaStashParked]] = {}
+
+
+def sfa_stash_key(q_nope: torch.Tensor, kv: torch.Tensor) -> _SfaStashKey:
+    """Lane key for the SFA forward-output stash.
+
+    Args:
+        q_nope (`torch.Tensor`): Absorbed queries ``[S, N, Rkv]`` of the call.
+        kv (`torch.Tensor`): Prefix-extended KV slice ``[L, 1, Rkv]`` of the call.
+
+    Returns:
+        `_SfaStashKey`: The (query shape, kv shape) pair identifying the lane.
+    """
+    return tuple(q_nope.shape), tuple(kv.shape)
+
+
+def sfa_stash_push(
+    key: _SfaStashKey,
+    attn_output: torch.Tensor,
+    softmax_max: torch.Tensor,
+    softmax_sum: torch.Tensor,
+) -> None:
+    """Stash one SFA forward's kernel outputs for its checkpoint replay.
+
+    In offload mode the entry parks the outputs in pinned host memory and
+    holds no device reference; in device-resident mode it holds the raw
+    tensors themselves.
+
+    Args:
+        key (`_SfaStashKey`): Lane key from :func:`sfa_stash_key`.
+        attn_output (`torch.Tensor`): Raw kernel attention output.
+        softmax_max (`torch.Tensor`): Kernel softmax max statistic.
+        softmax_sum (`torch.Tensor`): Kernel softmax sum statistic.
+    """
+    lane = _sfa_stash.setdefault(key, deque())
+    if len(lane) >= _MAX_INFLIGHT_SFA_STASH:
+        evicted = lane.popleft()
+        if isinstance(evicted, _SfaStashParked):
+            evicted.release()
+        log_rank0.warning(
+            f"SFA skip-recompute stash held {_MAX_INFLIGHT_SFA_STASH} in-flight "
+            f"entries for shape {key}; dropping the oldest (expected only when "
+            f"orphan no-grad forwards outlive live graphs)"
+        )
+    if _SFA_STASH_OFFLOAD:
+        lane.append(_SfaStashParked(attn_output, softmax_max, softmax_sum))
+    else:
+        lane.append((attn_output, softmax_max, softmax_sum))
+
+
+def sfa_stash_prefetch(key: _SfaStashKey) -> _SfaStashParked | None:
+    """Issue the H2D refill for this lane's most recent parked entry.
+
+    Idempotent per entry; the entry handle must be handed back to
+    :func:`sfa_stash_pop` so the pop can detect a prefetch that no longer
+    matches the lane tail.
+
+    Args:
+        key (`_SfaStashKey`): Lane key from :func:`sfa_stash_key`.
+
+    Returns:
+        `_SfaStashParked | None`: The prefetched entry, or None when offload
+        mode is off or the lane is empty (device-resident mode pops directly).
+    """
+    if not _SFA_STASH_OFFLOAD:
+        return None
+    lane = _sfa_stash.get(key)
+    if not lane:
+        return None
+    entry = lane[-1]
+    if not isinstance(entry, _SfaStashParked):
+        # A foreign plain-tuple entry appended into an offload-mode lane has
+        # no refill to issue; return None and the pop's tuple branch returns
+        # its values as-is. The replay path must not raise: an assert would
+        # also be stripped under ``python -O`` and fail later as AttributeError.
+        return None
+    entry.prefetch()
+    return entry
+
+
+def sfa_stash_pop(
+    key: _SfaStashKey,
+    q_nope: torch.Tensor,
+    kv: torch.Tensor,
+    prefetch: _SfaStashParked | None = None,
+) -> _SfaStashEntry | None:
+    """Pop the stashed kernel outputs for this replay's lane.
+
+    A miss never raises: the kernel recompute is always numerically correct,
+    so the caller falls back to it and training keeps running.
+
+    Args:
+        key (`_SfaStashKey`): Lane key from :func:`sfa_stash_key`.
+        q_nope (`torch.Tensor`): Absorbed queries ``[S, N, Rkv]`` of the replay call.
+        kv (`torch.Tensor`): Prefix-extended KV slice ``[L, 1, Rkv]`` of the replay call.
+        prefetch (`_SfaStashParked`, optional): Entry handle returned by
+            :func:`sfa_stash_prefetch` for this call. When it differs from the
+            lane tail (LIFO violated or the entry was cap-evicted in between),
+            the mismatched entry stays parked and the actual tail takes a
+            blocking self-rescue refill. On an empty lane it is released so
+            its pinned buffers return to the pool instead of leaking.
+
+    Returns:
+        `_SfaStashEntry | None`: The stashed ``(attn_output, softmax_max,
+        softmax_sum)`` (offload mode: fresh device tensors bitwise equal to
+        the originals), or ``None`` when the lane is empty or the tail entry's
+        shape does not match this replay call — the caller then reruns the
+        kernel instead.
+    """
+    lane = _sfa_stash.get(key)
+    if not lane:
+        if prefetch is not None:
+            prefetch.release()
+        log_rank0.warning(
+            "SFA skip-recompute stash is empty at the replay entry: a checkpoint-"
+            "replay SFA forward found no stashed original for shape "
+            f"{key} (external lane clear or cap eviction). Falling back to the "
+            "kernel recompute for this call."
+        )
+        return None
+    entry = lane[-1]
+    if isinstance(entry, _SfaStashParked):
+        if prefetch is not None and prefetch is not entry:
+            log_rank0.warning(
+                "SFA stash prefetch does not match the popped entry for lane "
+                f"{key}; falling back to a blocking refill (LIFO violated or the "
+                "entry was cap-evicted between prefetch and pop)"
+            )
+        outputs = entry.consume()
+    else:
+        outputs = entry
+    lane.pop()
+    if not lane:
+        # Prune the drained lane so variable-shape evaluation does not
+        # accumulate one empty deque per distinct shape ever seen.
+        del _sfa_stash[key]
+    # Defense-in-depth only: the lane key already fixes both shapes, so this
+    # fires solely on a foreign entry appended directly into the lane; it
+    # cannot detect a same-shape cross-graph mispair (see section comment).
+    expected = (q_nope.shape[0], q_nope.shape[1], kv.shape[-1])
+    if tuple(outputs[0].shape[-3:]) != expected:
+        log_rank0.warning(
+            "SFA skip-recompute stash misalignment: entry shape "
+            f"{tuple(outputs[0].shape)} does not match the replay call "
+            f"{expected} for lane {key}. Dropping the foreign entry and "
+            "falling back to the kernel recompute for this call."
+        )
+        return None
+    return outputs
