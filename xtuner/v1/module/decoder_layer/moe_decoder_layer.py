@@ -45,6 +45,7 @@ from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_act_fn, get_gated_act_fn
 from xtuner.v1.ops.fp32_linear import fp32_linear
 from xtuner.v1.ops.moe.npu import fused_a2a_gmm
+from xtuner.v1.quantization.linear.config import linear_quant_config_from_env
 from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
@@ -134,9 +135,28 @@ class MoEMLP(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = moe_intermediate_size * n_shared_experts
-        self.gate_proj = build_linear(self.hidden_size, self.intermediate_size, bias=mlp_bias, float8_cfg=float8_cfg)
-        self.up_proj = build_linear(self.hidden_size, self.intermediate_size, bias=mlp_bias, float8_cfg=float8_cfg)
-        self.down_proj = build_linear(self.intermediate_size, self.hidden_size, bias=mlp_bias, float8_cfg=float8_cfg)
+        linear_quant_cfg = linear_quant_config_from_env()
+        self.gate_proj = build_linear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=mlp_bias,
+            float8_cfg=float8_cfg,
+            linear_quant_cfg=linear_quant_cfg,
+        )
+        self.up_proj = build_linear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=mlp_bias,
+            float8_cfg=float8_cfg,
+            linear_quant_cfg=linear_quant_cfg,
+        )
+        self.down_proj = build_linear(
+            self.intermediate_size,
+            self.hidden_size,
+            bias=mlp_bias,
+            float8_cfg=float8_cfg,
+            linear_quant_cfg=linear_quant_cfg,
+        )
         self.act_fn = get_gated_act_fn(hidden_act, swiglu_limit)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -223,6 +243,7 @@ class MoEBlock(nn.Module):
         self.intermediate_size = moe_intermediate_size
         self.num_routed_experts = n_routed_experts
         self.ep_mesh = ep_mesh
+        linear_quant_cfg = linear_quant_config_from_env()
         # self.fused_w1 = GroupedLinear(self.hidden_size, self.intermediate_size, self.num_routed_experts, ep_mesh)
         # self.fused_w3 = GroupedLinear(self.hidden_size, self.intermediate_size, self.num_routed_experts, ep_mesh)
         self.fused_w1w3 = build_grouped_linear(
@@ -236,6 +257,7 @@ class MoEBlock(nn.Module):
             float8_cfg=float8_cfg,
             ep_tp_mesh=ep_tp_mesh,
             num_fused_projections=2,
+            linear_quant_cfg=linear_quant_cfg,
         )
         self.fused_w2 = build_grouped_linear(
             self.intermediate_size,
@@ -247,6 +269,7 @@ class MoEBlock(nn.Module):
             parallel_style="row",
             float8_cfg=float8_cfg,
             ep_tp_mesh=ep_tp_mesh,
+            linear_quant_cfg=linear_quant_cfg,
         )
         self.moe_act = moe_act_fn_cfg.build()
 

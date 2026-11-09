@@ -9,6 +9,7 @@ from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.module import AttnOutputs, GatedDeltaNetConfig, KDAConfig, MHAConfig, MLAConfig, RMSNorm
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_gated_act_fn
+from xtuner.v1.quantization.linear.config import linear_quant_config_from_env
 from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
@@ -47,9 +48,28 @@ class DenseMLP(nn.Module):
         float8_cfg: Float8Config | None = None,
     ):
         super().__init__()
-        self.gate_proj = build_linear(hidden_size, intermediate_size, bias=bias, float8_cfg=float8_cfg)
-        self.up_proj = build_linear(hidden_size, intermediate_size, bias=bias, float8_cfg=float8_cfg)
-        self.down_proj = build_linear(intermediate_size, hidden_size, bias=bias, float8_cfg=float8_cfg)
+        linear_quant_cfg = linear_quant_config_from_env()
+        self.gate_proj = build_linear(
+            hidden_size,
+            intermediate_size,
+            bias=bias,
+            float8_cfg=float8_cfg,
+            linear_quant_cfg=linear_quant_cfg,
+        )
+        self.up_proj = build_linear(
+            hidden_size,
+            intermediate_size,
+            bias=bias,
+            float8_cfg=float8_cfg,
+            linear_quant_cfg=linear_quant_cfg,
+        )
+        self.down_proj = build_linear(
+            intermediate_size,
+            hidden_size,
+            bias=bias,
+            float8_cfg=float8_cfg,
+            linear_quant_cfg=linear_quant_cfg,
+        )
         self.act_fn = get_gated_act_fn(hidden_act, swiglu_limit)
 
     def forward(self, x):

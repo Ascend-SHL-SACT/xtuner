@@ -51,7 +51,7 @@ from xtuner.v1.module.dispatcher.torch_all2all import (
     TorchAll2AllPreDispatchResult,
 )
 from xtuner.v1.module.grouped_linear.moe_group_linear import GroupedLinear
-from xtuner.v1.ops import unpermute
+from xtuner.v1.ops import permute, unpermute
 
 
 if TYPE_CHECKING:
@@ -377,6 +377,8 @@ def fused_dispatch_mlp_combine(
     n_routed_experts: int,
     ep_group: dist.ProcessGroup,
     recv_tokens_hook: Callable[[int], None] | None = None,
+    act_quant_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    entry_prequantized: bool = False,
 ) -> torch.Tensor:
     """Run the fused dispatch + FC1 + activation + FC2 + combine alltoallv.
 
@@ -404,10 +406,24 @@ def fused_dispatch_mlp_combine(
             total received routed-row count (``sum(recv_counts)`` -- the same value the dispatcher
             path reports as ``post_dispatched["hidden_states"].shape[0]``). Also fires on the
             activation-checkpoint recompute; the MoE layer's hook filters replays itself.
+        act_quant_fn (Callable[[torch.Tensor], torch.Tensor] | None): optional per-token fake-quant
+            (STE) applied to the FC1 input and the FC2 input. Quantizing the pre-dispatch rows
+            equals the separated module path's post-dispatch quant because per-token scales are
+            row-local and a2a only permutes/replicates rows; the chunked path's structural zero
+            pad row is appended after the FC1 quant and stays exact zeros through the FC2 quant
+            (dynamic scale floor) and gmm/act/dW. ``None`` leaves both inputs unquantized
+            (byte-identical to the unquantized path).
+        entry_prequantized (bool): ``True`` when ``hidden_states`` was already per-token
+            fake-quantized by the caller (``fused_forward`` quantizes the pre-permute rows once
+            and re-permutes the quantized tensor), so the FC1-input quant is skipped while the
+            FC2-input quant still runs. Forward values are bit-identical either way (per-token
+            scales are row-local, so quantize-then-replicate equals replicate-then-quantize).
 
     Returns:
         torch.Tensor: the combined hidden states ``[n_local, hidden]``, in the input's sort order.
     """
+    if act_quant_fn is not None and not entry_prequantized:
+        hidden_states = act_quant_fn(hidden_states)
     # Materialize the transposed weights ``[E, in, out]`` (the op needs this layout with
     # ``trans_gmm_weight=False``) BEFORE the metadata ``all_to_all_single`` in ``_compute_counts``,
     # and DETACHED under ``no_grad``. This detach is the activation-checkpoint recompute-nan fix:
@@ -436,6 +452,8 @@ def fused_dispatch_mlp_combine(
             hidden_states, w1, w1_fwd, ep_group, send_counts, recv_counts, group_list
         )
         intermediate = act_fn(gate_up_out, split_dim=-1)
+        if act_quant_fn is not None:
+            intermediate = act_quant_fn(intermediate)
         combined = GmmUnpermuteAlltoallv.apply(
             intermediate, w2, w2_fwd, ep_group, send_counts, recv_counts, group_list
         )
@@ -490,6 +508,8 @@ def fused_dispatch_mlp_combine(
             x_c, w1[c0 : c0 + size_c], w1_fwd[c0 : c0 + size_c], ep_group, send_c, recv_c, gl_c
         )
         inter_c = act_fn(gate_up_c, split_dim=-1)
+        if act_quant_fn is not None:
+            inter_c = act_quant_fn(inter_c)
         gathered_idx.append(idx)
         back_c = GmmUnpermuteAlltoallv.apply(
             inter_c, w2[c0 : c0 + size_c], w2_fwd[c0 : c0 + size_c], ep_group, send_c, recv_c, gl_c
@@ -516,7 +536,11 @@ def fused_forward(
     Mirrors ``dispatcher_mc2.dispatch_mlp_combine``: fuse dispatch a2a+permute+FC1, apply the gated
     activation, fuse FC2+combine a2a, then unpermute to the pre-dispatch token order, and merge the
     shared-experts output + residual via ``_post_moe_forward``. Byte-identical to the former inlined
-    ``MoEDecoderLayer._fused_a2a_gmm_forward`` (relocated verbatim, ``self.`` -> ``decoder_layer.``).
+    ``MoEDecoderLayer._fused_a2a_gmm_forward`` (relocated verbatim, ``self.`` -> ``decoder_layer.``)
+    whenever W8A8 linear quant is off. With quant on, the act quant is deduplicated: the pre-permute
+    hidden is fake-quantized once, re-permuted for the routed dispatch (bit-identical to quantizing
+    the topk-replicated rows), and reused by the shared experts' gate/up (see the inline notes and
+    ``Int8W8A8DynamicLinear._input_prequantized``).
 
     The weight-prep (FSDP2 ``to_local`` + ``view``) + the shared-experts/post-moe merge wrap the
     same-module ``fused_dispatch_mlp_combine`` (which owns the two ``AlltoallvPermuteGmm`` /
@@ -547,12 +571,56 @@ def fused_forward(
     w2 = cast(GroupedLinear, decoder_layer.experts.fused_w2)
     w2_w = w2.weight.to_local() if isinstance(w2.weight, DTensor) else w2.weight
     w2_w = w2_w.view(-1, w2.local_out_features, w2.local_in_features)
+    # W8A8 dynamic linear quant: the swapped-in quantized grouped-linears expose fake-quant
+    # hooks (plain ``GroupedLinear`` has none, so a feature-off layer stays byte-identical).
+    # The weight hooks return straight-through fake-quant views of the native weights, so the
+    # fused op consumes the same quantized grid the separated module path would, and the
+    # hand-written backward's ``weight_grad`` flows back through the STE to the master weight.
+    w1_quant = getattr(w1, "fused_weight_fake_quant", None)
+    w2_quant = getattr(w2, "fused_weight_fake_quant", None)
+    act_quant_fn: Callable[[torch.Tensor], torch.Tensor] | None = None
+    if callable(w1_quant) and callable(w2_quant):
+        w1_w = w1_quant(w1_w)
+        w2_w = w2_quant(w2_w)
+        act_quant_fn = cast("Callable[[torch.Tensor], torch.Tensor]", getattr(w1, "fused_act_fake_quant"))
     pre = cast(TorchAll2AllPreDispatchResult, pre_dispatched)
     dispatcher = cast(TorchAll2AllDispatcher, decoder_layer.dispatcher)
     ep_group = dispatcher._process_group
     assert ep_group is not None, "fused a2a+gmm requires a non-trivial EP group"
+    # W8A8 act-quant dedup: fake-quantize the pre-permute rows ONCE -- per-token scales are
+    # row-local, so quantize-then-replicate is bit-identical to quantizing the topk-replicated
+    # dispatch rows, at 1/topk the quantized row count -- and re-run the same deterministic
+    # expert-sort permute on the quantized tensor (``dispatch_preprocess`` permuted the raw
+    # hidden with the same op and the same ``topk_ids``, so the sort order matches and the a2a
+    # carries byte-identical rows). The same quantized tensor also feeds the shared experts'
+    # gate/up when the layer has no shared-expert sigmoid gate (that gate linear is unquantized
+    # and must keep consuming the raw hidden); the shared gate/up skip their internal act quant
+    # via ``_input_prequantized``, scoped around the shared forward below. The STE node sits at
+    # the single quantized tensor, so the routed and shared gradients reach the raw hidden
+    # through one straight-through mask (same math as the per-consumer masks; the summation
+    # order differs, so backward matches to rounding, not bitwise).
+    entry_prequantized = False
+    routed_hidden = pre["hidden_states"]
+    shared_hidden = shared_input_hidden
+    # Duck-typed by the callable-hook guard above (any linear class exposing the hook works).
+    shared_prequant: tuple[Any, Any] | None = None
+    if act_quant_fn is not None:
+        quantized_hidden = act_quant_fn(shared_input_hidden)
+        routed_hidden, _ = permute(
+            quantized_hidden.view(-1, quantized_hidden.shape[-1]),
+            router_results["topk_ids"].to(torch.int32),
+        )
+        entry_prequantized = True
+        if decoder_layer.n_shared_experts > 0 and not decoder_layer.with_shared_expert_gate:
+            shared_gate = getattr(decoder_layer.shared_experts, "gate_proj", None)
+            shared_up = getattr(decoder_layer.shared_experts, "up_proj", None)
+            if callable(getattr(shared_gate, "fused_act_fake_quant", None)) and callable(
+                getattr(shared_up, "fused_act_fake_quant", None)
+            ):
+                shared_hidden = quantized_hidden
+                shared_prequant = (shared_gate, shared_up)
     combined_hidden = fused_dispatch_mlp_combine(
-        hidden_states=pre["hidden_states"],
+        hidden_states=routed_hidden,
         w1=w1_w,
         w2=w2_w,
         act_fn=decoder_layer.experts.moe_act,
@@ -560,6 +628,8 @@ def fused_forward(
         n_routed_experts=decoder_layer.n_routed_experts,
         ep_group=ep_group,
         recv_tokens_hook=decoder_layer.recv_tokens_hook,
+        act_quant_fn=act_quant_fn,
+        entry_prequantized=entry_prequantized,
     )
     combined_hidden_states = unpermute(
         combined_hidden,
@@ -569,7 +639,18 @@ def fused_forward(
     combined_hidden_states = combined_hidden_states.view(*origin_shape)
     shared_experts_out: torch.Tensor | None = None
     if decoder_layer.n_shared_experts > 0:
-        shared_experts_out = decoder_layer._shared_experts_forward(hidden_states=shared_input_hidden)
+        if shared_prequant is not None:
+            # Scoped exactly around the shared forward (and reset even on error): gate/up read
+            # the flag and skip their internal act quant (the input already carries the STE
+            # node); down_proj never reads it and keeps quantizing its own input.
+            shared_prequant[0]._input_prequantized = True
+            shared_prequant[1]._input_prequantized = True
+        try:
+            shared_experts_out = decoder_layer._shared_experts_forward(hidden_states=shared_hidden)
+        finally:
+            if shared_prequant is not None:
+                shared_prequant[0]._input_prequantized = False
+                shared_prequant[1]._input_prequantized = False
     hidden_states = decoder_layer._post_moe_forward(
         combined_hidden_states=combined_hidden_states,
         residual=residual,
