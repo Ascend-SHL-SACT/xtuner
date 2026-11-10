@@ -8,6 +8,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tenso
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.float8.float8_gmm_tile_wise import TileWiseFloat8GroupedLinear
 from xtuner.v1.ops import group_gemm
+from xtuner.v1.quantization.linear.config import LinearQuantConfig
 from xtuner.v1.utils.interleaved_shard import InterleavedShard
 
 
@@ -184,8 +185,30 @@ def build_grouped_linear(
     float8_cfg: Float8Config | None = None,
     ep_tp_mesh: DeviceMesh | None = None,
     num_fused_projections: int = 1,
+    linear_quant_cfg: LinearQuantConfig | None = None,
 ):
-    """Build a grouped linear layer with optional float8 support."""
+    """Build a grouped linear layer with optional float8 or W8A8 support."""
+    if (
+        float8_cfg is not None
+        and float8_cfg.scaling_granularity_grouped_gemm is not None
+        and linear_quant_cfg is not None
+    ):
+        raise ValueError("float8 and W8A8 linear quantization are mutually exclusive; configure only one.")
+    if linear_quant_cfg is not None:
+        from xtuner.v1.quantization.linear.modules import Int8W8A8DynamicGroupedLinear
+
+        return Int8W8A8DynamicGroupedLinear(
+            in_features,
+            out_features,
+            num_routed_experts,
+            moe_bias=moe_bias,
+            ep_mesh=ep_mesh,
+            expert_tp_mesh=expert_tp_mesh,
+            parallel_style=parallel_style,
+            ep_tp_mesh=ep_tp_mesh,
+            num_fused_projections=num_fused_projections,
+            gmm_engine=linear_quant_cfg.gmm_engine,
+        )
     if float8_cfg is None or float8_cfg.scaling_granularity_grouped_gemm is None:
         return GroupedLinear(
             in_features,

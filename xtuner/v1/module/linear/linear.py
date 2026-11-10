@@ -6,6 +6,7 @@ from torch.nn import functional as F
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.float8.float8_linear_tensor_wise import TensorWiseFloat8Linear
 from xtuner.v1.float8.float8_linear_tile_wise import TileWiseFloat8Linear
+from xtuner.v1.quantization.linear.config import LinearQuantConfig
 
 
 class _Linear(nn.Linear):
@@ -31,8 +32,15 @@ def build_linear(
     device=None,
     dtype=None,
     float8_cfg: Float8Config | None = None,
+    linear_quant_cfg: LinearQuantConfig | None = None,
 ) -> nn.Module:
-    """Build a linear layer with optional float8 support."""
+    """Build a linear layer with optional float8 or W8A8 support."""
+    if float8_cfg is not None and float8_cfg.scaling_granularity_gemm is not None and linear_quant_cfg is not None:
+        raise ValueError("float8 and W8A8 linear quantization are mutually exclusive; configure only one.")
+    if linear_quant_cfg is not None:
+        from xtuner.v1.quantization.linear.modules import Int8W8A8DynamicLinear
+
+        return Int8W8A8DynamicLinear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     if float8_cfg is None or float8_cfg.scaling_granularity_gemm is None:
         return _Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     elif float8_cfg.scaling_granularity_gemm is ScalingGranularity.TILEWISE:

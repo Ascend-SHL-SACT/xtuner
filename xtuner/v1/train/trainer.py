@@ -64,6 +64,7 @@ from xtuner.v1.quantization.kv.calibrate import (
     needs_kv_calibration,
 )
 from xtuner.v1.quantization.kv.export import maybe_write_hf_kv_scales
+from xtuner.v1.quantization.linear.export import maybe_write_hf_w8a8_linear
 from xtuner.v1.utils import (
     XTUNER_DETERMINISTIC,
     ParallelConfigException,
@@ -1983,6 +1984,10 @@ class Trainer:
         # Frozen static-mode KV scales cannot be re-derived from the weights; carry them into the
         # exported HF checkpoint the same way the DCP sidecar carries them into a resume.
         maybe_write_hf_kv_scales(self._engine.model, finalized_hf_path)
+        # W8A8 linear weights re-quantize per forward, so the exported int8 weights and
+        # scales can always be derived from the exported master weights; write them here
+        # to make the checkpoint consumable by the deployed W8A8_DYNAMIC scheme.
+        maybe_write_hf_w8a8_linear(self._engine.model, finalized_hf_path)
         latest_hf_link = self.exp_dir / "hf-latest"
         save_hf_path = finalized_hf_path
 
