@@ -970,7 +970,9 @@ class TestHfW8A8LinearExport:
             for artifact in ("weight_scale", "weight_offset"):
                 assert weight_map[f"{module_key}.{artifact}"] == weight_map[weight_key]
 
-        # Every quantized module is marked W8A8_DYNAMIC by its bare (or experts.0) prefix.
+        # Every quantized module is marked W8A8_DYNAMIC by its bare (or experts.0) prefix;
+        # every other exported weight is claimed FLOAT by its full key; the top-level
+        # format metadata is filled in.
         description = json.loads((hf_dir / _DESCRIPTION_FILENAME).read_text())
         expected_desc_keys = {
             "model.language_model.layers.0.mlp.gate_proj",
@@ -980,9 +982,14 @@ class TestHfW8A8LinearExport:
             "model.language_model.layers.1.mlp.experts.0.up_proj",
             "model.language_model.layers.1.mlp.experts.0.down_proj",
         }
-        assert set(description) == expected_desc_keys | {"version"}
+        expected_float_keys = {_BYSTANDER_KEY} | {
+            _expert_key(i, proj) for i in range(1, _E) for proj in ("gate", "up", "down")
+        }
+        assert set(description) == expected_desc_keys | expected_float_keys | {"version", "model_quant_type"}
         assert description["version"] == "1.0.0"
+        assert description["model_quant_type"] == "W8A8_DYNAMIC"
         assert all(description[key] == "W8A8_DYNAMIC" for key in expected_desc_keys)
+        assert all(description[key] == "FLOAT" for key in expected_float_keys)
 
     def test_description_merge_preserves_existing_entries(self, tmp_path):
         root, masters = _full_w8a8_tree()
@@ -1000,7 +1007,56 @@ class TestHfW8A8LinearExport:
             assert description[key] == value
         assert description["model.language_model.layers.0.mlp.gate_proj"] == "W8A8_DYNAMIC"
         assert description["model.language_model.layers.1.mlp.experts.0.down_proj"] == "W8A8_DYNAMIC"
-        assert len(description) == len(pre_existing) + 6
+        # The merge added the plan entries, the FLOAT completion, and the format metadata;
+        # nothing pre-existing was touched or clobbered.
+        added = set(description) - set(pre_existing)
+        assert added == {
+            "model.language_model.layers.0.mlp.gate_proj",
+            "model.language_model.layers.0.mlp.up_proj",
+            "model.language_model.layers.0.mlp.down_proj",
+            "model.language_model.layers.1.mlp.experts.0.gate_proj",
+            "model.language_model.layers.1.mlp.experts.0.up_proj",
+            "model.language_model.layers.1.mlp.experts.0.down_proj",
+            "model_quant_type",
+            _BYSTANDER_KEY,
+        } | {_expert_key(i, proj) for i in range(1, _E) for proj in ("gate", "up", "down")}
+
+    def test_float_completion_marks_unquantized_weights(self, tmp_path):
+        # Regression: the deployment engine attributes every exported weight through the
+        # description; weights outside the W8A8 plan (bystander linears, non-template
+        # routed-expert slices) used to ship unclaimed and failed the consumer's load.
+        root, masters = _full_w8a8_tree()
+        hf_dir = tmp_path / "hf"
+        _write_full_fixture(hf_dir, masters)
+        maybe_write_hf_w8a8_linear(root, hf_dir)
+        description = json.loads((hf_dir / _DESCRIPTION_FILENAME).read_text())
+        assert description[_BYSTANDER_KEY] == "FLOAT"
+        for i in range(1, _E):
+            for proj in ("gate", "up", "down"):
+                assert description[_expert_key(i, proj)] == "FLOAT"
+        # Quantized modules stay claimed by their bare prefix only: the full ``.weight``
+        # keys of W8A8 weights must not carry a contradicting FLOAT entry.
+        assert _dense_key(0, "gate") not in description
+        assert _expert_key(0, "gate") not in description
+
+    def test_float_completion_preserves_faquant_entries(self, tmp_path):
+        # C8+W8A8 combined export: the KV writer's FAQuant-marked scale entries are listed
+        # in the index weight_map; the FLOAT completion must honor them, not re-claim them.
+        root, masters = _full_w8a8_tree()
+        hf_dir = tmp_path / "hf"
+        _write_full_fixture(hf_dir, masters)
+        fa_key = "model.language_model.layers.5.self_attn.fa_k.scale"
+        shard = hf_dir / "model-00002-of-00002.safetensors"
+        tensors = load_file(shard)
+        tensors[fa_key] = torch.zeros(1, 1, dtype=torch.float32)
+        save_file(tensors, shard)
+        index = json.loads((hf_dir / _HF_INDEX_FILENAME).read_text())
+        index["weight_map"][fa_key] = shard.name
+        (hf_dir / _HF_INDEX_FILENAME).write_text(json.dumps(index, indent=4) + "\n")
+        (hf_dir / _DESCRIPTION_FILENAME).write_text(json.dumps({"fa_quant_type": "FAKQuant", fa_key: "FAQuant"}))
+        maybe_write_hf_w8a8_linear(root, hf_dir)
+        description = json.loads((hf_dir / _DESCRIPTION_FILENAME).read_text())
+        assert description[fa_key] == "FAQuant"
 
     def test_description_conflict_fails_fast(self, tmp_path):
         root, masters = _full_w8a8_tree()

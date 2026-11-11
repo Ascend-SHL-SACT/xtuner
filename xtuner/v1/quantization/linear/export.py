@@ -21,7 +21,11 @@ applies it in the matmul, so it exports as zeros. Detection keys on
 bare prefix, with routed experts marked through their ``experts.0.*`` template keys (the
 consumer's packed-module mapping expands an experts prefix into exactly those). The
 description is read-merge-written so entries written moments earlier by the KV FAKQuant
-export survive; a conflicting value for the same key fails fast. ``config.json`` is
+export survive; a conflicting value for the same key fails fast. Every remaining exported
+weight is then claimed explicitly as ``FLOAT`` by its full HF key (strictly add-if-absent,
+so the KV export's ``FAQuant`` entries survive), and ``model_quant_type`` is filled in when
+the file does not define it — the deployment engine must be able to attribute every weight
+it loads. ``config.json`` is
 deliberately left untouched: the ModelSlim path activates on the description file when
 ``config.json`` declares no ``quantization_config``, while an XTuner-specific
 ``quant_method`` there would make upstream vLLM reject the whole checkpoint.
@@ -58,7 +62,9 @@ def maybe_write_hf_w8a8_linear(model: nn.Module, hf_dir: str | Path) -> None:
     (checked upfront); the affected shards are then rewritten one at a time. Routed-expert
     keys exist for all experts because the HF save gathers the full model on rank 0. The
     ``quant_model_description.json`` recipe is merged into, never overwriting existing
-    entries (see the module docstring).
+    entries (see the module docstring): plan entries claim the quantized modules, the FLOAT
+    completion claims every other exported weight, and ``model_quant_type`` is filled in
+    when the file does not define it.
 
     Args:
         model (nn.Module): The training model the W8A8 modules live in.
@@ -115,7 +121,12 @@ def maybe_write_hf_w8a8_linear(model: nn.Module, hf_dir: str | Path) -> None:
             weight_map[key] = shard
     index_path.write_text(json.dumps(index, indent=4) + "\n")
 
-    _merge_description(hf_dir, description)
+    existing_description = _read_description(hf_dir)
+    existing_entries = {} if existing_description is None else existing_description
+    description["model_quant_type"] = existing_entries.get("model_quant_type", _MODELSLIM_W8A8_DYNAMIC)
+    description.update(_float_completion_entries(weight_map, description, existing_entries))
+
+    _merge_description(hf_dir, description, existing_description)
 
 
 def _hf_weight_keys(module_name: str, to_hf_key_list: Callable[[str], list[str]]) -> list[str]:
@@ -175,16 +186,50 @@ def _description_keys(hf_keys: list[str]) -> list[str]:
     return expert0 if expert0 else bare
 
 
-def _merge_description(hf_dir: Path, description: dict[str, str]) -> None:
-    # Read-merge-write: the KV FAKQuant export writes the same file moments earlier (blind
-    # overwrite), so its ``version``/``fa_quant_type``/FA entries must survive. A key
+def _read_description(hf_dir: Path) -> dict[str, str] | None:
+    # The description content, read once per export: ``None`` when the file does not exist,
+    # the parsed mapping otherwise (possibly empty for an existing-but-empty file). The
+    # FLOAT completion must honor entries another export (the KV FAKQuant writer) put there,
+    # and the merge reuses the same read instead of parsing the file twice.
+    desc_path = hf_dir / _MODELSLIM_DESCRIPTION_FILENAME
+    if not desc_path.exists():
+        return None
+    return cast(dict[str, str], json.loads(desc_path.read_text()))
+
+
+def _float_completion_entries(
+    weight_map: dict[str, str],
+    planned: dict[str, str],
+    existing: dict[str, str],
+) -> dict[str, str]:
+    # The deployment engine attributes every exported weight through the description:
+    # quantized modules are claimed by their bare prefix in ``planned``, and every other
+    # exported weight is claimed explicitly as ``FLOAT`` by its full HF key. Strictly
+    # add-if-absent — pre-existing entries (e.g. the KV export's ``FAQuant`` markers) are
+    # honored, never overwritten.
+    entries: dict[str, str] = {}
+    for key in weight_map:
+        if key.endswith(f".{_W8A8_SCALE_SUFFIX}") or key.endswith(f".{_W8A8_OFFSET_SUFFIX}"):
+            continue
+        if key in planned or key in existing:
+            continue
+        bare = key.removesuffix(".weight")
+        if bare in planned or bare in existing:
+            continue
+        entries[key] = "FLOAT"
+    return entries
+
+
+def _merge_description(hf_dir: Path, description: dict[str, str], existing: dict[str, str] | None) -> None:
+    # Read-merge-write against the content the caller read: the KV FAKQuant export writes
+    # the same file moments earlier (blind overwrite), so its ``version``/``fa_quant_type``/
+    # FA entries must survive. ``existing is None`` means the file did not exist. A key
     # mapped to a different value means two features claim one layer — fail fast rather
     # than silently re-quantize.
-    desc_path = hf_dir / _MODELSLIM_DESCRIPTION_FILENAME
-    if desc_path.exists():
-        merged = cast(dict[str, Any], json.loads(desc_path.read_text()))
+    if existing is None:
+        merged: dict[str, str] = {"version": _MODELSLIM_DESCRIPTION_VERSION}
     else:
-        merged = {"version": _MODELSLIM_DESCRIPTION_VERSION}
+        merged = dict(existing)
     for key, value in description.items():
         if key in merged and merged[key] != value:
             raise ValueError(
@@ -192,7 +237,7 @@ def _merge_description(hf_dir: Path, description: dict[str, str]) -> None:
                 f"refusing to overwrite with {value!r}."
             )
         merged[key] = value
-    desc_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
+    (hf_dir / _MODELSLIM_DESCRIPTION_FILENAME).write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
 
 
 def _npu_export_available() -> bool:
