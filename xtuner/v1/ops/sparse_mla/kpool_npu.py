@@ -75,6 +75,20 @@ __all__ = ["npu_kpool_topk_indices", "pack_visible_tail_enabled", "pack_visible_
 # chain. Setting it to ``0`` restores the legacy per-segment path bit for bit.
 _BATCHED_SCORE = os.environ.get("XTUNER_GLM53_KPOOL_BATCHED_SCORE", "1") == "1"
 
+# Causal-extent cropping for the batched scorer. A row only ever reads scores below its own
+# visible prefix, and the fused kernel stores ``finfo.min`` -- the buffer prefill value -- at
+# invisible cells, so per row chunk everything at or past the chunk's widest prefix is
+# skippable: the topk / prefill / visibility extents stop there, and the score kernel
+# early-exits programs whose whole row tile sits past its rows' widest prefix (they would
+# only compute and store finfo.min). Caller-visible pool ids are unchanged (rows shorter
+# than ``k`` still pick implementation-defined pad columns, masked to -1 by the caller).
+# The win is dominated by the score-kernel row-tile skip and grows with prefix skew
+# (device micro-bench 2026-11-11, 512K-doc shards: e2e x7.9 early rank / x1.7 mid /
+# x1.3 late rank; topk crop [1024,131072] 4.70 -> 1.96 ms averaged over a causal chunk
+# sweep, though the strided ``[:, :w_topk]`` view pays a 1.04-1.19x stride penalty vs a
+# contiguous buffer at equal width). ``0`` restores the full-width rectangle bit for bit.
+_CAUSAL_CROP = os.environ.get("XTUNER_KPOOL_CAUSAL_CROP", "1") == "1"
+
 # Span-dense packed index rows (built by ``pack_visible_tail_into`` below): each row dense
 # with distinct visible tokens inside its causal read span, -1 only beyond it. The default
 # ``0`` keeps the legacy -1-padded layout bit for bit.
@@ -756,6 +770,14 @@ def _score_and_topk_batched(
     Returns:
         Tensor: ``[S, min(select_k, max_pools)]`` int64 document-local pool ids, sorted by
         score descending -- the same content the legacy per-segment ``topk`` produced.
+
+    With ``XTUNER_KPOOL_CAUSAL_CROP=1`` (default) the per-chunk prefill / visibility / topk
+    extents and the fused kernel's row tiles stop at each chunk's widest visible prefix
+    (``=0`` keeps the full-width rectangle bit for bit): rows only read scores below their
+    own prefixes and invisible cells hold the ``finfo.min`` prefill either way, so the
+    selected pool-id sets are unchanged -- rows with fewer visible pools than ``select_k``
+    still pick pad columns from an implementation-defined set, which the caller's
+    ``sel < row_prefix`` test masks to ``-1`` exactly as before.
     """
     device = q_local.device
     seq_len = q_local.shape[0]
@@ -786,10 +808,25 @@ def _score_and_topk_batched(
         arange_p = torch.arange(width, device=device)
         for c_lo in range(0, seq_len, row_chunk):
             c_hi = min(c_lo + row_chunk, seq_len)
+            # Causal crop (see _CAUSAL_CROP): every row's real scores sit below its own
+            # visible prefix, so the chunk's widest prefix bounds all of them. row_prefix is
+            # monotone inside a document and resets across documents, so the bound is the
+            # chunk MAX, not its last row. Extents: ``w_vis`` covers every launch's padded
+            # pool axis (each launch's ``w`` is clamped to its own chunk-clamped last-row
+            # prefix, so ``pools_padded <= w_vis`` always holds), and ``w_topk = max(w_vis,
+            # k)`` keeps the topk legal when the chunk's rows are narrower than ``k`` slots.
+            # Cells past these extents are never read by this chunk: the topk stops at
+            # ``w_topk``, and both buffers are re-prefilled over ``[:w_topk]`` next chunk.
+            if _CAUSAL_CROP:
+                w_vis = -(-max(prefix_host[c_lo:c_hi]) // _MAX_BLOCK_P) * _MAX_BLOCK_P
+                w_topk = max(w_vis, k)
+            else:
+                w_vis = width
+                w_topk = width
             scores = scores_buf[: c_hi - c_lo]
-            scores.fill_(finfo_min)
+            scores[:, :w_topk].fill_(finfo_min)
             visible = visible_buf[: c_hi - c_lo]
-            torch.lt(arange_p.unsqueeze(0), row_prefix[c_lo:c_hi].unsqueeze(-1), out=visible)
+            torch.lt(arange_p[:w_vis].unsqueeze(0), row_prefix[c_lo:c_hi].unsqueeze(-1), out=visible[:, :w_vis])
             for row_lo, row_hi, pool_lo, pool_hi, _doc_start in ranges:
                 r_lo = max(row_lo, c_lo)
                 r_hi = min(row_hi, c_hi)
@@ -806,9 +843,25 @@ def _score_and_topk_batched(
                     scores[r_lo - c_lo : r_hi - c_lo, :w],
                     w,
                     scale,
+                    row_prefix=row_prefix[r_lo:r_hi] if _CAUSAL_CROP else None,
                 )
-            topk_ids[c_lo:c_hi] = scores.topk(k, dim=-1).indices
+            topk_ids[c_lo:c_hi] = scores[:, :w_topk].topk(k, dim=-1).indices
         return topk_ids
+    # Whole-shard layout. The causal-crop bound is the shard-wide MAX visible prefix (a row
+    # never reads at or past its own prefix, so no column >= the widest prefix contributes a
+    # real score), rounded up to a whole tile for the same launch-extent reason as the
+    # per-segment ``w`` below and k-floored to keep the topk legal. Every launch's
+    # ``pools_padded`` stays inside it (each ``w <= round256(prefix_host[segment-last]) <=
+    # w_vis by the same argument as the chunked layout), and cells past ``w_topk`` are
+    # finfo.min in both arms (invisible cells hold exactly that), so cropping the buffer
+    # widths is bit-equivalent -- rows shorter than ``k`` still pick implementation-defined
+    # pad columns, which the caller's ``sel < row_prefix`` test masks to -1.
+    if _CAUSAL_CROP:
+        w_vis = -(-max(prefix_host) // _MAX_BLOCK_P) * _MAX_BLOCK_P
+        w_topk = max(w_vis, k)
+    else:
+        w_vis = width
+        w_topk = width
     # Transient memory scales as S_local x (largest-document pools + one tile of slack) for
     # *every* row, not each row's own document size: ~2.2 GB fp32 scores_all + ~0.55 GB bool
     # visible_all per call at 128K/SP=8 (allocator-reused across the 192 calls/step; validated
@@ -819,12 +872,12 @@ def _score_and_topk_batched(
     # 0.9 GB bool per call) -- size the headroom from the balanced row counts, not the
     # uniform ones.
     scores_all = torch.full(
-        (seq_len, width), float(torch.finfo(torch.float32).min), dtype=torch.float32, device=device
+        (seq_len, w_topk), float(torch.finfo(torch.float32).min), dtype=torch.float32, device=device
     )
     # One whole-call visibility compare instead of one per segment: column ``c`` is visible to
     # row ``r`` iff ``c < row_prefix[r]`` -- columns past a document's real pools are past its
     # rows' prefixes too, i.e. invalid (the legacy path padded the mask with zeros instead).
-    visible_all = torch.arange(width, device=device).unsqueeze(0) < row_prefix.unsqueeze(-1)
+    visible_all = torch.arange(w_vis, device=device).unsqueeze(0) < row_prefix.unsqueeze(-1)
     for row_lo, row_hi, pool_lo, pool_hi, _doc_start in ranges:
         # ``row_prefix`` is monotone within a document, so the segment's last row carries the
         # widest visible prefix; rounding it up to a whole tile matches the kernel's
@@ -840,6 +893,7 @@ def _score_and_topk_batched(
             scores_all[row_lo:row_hi, :w],
             w,
             scale,
+            row_prefix=row_prefix[row_lo:row_hi] if _CAUSAL_CROP else None,
         )
     return scores_all.topk(k, dim=-1).indices
 
@@ -916,6 +970,7 @@ if triton is not None:
         P,
         scale,
         neg_inf,
+        rp_ptr,  # [S] int32 per-row visible-pool prefix; unused placeholder when HAS_RP is False
         V_STRIDE,
         O_STRIDE,
         NH: tl.constexpr,
@@ -923,6 +978,7 @@ if triton is not None:
         BS: tl.constexpr,
         BP: tl.constexpr,
         HAS_VALID: tl.constexpr,
+        HAS_RP: tl.constexpr,
     ):
         """Fused DSA (lightning) indexer scoring.
 
@@ -949,6 +1005,9 @@ if triton is not None:
             P: Padded pool count (the logical pool-axis extent of this launch).
             scale: Softmax scale (usually ``D**-0.5``).
             neg_inf: ``float32`` finfo.min written to invalid candidates.
+            rp_ptr: Optional per-row visible-pool prefix ``[S]`` int32 -- column ``p`` is
+                visible to row ``s`` iff ``p < rp_ptr[s]``. Only read when ``HAS_RP``; any
+                tensor is an acceptable placeholder otherwise.
             V_STRIDE: Row stride of ``valid_ptr``; ``P`` when the mask is contiguous.
             O_STRIDE: Row stride of ``out_ptr``; ``P`` when the output is contiguous. Strided
                 callers must keep the batch axis at 1 (the batch offset below still assumes a
@@ -958,6 +1017,7 @@ if triton is not None:
             BS: Query-axis tile.
             BP: Pool-axis tile.
             HAS_VALID: Whether ``valid_ptr`` carries a mask.
+            HAS_RP: Whether ``rp_ptr`` carries row prefixes (enables the row-tile skip).
         """
         pid_s = tl.program_id(0)
         pid_p = tl.program_id(1)
@@ -965,6 +1025,19 @@ if triton is not None:
 
         s0 = pid_s * BS
         p0 = pid_p * BP
+
+        if HAS_RP:
+            # Causal row-tile skip (see _CAUSAL_CROP): a program whose whole row tile sits at
+            # or past the tile's widest visible prefix would only compute tiles that the
+            # store then overwrites with ``neg_inf`` -- which is the caller's buffer prefill
+            # value -- so skipping both the compute and the store is bit-identical. The
+            # bound is the MAX prefix over the tile's rows (prefixes are monotone within a
+            # launch -- one document segment -- but the max keeps the skip safe under any
+            # ordering); ``other=0`` cannot inflate it because prefixes are non-negative.
+            offs_rp = s0 + tl.arange(0, BS)
+            b_rp = tl.load(rp_ptr + offs_rp, mask=offs_rp < S, other=0)
+            if p0 >= tl.max(b_rp):
+                return
 
         q_batch_off = pid_b * S * NH * D
         w_batch_off = pid_b * S * NH
@@ -1181,6 +1254,7 @@ if triton is not None:
                 pools_padded,
                 float(scale),
                 float(torch.finfo(torch.float32).min),
+                valid_candidates,  # unused placeholder, kernel guards on HAS_RP
                 pools_padded,
                 pools_padded,
                 num_heads,
@@ -1188,6 +1262,7 @@ if triton is not None:
                 block_s,
                 block_p,
                 has_valid,
+                False,
             )
             return out[:, :, :num_pools] if pad else out
 
@@ -1227,6 +1302,7 @@ if triton is not None:
         out: torch.Tensor,
         num_pools: int,
         scale: float,
+        row_prefix: Tensor | None = None,
     ) -> None:
         """Launch the fused scoring kernel straight into caller-provided
         (possibly strided) buffers.
@@ -1255,6 +1331,14 @@ if triton is not None:
                 rest of the row keeps whatever the caller prefilled.
             num_pools (int): The segment's real pool count ``P``.
             scale (float): Softmax scale (usually ``D**-0.5``).
+            row_prefix (Tensor | None): Optional per-row visible-pool prefix ``[R]`` int32,
+                aligned with ``q``'s rows (a row slice of the whole-call ``row_prefix``).
+                When given, the kernel early-exits programs whose whole row tile sits at or
+                past the tile's max prefix -- those tiles would only compute and store
+                ``finfo.min``, the caller's prefill value, so the skip is bit-identical.
+                Rows within one launch must belong to one document segment so prefixes are
+                monotone (the batched scorer's per-segment launches qualify); the kernel
+                takes the tile MAX anyway, so any ordering stays correct.
         """
         rows, num_heads, head_dim = q.shape
         # Same platform guard as the autograd forward: the tile budget (_MAX_TILE_ELEMS /
@@ -1281,6 +1365,7 @@ if triton is not None:
             pools_padded,
             float(scale),
             float(torch.finfo(torch.float32).min),
+            q if row_prefix is None else row_prefix,  # placeholder, kernel guards on HAS_RP
             valid.stride(0),
             out.stride(0),
             num_heads,
@@ -1288,6 +1373,7 @@ if triton is not None:
             block_s,
             block_p,
             True,
+            row_prefix is not None,
         )
 else:
     _MAX_BLOCK_P = 256
