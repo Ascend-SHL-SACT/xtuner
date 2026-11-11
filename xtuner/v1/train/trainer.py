@@ -409,6 +409,9 @@ class TrainerConfig(BaseModel):
     )
     model_cfg: XTunerBaseModelConfig
     load_from: str | Path | None = None
+    # HuggingFace metadata source (config/tokenizer files) copied into HF-format exports when the
+    # model is NOT loaded from a Huggingface path (e.g. random initialization).
+    hf_export_source: str | Path | None = None
     tokenizer_path: str | Path | None = None
     dataset_cfg: Annotated[DatasetConfigList | None, Parameter(show_default=False)] = (
         None  # TODO: Removed in version 1.1.0
@@ -539,6 +542,7 @@ class Trainer:
         self,
         *,
         load_from: str | Path | None = None,  # Huggingface model path or saved trainer_path
+        hf_export_source: str | Path | None = None,  # HF metadata source for exports when not loading from HF
         model_cfg: XTunerBaseModelConfig,
         optim_cfg: OptimConfig,
         fsdp_cfg: FSDPConfig | None = FSDPConfig(),
@@ -622,9 +626,18 @@ class Trainer:
         self._profile_time = profile_time
         self._profile_memory = profile_memory
         self._load_from = Path(load_from) if isinstance(load_from, str) else load_from
+        self._hf_export_source = Path(hf_export_source) if isinstance(hf_export_source, str) else hf_export_source
 
         is_hf_path, error_info = is_hf_model_path(load_from) if load_from is not None else False, None
         self._load_from_hf = is_hf_path
+
+        if self._hf_export_source is not None:
+            source_ok, source_error = is_hf_model_path(self._hf_export_source)
+            if not source_ok:
+                raise ValueError(
+                    "`hf_export_source` should be a valid HuggingFace model path (the config/tokenizer metadata "
+                    f"source for HF-format exports). Error: {source_error}"
+                )
 
         self._checkpoint_interval = checkpoint_interval
         self._checkpoint_maxkeep = checkpoint_maxkeep
@@ -727,12 +740,13 @@ class Trainer:
         if isinstance(load_from, str):
             load_from = Path(load_from)
 
-        self._can_save_hf = model_cfg.hf_config is not None or self._load_from_hf
+        self._can_save_hf = model_cfg.hf_config is not None or self._load_from_hf or self._hf_export_source is not None
         if not self._can_save_hf:
             assert_info = (
                 f"`hf_interval`: {hf_interval}, `hf_max_keep`: {hf_max_keep} and "
                 f"`async_hf_export`: {async_hf_export} "
-                f"should be None when `load_from` is not a Huggingface model path, "
+                f"should be None when `load_from` is not a Huggingface model path and `hf_export_source` "
+                f"is not set, "
             )
             if is_hf_path is False and error_info is not None:
                 assert_info += f", HF path load error Info: {error_info}"
@@ -745,6 +759,7 @@ class Trainer:
             fsdp_config=fsdp_cfg,
             load_checkpoint_path=self._load_checkpoint_cfg.checkpoint_path,
             strict=strict_load,
+            hf_export_source=self._hf_export_source,
             intra_layer_micro_batch=intra_layer_micro_batch,
         )
         self._lr_cfg = lr_cfg
@@ -1191,6 +1206,7 @@ class Trainer:
         optim_config: OptimConfig,
         fsdp_config: FSDPConfig,
         load_checkpoint_path: str | Path | None,
+        hf_export_source: Path | None,
         intra_layer_micro_batch: int = 1,
         strict: bool = True,
     ):
@@ -1202,6 +1218,9 @@ class Trainer:
             optim_config (OptimConfig): Optimizer configuration.
             fsdp_config (FSDPConfig): FSDP configuration for distributed training.
             resume_cfg (ResumeConfig | None): Resume configuration for continuing training.
+            hf_export_source (Path | None): HuggingFace metadata (config/tokenizer) source copied into
+                HF-format exports. Takes precedence over ``model_path`` for the export metadata source;
+                weight initialization is not affected.
             intra_layer_micro_batch (int): Intra-layer micro batch size for gradient accumulation.
             strict (bool): Whether to strictly load model weights.
 
@@ -1219,7 +1238,9 @@ class Trainer:
         elif load_checkpoint_path is None:
             engine.init_model_weights()
 
-        if model_path is not None:
+        if hf_export_source is not None:
+            engine.model.set_hf(hf_export_source)
+        elif model_path is not None:
             engine.model.set_hf(model_path)
 
         if engine.model.compile_cfg is not None:
@@ -1588,7 +1609,6 @@ class Trainer:
                 except Exception as e:
                     logger.info(f"Rank: {self.rank} npu_cpu_binder failed: {e}")
             return
-
 
         if str(DEVICE) != "cuda":
             log_rank0.info("Current device is not cuda, skip numa binding.")

@@ -2,10 +2,11 @@ import os
 import pickle
 import shutil
 import tempfile
+import unittest
 import weakref
 from concurrent.futures import Future
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import parametrize
 import torch
@@ -205,6 +206,105 @@ class TestTrainerSaveHF(DistributedTestBase):
             self.assertTrue(config_file.exists())
             self.assertEqual(model_file.read_text(), "fake model weights")
             self.assertEqual(config_file.read_text(), '{"model_type": "fake_model"}')
+
+    @patch("xtuner.v1.train.trainer.is_hf_model_path", Mock(return_value=True))
+    @patch.object(Qwen3MoE30BA3Config, "hf_config", new_callable=PropertyMock, return_value=None)
+    @patch("xtuner.v1.train.trainer.Trainer._prepare_model_input", Mock(return_value=[]))
+    @prepare
+    def test_hf_export_source_enables_hf_interval(self):
+        """Test HF export fires from a randomly-initialized run when `hf_export_source` is set."""
+        self.create_pg(DEVICE)
+        work_dir_list = [self.work_dir]
+        dist.broadcast_object_list(work_dir_list, src=0)
+        self.work_dir = Path(work_dir_list[0])
+        model_cfg = Qwen3MoE30BA3Config()
+        optim_cfg = AdamWConfig(lr=1e-4, weight_decay=0.01)
+        fsdp_cfg = FSDPConfig(tp_size=1)
+        dataset_cfg = [
+            {
+                "dataset": DatasetConfig(name="alpaca", anno_path=self.alpaca_path, sample_ratio=1.0),
+                "tokenize_fn": FTDPTokenizeFnConfig(),
+            },
+        ]
+        dataloader_cfg = DataloaderConfig()
+        lr_cfg = LRConfig(lr_type="constant", warmup_ratio=0.1, lr_min=1e-6)
+
+        with patch("xtuner.v1.train.trainer.Trainer.build_engine") as build_engine_mock:
+            build_engine_mock.side_effect = lambda *args, **kwargs: FakeEngine()
+            trainer = Trainer(
+                load_from=None,
+                hf_export_source=str(self.fake_hf_model_dir),
+                model_cfg=model_cfg,
+                optim_cfg=optim_cfg,
+                fsdp_cfg=fsdp_cfg,
+                dataset_cfg=dataset_cfg,
+                dataloader_cfg=dataloader_cfg,
+                lr_cfg=lr_cfg,
+                tokenizer_path=self.tokenizer_path,
+                global_batch_size=2,
+                total_step=10,
+                work_dir=str(self.work_dir),
+                hf_interval=3,
+                hf_max_keep=2,
+                seed=42,
+                debug=False,
+            )
+            # The source must be plumbed to the engine as the export metadata path.
+            build_engine_mock.assert_called_once()
+            self.assertEqual(build_engine_mock.call_args.kwargs.get("hf_export_source"), self.fake_hf_model_dir)
+
+        trainer.fit()
+        dist.barrier()
+
+        expected_saves = [3, 6, 9, 10]  # steps 3, 6, 9, 10
+        self.assertEqual(len(trainer._engine.save_hf_calls), 4)
+        for i, step in enumerate(expected_saves):
+            expected_path = str(self.work_dir / trainer.exp_dir.name / f"hf-{step}")
+            self.assertEqual(trainer._engine.save_hf_calls[i], expected_path)
+
+    @patch("xtuner.v1.train.trainer.is_hf_model_path", Mock(return_value=True))
+    @patch.object(Qwen3MoE30BA3Config, "hf_config", new_callable=PropertyMock, return_value=None)
+    @patch("xtuner.v1.train.trainer.Trainer.build_engine", Mock(side_effect=lambda *args, **kwargs: FakeEngine()))
+    @patch("xtuner.v1.train.trainer.Trainer._prepare_model_input", Mock(return_value=[]))
+    @prepare
+    def test_hf_interval_without_hf_source_asserts(self):
+        """Test `hf_interval` without any HF source (load_from/hf_config/hf_export_source) fails fast."""
+        self.create_pg(DEVICE)
+        work_dir_list = [self.work_dir]
+        dist.broadcast_object_list(work_dir_list, src=0)
+        self.work_dir = Path(work_dir_list[0])
+        model_cfg = Qwen3MoE30BA3Config()
+        optim_cfg = AdamWConfig(lr=1e-4, weight_decay=0.01)
+        fsdp_cfg = FSDPConfig(tp_size=1)
+        dataset_cfg = [
+            {
+                "dataset": DatasetConfig(name="alpaca", anno_path=self.alpaca_path, sample_ratio=1.0),
+                "tokenize_fn": FTDPTokenizeFnConfig(),
+            },
+        ]
+        dataloader_cfg = DataloaderConfig()
+        lr_cfg = LRConfig(lr_type="constant", warmup_ratio=0.1, lr_min=1e-6)
+
+        # The assertion fires inside the spawned worker; the harness surfaces it as RuntimeError.
+        with self.assertRaises(RuntimeError) as ctx:
+            Trainer(
+                load_from=None,
+                model_cfg=model_cfg,
+                optim_cfg=optim_cfg,
+                fsdp_cfg=fsdp_cfg,
+                dataset_cfg=dataset_cfg,
+                dataloader_cfg=dataloader_cfg,
+                lr_cfg=lr_cfg,
+                tokenizer_path=self.tokenizer_path,
+                global_batch_size=2,
+                total_step=10,
+                work_dir=str(self.work_dir),
+                hf_interval=3,
+                hf_max_keep=2,
+                seed=42,
+                debug=False,
+            )
+        self.assertIn("hf_export_source", str(ctx.exception))
 
     @patch("xtuner.v1.train.trainer.is_hf_model_path", Mock(return_value=True))
     @patch("xtuner.v1.train.trainer.Trainer.build_engine", Mock(side_effect=lambda *args, **kwargs: FakeEngine()))
@@ -464,6 +564,31 @@ class TestTrainerSaveHF(DistributedTestBase):
     @property
     def world_size(self) -> int:
         return int(os.getenv("XTUNER_TEST_WORLD_SIZE", "2"))
+
+
+class TestHfExportSourceValidation(unittest.TestCase):
+    """Fail-fast validation of `hf_export_source` (no distributed runtime needed)."""
+
+    def test_hf_export_source_invalid_path_raises(self):
+        """Test `hf_export_source` pointing at a non-HF directory raises ValueError at trainer init."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            not_hf_dir = Path(tmp_dir) / "not_hf"
+            not_hf_dir.mkdir()
+            with self.assertRaises(ValueError) as ctx:
+                Trainer(
+                    load_from=None,
+                    hf_export_source=str(not_hf_dir),
+                    model_cfg=Qwen3MoE30BA3Config(),
+                    optim_cfg=AdamWConfig(lr=1e-4, weight_decay=0.01),
+                    dataloader_cfg=DataloaderConfig(),
+                    lr_cfg=LRConfig(lr_type="constant", warmup_ratio=0.1, lr_min=1e-6),
+                    tokenizer_path=None,
+                    global_batch_size=2,
+                    total_step=1,
+                    hf_interval=1,
+                )
+            self.assertIn("hf_export_source", str(ctx.exception))
+            self.assertIn("not_hf", str(ctx.exception))
 
 
 class TestTrainerConfig(DeterministicDDPTestCase):
