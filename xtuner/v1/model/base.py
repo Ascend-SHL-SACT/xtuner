@@ -541,6 +541,17 @@ def _save_file(
     save_file(tensors, filename, metadata=metadata)
 
 
+def _strip_inherited_quantization_config(hf_dir: Path) -> None:
+    config_path = hf_dir / "config.json"
+    if not config_path.is_file():
+        return
+    payload: Any = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or "quantization_config" not in payload:
+        return
+    del payload["quantization_config"]
+    config_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 class _HFSaveBucketItem(NamedTuple):
     tensor: torch.Tensor
     save_plan: HFSavePlan
@@ -1741,6 +1752,8 @@ class BaseModel(nn.Module):
                         copy(file, target_path)
                     else:
                         copytree(file, target_path, ignore_dangling_symlinks=True, dirs_exist_ok=True)
+            # Drop a source-inherited quantization_config; it never matches the exported weights.
+            _strip_inherited_quantization_config(hf_dir)
         else:
             raise RuntimeError("Internal Error, both self.config.hf_config and self._hf_path are None")
 
@@ -1847,6 +1860,8 @@ class BaseModel(nn.Module):
                             copy(file, target_path)
                         else:
                             copytree(file, target_path, ignore_dangling_symlinks=True, dirs_exist_ok=True)
+                # Drop a source-inherited quantization_config; it never matches the exported weights.
+                _strip_inherited_quantization_config(hf_dir)
 
             # write or overwrite `model.safetensors.index.json`
             with open(hf_dir / "model.safetensors.index.json", "w") as f:
