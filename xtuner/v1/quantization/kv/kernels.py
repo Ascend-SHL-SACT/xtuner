@@ -14,14 +14,29 @@ import torch
 class _Int8FakeQuant(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, scale: torch.Tensor | None, clip: bool) -> torch.Tensor:
+        if not clip:
+            # No clip mask to save, so run the fused chain: one fp32 materialization
+            # (``x / s``) plus in-place rounding ops instead of the generic path's six
+            # full-size fp32 temporaries. Bit-exact against the generic path below:
+            # ``max(mx, -mn)`` selected over the raw dtype equals ``amax(x.float().abs())``
+            # (sign flip and the low-to-high dtype upcast are exact), and a low-precision
+            # operand divided by an fp32 scale promotes to the same fp32 dividend. The
+            # clamp stays: it is provably dead for a dynamic scale (|x| <= amax = 127 * s)
+            # but live for a caller-supplied static scale (values can exceed the range).
+            s = scale
+            if s is None:
+                mn, mx = torch.aminmax(x, dim=-1, keepdim=True)
+                s = torch.maximum(mx, mn.neg()).float().div_(127.0).clamp_min_(1e-12)
+            q = torch.div(x, s).round_().clamp_(-127.0, 127.0).mul_(s)
+            ctx.clip = False
+            return q.to(x.dtype)
         x32 = x.float()
         if scale is None:
             # Per-token dynamic: the scale is derived inside the Function so no gradient
             # flows through the amax path.
             scale = x32.abs().amax(dim=-1, keepdim=True).div_(127.0).clamp_min_(1e-12)
         ctx.clip = clip
-        if clip:
-            ctx.save_for_backward(x32.abs().le(127.0 * scale))
+        ctx.save_for_backward(x32.abs().le(127.0 * scale))
         q = torch.clamp(torch.round(x32 / scale), -127.0, 127.0)
         return q.mul(scale).to(x.dtype)
 
