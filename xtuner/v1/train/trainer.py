@@ -409,6 +409,9 @@ class TrainerConfig(BaseModel):
     )
     model_cfg: XTunerBaseModelConfig
     load_from: str | Path | None = None
+    # HuggingFace metadata source: a local directory whose files (config/tokenizer) are copied into
+    # HF-format exports when the model is NOT loaded from a Huggingface path (e.g. random initialization).
+    hf_export_source: str | Path | None = None
     tokenizer_path: str | Path | None = None
     dataset_cfg: Annotated[DatasetConfigList | None, Parameter(show_default=False)] = (
         None  # TODO: Removed in version 1.1.0
@@ -539,6 +542,7 @@ class Trainer:
         self,
         *,
         load_from: str | Path | None = None,  # Huggingface model path or saved trainer_path
+        hf_export_source: str | Path | None = None,  # HF metadata source for exports when not loading from HF
         model_cfg: XTunerBaseModelConfig,
         optim_cfg: OptimConfig,
         fsdp_cfg: FSDPConfig | None = FSDPConfig(),
@@ -622,9 +626,23 @@ class Trainer:
         self._profile_time = profile_time
         self._profile_memory = profile_memory
         self._load_from = Path(load_from) if isinstance(load_from, str) else load_from
+        self._hf_export_source = Path(hf_export_source) if isinstance(hf_export_source, str) else hf_export_source
 
         is_hf_path, error_info = is_hf_model_path(load_from) if load_from is not None else False, None
         self._load_from_hf = is_hf_path
+
+        if self._hf_export_source is not None:
+            if not self._hf_export_source.is_dir():
+                raise ValueError(
+                    "`hf_export_source` should be a local HuggingFace model directory (the config/tokenizer "
+                    f"metadata source for HF-format exports). Not a directory: {self._hf_export_source}"
+                )
+            source_ok, source_error = is_hf_model_path(self._hf_export_source)
+            if not source_ok:
+                raise ValueError(
+                    "`hf_export_source` should be a valid HuggingFace model path (the config/tokenizer metadata "
+                    f"source for HF-format exports). Error: {source_error}"
+                )
 
         self._checkpoint_interval = checkpoint_interval
         self._checkpoint_maxkeep = checkpoint_maxkeep
@@ -727,12 +745,13 @@ class Trainer:
         if isinstance(load_from, str):
             load_from = Path(load_from)
 
-        self._can_save_hf = model_cfg.hf_config is not None or self._load_from_hf
+        self._can_save_hf = model_cfg.hf_config is not None or self._load_from_hf or self._hf_export_source is not None
         if not self._can_save_hf:
             assert_info = (
                 f"`hf_interval`: {hf_interval}, `hf_max_keep`: {hf_max_keep} and "
                 f"`async_hf_export`: {async_hf_export} "
-                f"should be None when `load_from` is not a Huggingface model path, "
+                f"should be None when `load_from` is not a Huggingface model path and `hf_export_source` "
+                f"is not set, "
             )
             if is_hf_path is False and error_info is not None:
                 assert_info += f", HF path load error Info: {error_info}"
@@ -747,6 +766,8 @@ class Trainer:
             strict=strict_load,
             intra_layer_micro_batch=intra_layer_micro_batch,
         )
+        if self._hf_export_source is not None:
+            self._engine.model.set_hf(self._hf_export_source)
         self._lr_cfg = lr_cfg
         self._lr_scheduler = self.build_lr_scheduler(lr_cfg, self.total_step)
 
@@ -842,6 +863,7 @@ class Trainer:
             snapshot_interval=config.snapshot_interval,
             check_health_interval=config.check_health_interval,
             hf_interval=config.hf_interval,
+            hf_export_source=config.hf_export_source,
             hf_max_keep=config.hf_max_keep,
             exp_tracker=config.exp_tracker,
             profile_step=config.profile_step,

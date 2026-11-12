@@ -157,6 +157,14 @@ class BaseComposeModel(BaseModel):
             if missing:
                 raise RuntimeError(f"Missing parameters from {hf_path}: {list(missing)}. ")
 
+    def set_hf(self, hf_path: str | Path):
+        # Propagate the HF metadata source to children so HF-format export works without
+        # loading weights from Huggingface (random-init export); mirrors `from_hf`.
+        self._hf_path = Path(hf_path)
+        self.language_model.set_hf(hf_path)
+        self.vision_tower.set_hf(hf_path)
+        self.multi_modal_projector.set_hf(hf_path)
+
     def save_hf(self, hf_dir: Path | str, save_dtype: torch.dtype = torch.bfloat16, safetensors_prefix: str = "model"):
         hf_dir = Path(hf_dir)
         self.language_model.save_hf(hf_dir, save_dtype, "model-language")
