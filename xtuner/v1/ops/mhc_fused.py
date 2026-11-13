@@ -163,6 +163,7 @@ _RSTD_D_BLOCK = 1024  # feature chunk of the per-row sum-of-squares pass
 _T_TILE = 64  # token rows per MMA tile
 _K_TILE = 128  # feature (reduction) chunk per MMA tile
 _DX_K2_TILE = 512  # feature chunk of the d_x store pass (see _mhc_dx_kernel)
+_DX_PASS2_WIDTH: int | None = None  # pinned after the first fused d_x launch (see backward)
 _DFN_D_TILE = 512  # feature tile of the d_fn reduction
 # Persistent-grid cap for the aiv-mode kernels (rstd here; the combine/collapse
 # group additionally resolves it on first use via the NaN-sentinel probe below).
@@ -720,21 +721,42 @@ class _MhcNormLinearFn(torch.autograd.Function):
                 )
             else:
                 d_x = torch.empty_like(x2d)
-                _mhc_dx_kernel[(min(triton.cdiv(tokens, _T_TILE), _MAX_PROGS),)](
-                    x2d,
-                    w,
-                    dm,
-                    rstd,
-                    d_x,
-                    tokens,
-                    N=n,
-                    MIX=mix,
-                    MIX_PAD=mix_pad,
-                    BLOCK_T=_T_TILE,
-                    BLOCK_K=_K_TILE,
-                    BLOCK_K2=_DX_K2_TILE,
-                    num_warps=4,
-                )
+
+                def _launch_dx(bk2: int) -> None:
+                    _mhc_dx_kernel[(min(triton.cdiv(tokens, _T_TILE), _MAX_PROGS),)](
+                        x2d,
+                        w,
+                        dm,
+                        rstd,
+                        d_x,
+                        tokens,
+                        N=n,
+                        MIX=mix,
+                        MIX_PAD=mix_pad,
+                        BLOCK_T=_T_TILE,
+                        BLOCK_K=_K_TILE,
+                        BLOCK_K2=bk2,
+                        num_warps=4,
+                    )
+
+                # Pass-2 width adaptivity across triton-ascend versions. 512 is
+                # ~27% faster on pass 2 but needs ~384KB UB under 3.6.0
+                # (bishengir auto-multi-buffer doubles the live 64x512 fp32 g/xv
+                # buffers) and fails to compile on the CANN 9.2.1 image (run #87,
+                # Ub overflow 3148800 vs 1572864 bits); 128 matches the split
+                # path's proven footprint. Pass 2 only recomputes g and stores
+                # elementwise, so its width is bit-free (see _mhc_dx_kernel
+                # comment) -- try 512 first, pin 128 only after a compile failure.
+                global _DX_PASS2_WIDTH
+                if _DX_PASS2_WIDTH is None:
+                    try:
+                        _launch_dx(_DX_K2_TILE)
+                        _DX_PASS2_WIDTH = _DX_K2_TILE
+                    except Exception:
+                        _DX_PASS2_WIDTH = _K_TILE
+                        _launch_dx(_K_TILE)
+                else:
+                    _launch_dx(_DX_PASS2_WIDTH)
         return d_x, d_w, None
 
 

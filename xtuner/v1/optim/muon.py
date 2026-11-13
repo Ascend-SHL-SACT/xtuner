@@ -260,6 +260,42 @@ def adamw_update(
     X.addcdiv_(M, denom, value=-adj_lr)
 
 
+_FOREACH_LERP_MODE: str | None = None  # "scalar" | "scalar_list"; probed on first use
+
+
+def _foreach_lerp_uniform_(tensors: list[Tensor], others: list[Tensor], weight: float) -> None:
+    """``torch._foreach_lerp_`` with one uniform weight, across torch 2.9/2.10.
+
+    torch 2.10's DTensor propagation lacks the ``_foreach_lerp_.ScalarList``
+    overload ("found no DeviceMesh from dtensor args" — the run-#88
+    step_optimizer failure) while ``.Scalar`` is DTensor-supported there; torch
+    2.9.1 has the ScalarList form used historically. Every call site passes one
+    constant weight, so both forms are numerically identical. The working
+    overload is probed once and cached (the probe fails before any device work,
+    so retrying is safe).
+
+    Args:
+        tensors (list[Tensor]): Destination tensors (DTensor or plain), modified in place.
+        others (list[Tensor]): Source tensors, same dtypes as ``tensors``.
+        weight (float): The uniform interpolation weight.
+
+    Returns:
+        None
+    """
+    global _FOREACH_LERP_MODE
+    if _FOREACH_LERP_MODE is None:
+        try:
+            torch._foreach_lerp_(tensors, others, weight)
+            _FOREACH_LERP_MODE = "scalar"
+            return
+        except (RuntimeError, TypeError):
+            _FOREACH_LERP_MODE = "scalar_list"
+    if _FOREACH_LERP_MODE == "scalar":
+        torch._foreach_lerp_(tensors, others, weight)
+    else:
+        torch._foreach_lerp_(tensors, others, [weight] * len(tensors))
+
+
 def adamw_update_foreach(  # type: ignore
     X: list[Tensor],  # Model weights (modified in place)
     G: list[Tensor],  # Gradient
@@ -279,17 +315,15 @@ def adamw_update_foreach(  # type: ignore
     assert batch_size == len(V)
 
     M_dtype = M[0].dtype
-    V_dtype = V[0].dtype
-
-    # Update momentum and variance
+    V_dtype = V[0].dtype    # Update momentum and variance
     # M = beta1 * M + (1 - beta1) * G
     G = [g.to(dtype=M_dtype) for g in G]
-    torch._foreach_lerp_(M, G, [1 - beta1] * batch_size)
+    _foreach_lerp_uniform_(M, G, 1 - beta1)
 
     # V = beta2 * V + (1 - beta2) * G * G
     G_square = torch._foreach_mul(G, G)
     G_square_v = [g.to(dtype=V_dtype) for g in G_square]
-    torch._foreach_lerp_(V, G_square_v, [1 - beta2] * batch_size)
+    _foreach_lerp_uniform_(V, G_square_v, 1 - beta2)
 
     # Bias correction
     bias_correction1 = 1 - beta1**step
