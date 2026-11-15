@@ -62,6 +62,7 @@ import torch
 from torch.optim.adam import adam as torch_adam
 
 from xtuner.v1.utils import get_device, get_torch_device_module
+from xtuner.v1.utils.activation_offload import alloc_pinned_cpu
 
 
 if TYPE_CHECKING:
@@ -81,7 +82,7 @@ def _get_host_scratch(optimizer, e: dict) -> dict:
     if key not in scratch:
 
         def pin(t: torch.Tensor) -> torch.Tensor:
-            return torch.empty(t.shape, dtype=torch.float32, device="cpu", pin_memory=True)
+            return alloc_pinned_cpu(t.shape, torch.float32)
 
         d = {"m": pin(e["cpu_exp_avg"]), "v": pin(e["cpu_exp_avg_sq"])}
         if e["amsgrad"]:

@@ -8,7 +8,11 @@ Modifications: To enable compatibility on both GPU and NPU, replace all torch.np
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
+from xtuner.v1.utils import get_logger
 from xtuner.v1.utils.device import get_device
+
+
+logger = get_logger()
 
 
 if get_device() == "npu":
@@ -61,6 +65,60 @@ class GetCnt:
         return [f"{block_idx - 1}_{prefetch_idx}" for prefetch_idx in prefetch_idxs]
 
 
+def alloc_pinned_cpu(shape: torch.Size | tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Allocate a pinned host buffer for offload parking, guarded against null-backed
+    storages.
+
+    On CANN 9.2.1 + torch_npu 2.10 the pinned-host allocator can silently return a
+    null-backed storage on the first binding of a freshly created NPU stream (CANN logs
+    EH0012 "aclrtAllocatorGetByStream failed"); the returned buffer keeps its recorded
+    ``nbytes``, so the failure does not surface at the allocation site but much later as
+    a fatal "aclrtMemcpyAsync failed because dst cannot be a NULL pointer" in the D2H
+    park (job-dyb-q35-xtuner-132). Detect the null-backed buffer here, retry once, and
+    fall back to a pageable host buffer as the last resort: a slower but correct park
+    beats a dead rank.
+
+    Args:
+        shape (torch.Size | tuple[int, ...]): Shape of the host buffer.
+        dtype (torch.dtype): Element dtype of the host buffer.
+
+    Returns:
+        torch.Tensor: Host buffer whose storage carries a non-null data pointer whenever
+            ``numel() > 0``.
+    """
+    for attempt in range(1, 3):
+        tensor = torch.empty(shape, dtype=dtype, pin_memory=True, device="cpu")
+        if tensor.numel() == 0 or tensor.untyped_storage().data_ptr() != 0:
+            return tensor
+        logger.warning("Pinned host allocation attempt %d returned a null-backed storage.", attempt)
+    logger.warning(
+        "Pinned host allocation returned a null-backed storage twice; falling back to a pageable "
+        "host buffer. The offload copies stay correct but may run synchronously."
+    )
+    return torch.empty(shape, dtype=dtype, device="cpu")
+
+
+def alloc_pinned_from_data(data, dtype: torch.dtype) -> torch.Tensor:
+    """Allocate a pinned host buffer and fill it from ``data``, with the null-storage
+    guard of :func:`alloc_pinned_cpu`.
+
+    Drop-in replacement for ``torch.tensor(data, dtype=dtype, pin_memory=True)`` on the
+    CANN 9.2.1 boxes whose pinned allocator can silently return null-backed storages
+    (see :func:`alloc_pinned_cpu`).
+
+    Args:
+        data (Any): Sequence accepted by ``torch.as_tensor``.
+        dtype (torch.dtype): Element dtype of the host buffer.
+
+    Returns:
+        torch.Tensor: Pinned host buffer holding ``data``.
+    """
+    host = torch.as_tensor(data, dtype=dtype)
+    out = alloc_pinned_cpu(tuple(host.shape), dtype)
+    out.copy_(host)
+    return out
+
+
 class SwapTensor:
     def __init__(self, tensor, key, tensor_cpu=None):
         self.tensor = tensor
@@ -72,7 +130,7 @@ class SwapTensor:
         if tensor_cpu is not None:
             self.tensor_cpu = tensor_cpu
         else:
-            self.tensor_cpu = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True, device="cpu")
+            self.tensor_cpu = alloc_pinned_cpu(tensor.shape, tensor.dtype)
 
         self.is_slice_tensor = tensor.storage().size() != tensor.numel()
         self.stat = "device"
@@ -238,7 +296,7 @@ class OffloadManager(metaclass=SingletonMeta):
         # Shape or dtype drift (e.g. variable seqlen) invalidates the cached buffer; reallocate.
         if cached is not None and cached.shape == shape and cached.dtype == dtype:
             return cached
-        new_tensor = torch.empty(shape, dtype=dtype, pin_memory=True, device="cpu")
+        new_tensor = alloc_pinned_cpu(shape, dtype)
         self.pin_memory_cache[key] = new_tensor
         return new_tensor
 

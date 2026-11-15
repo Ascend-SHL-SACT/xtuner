@@ -89,6 +89,7 @@ from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 from torch.nn import Parameter
 
 from xtuner.v1.utils import get_logger, log_rank0
+from xtuner.v1.utils.activation_offload import alloc_pinned_cpu
 
 
 _GRAD_OFFLOAD_ENV = "XTUNER_FSDP_GRAD_OFFLOAD"
@@ -591,7 +592,7 @@ class FSDPGradOffloadManager:
     def _ensure_acc(self, param: Parameter, flat: torch.Tensor) -> None:
         if param in self._acc:
             return
-        self._acc[param] = torch.empty(flat.shape, dtype=flat.dtype, pin_memory=True)
+        self._acc[param] = alloc_pinned_cpu(flat.shape, flat.dtype)
         need = flat.numel() * flat.element_size()
         self._offload_bytes += need
         self._ensure_ring()
@@ -609,7 +610,7 @@ class FSDPGradOffloadManager:
         # is the documented ring cost (module docstring).
         self._ring_slot_bytes = self._ring_chunk_bytes
         self._ring = [
-            torch.empty(self._ring_slot_bytes, dtype=torch.uint8, pin_memory=True) for _ in range(_RING_SLOTS)
+            alloc_pinned_cpu((self._ring_slot_bytes,), torch.uint8) for _ in range(_RING_SLOTS)
         ]
         self._ring_release = [threading.Event() for _ in range(_RING_SLOTS)]
         for release in self._ring_release:

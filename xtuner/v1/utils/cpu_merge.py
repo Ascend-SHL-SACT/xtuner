@@ -60,6 +60,7 @@ from typing import Any, BinaryIO
 import torch
 
 from xtuner.v1.utils import load_spec as load_spec_module
+from xtuner.v1.utils.activation_offload import alloc_pinned_cpu
 from xtuner.v1.utils.load_spec import (
     HFSavePlan,
     SaveShardStep,
@@ -256,7 +257,7 @@ def _pinned_staging(nbytes: int) -> torch.Tensor:
     """
     buf = _PINNED_STAGING.get("chunks")
     if buf is None or buf.numel() < nbytes:
-        _PINNED_STAGING["chunks"] = buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        _PINNED_STAGING["chunks"] = buf = alloc_pinned_cpu((nbytes,), torch.uint8)
     return buf
 
 

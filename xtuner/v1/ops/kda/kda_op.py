@@ -34,6 +34,8 @@ from fla_npu.ops.triton.triton_core.l2norm import l2norm_bwd, l2norm_fwd
 from fla_npu.ops.triton.triton_core.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 from typing_extensions import NotRequired, TypedDict
 
+from xtuner.v1.utils.activation_offload import alloc_pinned_from_data
+
 
 CHUNK_SIZE = 64
 
@@ -261,7 +263,7 @@ def _h2d_tensor(data: list[int], dtype: torch.dtype, device: torch.device | str)
         # the pinned blocks, handing one out only after its in-flight copies
         # retire. Every consumer runs on the current stream, so stream order
         # keeps all reads behind the copy.
-        staging = torch.tensor(data, dtype=dtype, pin_memory=True)
+        staging = alloc_pinned_from_data(data, dtype)
         return staging.to(device, non_blocking=True)
     return torch.tensor(data, dtype=dtype, device=device)
 

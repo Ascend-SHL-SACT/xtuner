@@ -48,6 +48,7 @@ from torch import Tensor
 
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.utils import log_rank0
+from xtuner.v1.utils.activation_offload import alloc_pinned_cpu
 from xtuner.v1.utils.activation_offload_npu import (
     sfa_stash_key,
     sfa_stash_pop,
@@ -648,8 +649,8 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
         # after the copy), and the pinned buffers stay alive in ctx until
         # backward streams them back with async H2D on that same stream.
         if kv.requires_grad and key_tnd.shape[0] > _SFA_GRAD_OFFLOAD_MIN_KV:
-            key_cpu = torch.empty(key_tnd.shape, dtype=key_tnd.dtype, pin_memory=True, device="cpu")
-            rope_cpu = torch.empty(key_rope_tnd.shape, dtype=key_rope_tnd.dtype, pin_memory=True, device="cpu")
+            key_cpu = alloc_pinned_cpu(key_tnd.shape, key_tnd.dtype)
+            rope_cpu = alloc_pinned_cpu(key_rope_tnd.shape, key_rope_tnd.dtype)
             key_cpu.copy_(key_tnd, non_blocking=True)
             rope_cpu.copy_(key_rope_tnd, non_blocking=True)
             del key_tnd, key_rope_tnd
@@ -668,13 +669,9 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
             # allocator before the grad kernel allocates its workspace (job dyb-q35-xtuner-21:
             # 2.39 GiB request vs 1.74 GiB free).
             if _SFA_GRAD_ROW_CHUNK:
-                q_cpu = torch.empty(query_tnd.shape, dtype=query_tnd.dtype, pin_memory=True, device="cpu")
-                qrope_cpu = torch.empty(
-                    query_rope_tnd.shape, dtype=query_rope_tnd.dtype, pin_memory=True, device="cpu"
-                )
-                raw_cpu = torch.empty(
-                    outputs.raw_output.shape, dtype=outputs.raw_output.dtype, pin_memory=True, device="cpu"
-                )
+                q_cpu = alloc_pinned_cpu(query_tnd.shape, query_tnd.dtype)
+                qrope_cpu = alloc_pinned_cpu(query_rope_tnd.shape, query_rope_tnd.dtype)
+                raw_cpu = alloc_pinned_cpu(outputs.raw_output.shape, outputs.raw_output.dtype)
                 q_cpu.copy_(query_tnd, non_blocking=True)
                 qrope_cpu.copy_(query_rope_tnd, non_blocking=True)
                 raw_cpu.copy_(outputs.raw_output, non_blocking=True)

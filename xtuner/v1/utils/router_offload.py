@@ -3,6 +3,8 @@ from typing import Any
 import torch
 from torch.utils._pytree import tree_map_only
 
+from xtuner.v1.utils.activation_offload import alloc_pinned_cpu
+
 
 # Names of view-like aten ops whose results share storage with their input. For these ops the
 # wrapper can stay lazy (no sync) because no real data movement happened. Non-aten or unknown
@@ -158,7 +160,7 @@ def async_offload_to_cpu(tensor: torch.Tensor, stream: torch.cuda.Stream) -> Asy
     if detached_tensor.device.type == "cpu":
         return AsyncOffloadedTensor(detached_tensor, None)
 
-    tensor_cpu = torch.empty(detached_tensor.shape, dtype=detached_tensor.dtype, device="cpu", pin_memory=True)
+    tensor_cpu = alloc_pinned_cpu(detached_tensor.shape, detached_tensor.dtype)
     event = torch.cuda.Event()
     current_stream = torch.cuda.current_stream()
     # Storage-level memcpy is faster than the strided element-wise path, but only correct when the

@@ -6,6 +6,8 @@ from torch.distributed._functional_collectives import all_gather_tensor_autograd
 from torch.distributed.device_mesh import DeviceMesh
 from typing_extensions import Self
 
+from xtuner.v1.utils.activation_offload import alloc_pinned_cpu
+
 from .utils import gather_for_sequence_parallel, pad_to_multiple_of, split_for_sequence_parallel
 
 
@@ -269,7 +271,7 @@ class SequenceContext:
         hit = cache.get(key)
         if hit is not None:
             return hit[1]
-        staging = torch.empty(cu.shape, dtype=cu.dtype, device="cpu", pin_memory=True)
+        staging = alloc_pinned_cpu(cu.shape, cu.dtype)
         staging.copy_(cu)
         copy = torch.empty(cu.shape, dtype=cu.dtype, device=dev)
         copy.copy_(staging, non_blocking=True)

@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 
 from xtuner.v1.utils import log_rank0
-from xtuner.v1.utils.activation_offload import OffloadManager, SwapTensor
+from xtuner.v1.utils.activation_offload import OffloadManager, SwapTensor, alloc_pinned_cpu
 
 
 if TYPE_CHECKING:
@@ -786,7 +786,7 @@ def _acquire_sfa_pinned(shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
     if free:
         _sfa_pinned_pool.move_to_end(key)
         return free.pop()
-    return torch.empty(shape, dtype=dtype, pin_memory=True, device="cpu")
+    return alloc_pinned_cpu(shape, dtype)
 
 
 def _release_sfa_pinned(buffer: torch.Tensor) -> None:

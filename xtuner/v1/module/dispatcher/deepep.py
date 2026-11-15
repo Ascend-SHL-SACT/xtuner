@@ -15,6 +15,7 @@ from xtuner.v1.ops.comm.deepep_op import (
     dispatch_forward,
 )
 from xtuner.v1.utils import copy_method_signature, get_device, get_logger
+from xtuner.v1.utils.activation_offload import alloc_pinned_from_data
 
 from . import XTUNER_DISPATCHER_DEBUG
 from .base import (
@@ -484,11 +485,7 @@ class DeepEPDispatcher(
         # is safe because the caching allocator refuses to recycle a pinned
         # block until the CUDA events referencing it have completed — a
         # guarantee a manually held buffer does not get.
-        tokens_per_expert = torch.tensor(
-            num_recv_tokens_per_expert_list,
-            dtype=torch.long,
-            pin_memory=True,
-        )
+        tokens_per_expert = alloc_pinned_from_data(num_recv_tokens_per_expert_list, torch.long)
         # `non_blocking=True` is only safe because every downstream consumer of
         # `tokens_per_expert` (group GEMM, FP8 quant kernels, prober) runs on
         # the current CUDA stream, so stream ordering covers the H2D. If

@@ -11,6 +11,7 @@ from typing_extensions import override
 from xtuner.v1.ops import permute, unpermute
 from xtuner.v1.ops.comm.all_to_all import all_to_all_single_autograd
 from xtuner.v1.utils import copy_method_signature, get_device, get_logger
+from xtuner.v1.utils.activation_offload import alloc_pinned_cpu
 
 from . import XTUNER_DISPATCHER_DEBUG
 from .base import (
@@ -160,7 +161,7 @@ def _dispatch(
         # fence contract above is untouched.
         bufs = _PINNED_SPLITS_BUFS.bufs
         if ep_size not in bufs:
-            bufs[ep_size] = torch.empty((2, ep_size), dtype=torch.int64, pin_memory=True)
+            bufs[ep_size] = alloc_pinned_cpu((2, ep_size), torch.int64)
         packed_splits = bufs[ep_size]
         packed_splits[0].copy_(tokens_per_expert.reshape(ep_size, num_experts_per_rank).sum(dim=1), non_blocking=True)
         packed_splits[1].copy_(tokens_per_expert_group.sum(dim=-1), non_blocking=True)
