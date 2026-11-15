@@ -342,6 +342,7 @@ class Glm53VLTokenizeFunction(BaseMLLMTokenizeFunction):
         # when concatenating the per-image processor outputs.
         pixel_values_list = []
         image_grid_list = []
+        running_visual_cells = 0
         for image_file in self._image_path:
             # 按 Data Format Types（V0.5 Agent）§7.1-7.2：嵌入图片使用
             # data:image/<subtype>;base64,<payload>（整体称为 data URI）。
@@ -358,6 +359,27 @@ class Glm53VLTokenizeFunction(BaseMLLMTokenizeFunction):
                     assert "s3://" not in image_path_, "Please use oss_loader_cfg to load image from s3."
                     image = load_image(image_path_)
             image = apply_exif_orientation(image)
+            # Early visual-budget abort: truncation never keeps a cut visual span, so a
+            # sample whose spans cannot all fit inside max_length is discarded by the
+            # placeholder-count assert below no matter what. Detect that with the actual
+            # decoded geometry (the annotation image_wh can lie; these leaks reach the
+            # runtime only through such lies) and stop before spending the remaining
+            # fetch/decode/processor work -- and the multi-GB pixel_values -- on media
+            # that only inflates the data worker's memory (job-dyb-q35-xtuner-133).
+            if self.max_length is not None:
+                _, grid_h, grid_w = self._predict_image_grid(image.size[0], image.size[1])
+                # patch_expand_factor 只存在于 HF PIL 后端（本项目走 processor 的
+                # smart_resize 路径，恒等价于 1）；显式保留占位，防止未来切换后端时
+                # 预算口径漂移。
+                expand = getattr(self.image_processor, "patch_expand_factor", 1)
+                running_visual_cells += grid_h * grid_w * expand
+                if running_visual_cells // self.merge_unit > self.max_length:
+                    raise RuntimeError(
+                        f"GLM-5.3-Flash sample's visual spans alone exceed max_length "
+                        f"({running_visual_cells // self.merge_unit} placeholders > {self.max_length}); "
+                        f"aborting before loading the remaining media. data_name: {self.data_name}, "
+                        f"data_id: {data_item.get('id', '')}. Discard this data."
+                    )
             processed_i = self.image_processor(images=[image], return_tensors="pt")
             pixel_values_list.append(processed_i["pixel_values"])
             image_grid_list.append(processed_i["image_grid_thw"])
@@ -492,12 +514,30 @@ class Glm53VLTokenizeFunction(BaseMLLMTokenizeFunction):
         pixel_values_list = []
         grid_list = []
         metadata_list = []
+        running_visual_cells = 0
         for video_file, (width, height), extra in zip(
             self._video_path, self._video_wh_list, self._video_extra_info_list
         ):
             video_path = os.path.join(media_root, video_file)
             num_frames, fps = _video_frame_source(video_file, extra)
             sampled, _ = self._predict_video_grid(num_frames, fps, height, width)
+
+            # Early visual-budget abort, same rationale as the image path: the
+            # frame count can be sampled from metadata, but the real grid comes from
+            # the decoded frames' geometry, so a lying video annotation can pass the
+            # cache stage and only fail the placeholder assert after every frame is
+            # decoded. Abort before the decode, on the predicted grid of the frames
+            # actually sampled (the processor re-derives the same grid below).
+            if self.max_length is not None:
+                grid_t, grid_h, grid_w = self._predict_video_grid(num_frames, fps, height, width)[1]
+                running_visual_cells += grid_t * grid_h * grid_w
+                if running_visual_cells // self.merge_unit > self.max_length:
+                    raise RuntimeError(
+                        f"GLM-5.3-Flash sample's visual spans alone exceed max_length "
+                        f"({running_visual_cells // self.merge_unit} placeholders > {self.max_length}); "
+                        f"aborting before decoding the remaining media. data_name: {self.data_name}, "
+                        f"data_id: {data_item.get('id', '')}. Discard this data."
+                    )
 
             frames = _read_video_frames(video_path, sampled)
             frame_tensor = torch.stack(

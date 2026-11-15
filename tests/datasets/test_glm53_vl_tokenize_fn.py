@@ -481,9 +481,11 @@ class TestGlm53MixedMediaAndTruncation:
         short_fn = Glm53VLTokenizeFnConfig(processor_path=ckpt_path, max_length=20).build(tokenizer, anno_name="test")
         short_fn.state = "cache"
         assert short_fn(_image_item(image_fixture))["num_tokens"] == 0
-        # runtime 仍然拒绝，作为 cache 过滤漏掉时的最后一道防线。
+        # runtime 仍然拒绝，作为 cache 过滤漏掉时的最后一道防线。拒绝现在由视觉预算
+        # 早停先触发（同样丢弃、更早、不再为剩余媒体加载付费）；占位符 assert 保留作
+        # 为几何预测与实算失配时的纵深防御。
         short_fn.state = "runtime"
-        with pytest.raises(AssertionError):
+        with pytest.raises(RuntimeError, match="visual spans alone exceed max_length"):
             short_fn(_image_item(image_fixture))
 
 
@@ -1494,3 +1496,150 @@ class TestGlm53Base64Images:
             else:
                 assert expected == actual, field
         assert packs[0]["seq_ctx"].pixel_values.dtype == torch.bfloat16
+
+
+class TestGlm53VisualBudgetEarlyAbort:
+    # 真实媒体解码/PIL 加载（读盘+图像处理）不在纯 CPU 单测的快路径里，统一按 GPU/NPU
+    # 标记隔离（与 tests/ops/test_hc_post.py 的 @pytest.mark.gpu 惯例一致）。
+    pytestmark = pytest.mark.gpu
+
+    # 视觉预算早停（job-dyb-q35-xtuner-132/-133 的 data worker 内存爆掉的根治杠杆）：
+    # 跨度总占位越过 max_length 的样本本来就会被占位符 assert 丢弃，但那要等全部媒体
+    # 加载+预处理完——元数据 image_wh 说小谎漏过 cache 的 monster 样本因此把 worker 顶到
+    # 44-60GB。早停用真实解码几何在第一张越界图后立即中止，与 assert 丢弃条件严格等价。
+
+    @staticmethod
+    def _two_image_item(paths):
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": {"url": paths[0], "image_wh": [448, 448]}},
+                        {"type": "image", "image": {"url": paths[1], "image_wh": [448, 448]}},
+                        {"type": "text", "text": "hi"},
+                    ],
+                },
+                {"role": "assistant", "content": "ok"},
+            ]
+        }
+
+    def test_early_abort_skips_remaining_media(self, ckpt_path, tokenizer, tmp_path, monkeypatch):
+        paths = []
+        for name in ("budget_a", "budget_b"):
+            p = tmp_path / f"{name}.png"
+            Image.new("RGB", (448, 448), color=(10, 20, 30)).save(p)
+            paths.append(str(p))
+        probe = Glm53VLTokenizeFnConfig(processor_path=ckpt_path).build(tokenizer, anno_name="test")
+        merge = probe.image_processor.merge_size**2
+        _, grid_h, grid_w = probe._predict_image_grid(448, 448)
+        placeholders_one = grid_h * grid_w // merge
+        fn = Glm53VLTokenizeFnConfig(processor_path=ckpt_path, max_length=placeholders_one - 1).build(
+            tokenizer, anno_name="test"
+        )
+        fn.state = "runtime"
+
+        from xtuner.v1.datasets.mllm_tokenize_fn import glm53_vl_tokenize_fn as vl_mod
+
+        real_load = vl_mod.load_image
+        loads = []
+
+        def counting_load(path):
+            loads.append(path)
+            return real_load(path)
+
+        monkeypatch.setattr("xtuner.v1.datasets.mllm_tokenize_fn.glm53_vl_tokenize_fn.load_image", counting_load)
+        with pytest.raises(RuntimeError, match="visual spans alone exceed max_length"):
+            fn(self._two_image_item(paths))
+        assert len(loads) == 1  # 第二张图不再加载：丢弃提前到剩余媒体之前
+
+    def test_fitting_sample_is_kept_intact(self, ckpt_path, tokenizer, tmp_path):
+        # 无误伤：总占位恰好放得下的样本（含 == 边界上方）不触发早停，cache/runtime 双路径
+        # 都完整保留两张图。
+        paths = []
+        for name in ("budget_c", "budget_d"):
+            p = tmp_path / f"{name}.png"
+            Image.new("RGB", (448, 448), color=(40, 50, 60)).save(p)
+            paths.append(str(p))
+        probe = Glm53VLTokenizeFnConfig(processor_path=ckpt_path).build(tokenizer, anno_name="test")
+        merge = probe.image_processor.merge_size**2
+        _, grid_h, grid_w = probe._predict_image_grid(448, 448)
+        placeholders_one = grid_h * grid_w // merge
+        max_length = 2 * placeholders_one + 32  # 两张图 + 文本全部放得下
+        fn = Glm53VLTokenizeFnConfig(processor_path=ckpt_path, max_length=max_length).build(
+            tokenizer, anno_name="test"
+        )
+        item = self._two_image_item(paths)
+        fn.state = "cache"
+        assert fn(item)["num_tokens"] > 0
+        fn.state = "runtime"
+        out = fn(item)
+        assert out["num_imgs"] == [2]
+        assert out["num_tokens"] > 0
+
+
+class TestGlm53VideoBudgetEarlyAbort:
+    pytestmark = pytest.mark.gpu
+
+    def test_video_early_abort_skips_remaining_decode(self, ckpt_path, tokenizer, tmp_path):
+        # video 空间几何可以漏过 cache（真 grid 来自实解码帧而非元数据）：帧数由元数据
+        # 采样，但 grid 高宽来自帧实几何——说谎的视频标注全部解码后才被占位符 assert 丢。
+        # 早停须在第一段视频解码前触发（真实 grid 口径），第二段不再解码。
+        dirs = []
+        for name in ("vbud_a", "vbud_b"):
+            d = tmp_path / name
+            d.mkdir()
+            for i in range(6):
+                Image.fromarray(np.full((1080, 1920, 3), i * 30, dtype=np.uint8)).save(d / f"{i + 1:08d}.jpg")
+            dirs.append(str(d) + "/")
+        probe = Glm53VLTokenizeFnConfig(processor_path=ckpt_path).build(tokenizer, anno_name="test")
+        merge = probe.image_processor.merge_size**2
+        _, (grid_t, grid_h, grid_w) = probe._predict_video_grid(6, 2.0, 1080, 1920)
+        placeholders_one = grid_t * grid_h * grid_w // merge
+        fn = Glm53VLTokenizeFnConfig(processor_path=ckpt_path, max_length=placeholders_one + 2).build(
+            tokenizer, anno_name="test"
+        )
+        fn.state = "runtime"
+        item = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video",
+                            "video": {
+                                "url": dirs[0],
+                                "image_wh": [1920, 1080],
+                                "origin_video_length": 6,
+                                "origin_fps": 2.0,
+                            },
+                        },
+                        {
+                            "type": "video",
+                            "video": {
+                                "url": dirs[1],
+                                "image_wh": [1920, 1080],
+                                "origin_video_length": 6,
+                                "origin_fps": 2.0,
+                            },
+                        },
+                        {"type": "text", "text": "hi"},
+                    ],
+                },
+                {"role": "assistant", "content": "ok"},
+            ]
+        }
+        from xtuner.v1.datasets.mllm_tokenize_fn import glm53_vl_tokenize_fn as vl_mod
+
+        real_read = vl_mod._read_video_frames
+        reads = []
+
+        def counting_read(path, sampled):
+            reads.append(path)
+            return real_read(path, sampled)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("xtuner.v1.datasets.mllm_tokenize_fn.glm53_vl_tokenize_fn._read_video_frames", counting_read)
+            with pytest.raises(RuntimeError, match="visual spans alone exceed max_length"):
+                fn(item)
+        assert len(reads) == 1  # 第二段视频不再解码
