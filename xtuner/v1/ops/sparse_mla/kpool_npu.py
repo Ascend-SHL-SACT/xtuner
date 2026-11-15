@@ -55,6 +55,7 @@ from torch import Tensor
 
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.ops.comm import gather_for_sequence_parallel
+from xtuner.v1.utils import get_torch_device_module
 
 from . import kpool
 from .kpool import _visible_tail_tokens, build_pool_index, build_pools, kpool_output_width
@@ -93,6 +94,17 @@ _CAUSAL_CROP = os.environ.get("XTUNER_KPOOL_CAUSAL_CROP", "1") == "1"
 # with distinct visible tokens inside its causal read span, -1 only beyond it. The default
 # ``0`` keeps the legacy -1-padded layout bit for bit.
 _PACK_VISIBLE_TAIL = os.environ.get("XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL", "0") == "1"
+
+# Indexer score+topk backend. ``triton`` (default) keeps the fused in-house chain
+# (_score_and_topk_batched); ``aclnn_v2`` replaces the whole score/Fill/Less/topk chain
+# with one native CANN ``aclnnLightningIndexerV2`` call per pack (TND, cmp_ratio=kpool,
+# lower causal). Selection sets match the triton chain except for rare topk-boundary
+# 1-for-1 swaps under fp32 summation noise (measured 9/78846 rows, score gap 8e-8~5e-7);
+# slot order may also differ on exact ties. Gate is s1-alignment, not bitwise.
+_INDEXER_BACKEND = os.environ.get("XTUNER_KPOOL_INDEXER_BACKEND", "triton")
+_INDEXER_ACLNN_V2 = _INDEXER_BACKEND == "aclnn_v2"
+_DEVICE_MODULE = get_torch_device_module()
+
 
 
 def _parse_row_chunk(raw: str) -> int:
@@ -438,77 +450,112 @@ def npu_kpool_topk_indices(
         )
 
         max_pools = max(r[3] - r[2] for r in ranges)
-        if _BATCHED_SCORE and lightning_indexer_score_into is not None and q_local.device.type == "npu":
-            if select_k <= max_pools:
-                # Batched scoring: one kernel launch per segment into a whole-call fp32 buffer
-                # and one whole-shard topk -- no per-segment pad / topk / scatter (see
-                # _score_and_topk_batched). The returned ids are document-local column ids
-                # exactly like the legacy slot buffer's; where the legacy path held
-                # ``_SEL_PAD`` these hold real column ids past the row's visible prefix, which
-                # the shared validity test below rejects the same way. The gate is only
-                # ``select_k <= max_pools`` (the *largest* segment): rows whose own visible
-                # prefix is narrower still keep every real column, because visible columns
-                # score above the ``finfo.min`` prefill and every prefill/pad id fails the
-                # prefix test (see the ``select_k`` contract in ``_score_and_topk_batched``).
-                # Do not tighten this to a per-document minimum -- mixed packs would lose the
-                # batched path for no correctness gain.
-                sel_all = _score_and_topk_batched(
-                    q_local,
-                    pool_key,
-                    w_all_f,
-                    ranges,
-                    row_prefix,
-                    prefix_host,
-                    select_k,
-                    index_head_dim,
-                    row_chunk=_SCORE_ROW_CHUNK,
-                ).to(torch.int32)
-                # ``topk`` hands back int64 ids; left as int64 they poison the shared expand
-                # below -- ``tok`` becomes a 2.1 GB int64 buffer and ``masked_fill_`` (no
-                # int64 AICORE kernel on 910C) drops to the AI_CPU at ~40 GB/s, ~56 ms per
-                # call, ~20 s per training step at 128K (run16 step-9 profile). The ids and
-                # ``_SEL_PAD`` (1<<26) are int32-safe by design; the degenerate/legacy
-                # buffers below are already int32, so this keeps every branch on one dtype.
+        sel_all = None
+        if (
+            _INDEXER_ACLNN_V2
+            and q_local.device.type == "npu"
+            and select_k <= 8192
+            and (select_k <= 2048 or select_k % 1024 == 0)
+        ):
+            # Native CANN LightningIndexerV2 backend (XTUNER_KPOOL_INDEXER_BACKEND=aclnn_v2):
+            # one op call replaces the triton score/Fill/Less/topk chain. Gate limits are
+            # conservative op-contract guards (select_k <= 8192; >2048 must be 1024-aligned,
+            # matching the op's TND key tiling), not measured cliffs. Orthogonal to
+            # XTUNER_KPOOL_CAUSAL_CROP: that knob shapes the triton fallback chain only;
+            # the V2 path carries the same causal-visibility idea in its plan geometry.
+            # Covers both the
+            # select_k <= max_pools case and the degenerate below-width case uniformly --
+            # the op -1-pads rows whose visible prefix is below select_k and the helper
+            # rewrites those slots to _SEL_PAD for the shared validity test below.
+            sel_all = _score_and_topk_aclnn_v2(
+                q_local,
+                pool_key,
+                w_all_f,
+                ranges,
+                select_k,
+                index_head_dim,
+                index_kpool,
+                seq_ctx,
+                score_shard_start,
+            )
+        if sel_all is None:
+            if (
+                _BATCHED_SCORE
+                and lightning_indexer_score_into is not None
+                and q_local.device.type == "npu"
+            ):
+                if select_k <= max_pools:
+                    # Batched scoring: one kernel launch per segment into a whole-call fp32 buffer
+                    # and one whole-shard topk -- no per-segment pad / topk / scatter (see
+                    # _score_and_topk_batched). The returned ids are document-local column ids
+                    # exactly like the legacy slot buffer's; where the legacy path held
+                    # ``_SEL_PAD`` these hold real column ids past the row's visible prefix, which
+                    # the shared validity test below rejects the same way. The gate is only
+                    # ``select_k <= max_pools`` (the *largest* segment): rows whose own visible
+                    # prefix is narrower still keep every real column, because visible columns
+                    # score above the ``finfo.min`` prefill and every prefill/pad id fails the
+                    # prefix test (see the ``select_k`` contract in ``_score_and_topk_batched``).
+                    # Do not tighten this to a per-document minimum -- mixed packs would lose the
+                    # batched path for no correctness gain.
+                    sel_all = _score_and_topk_batched(
+                        q_local,
+                        pool_key,
+                        w_all_f,
+                        ranges,
+                        row_prefix,
+                        prefix_host,
+                        select_k,
+                        index_head_dim,
+                        row_chunk=_SCORE_ROW_CHUNK,
+                    ).to(torch.int32)
+                    # ``topk`` hands back int64 ids; left as int64 they poison the shared expand
+                    # below -- ``tok`` becomes a 2.1 GB int64 buffer and ``masked_fill_`` (no
+                    # int64 AICORE kernel on 910C) drops to the AI_CPU at ~40 GB/s, ~56 ms per
+                    # call, ~20 s per training step at 128K (run16 step-9 profile). The ids and
+                    # ``_SEL_PAD`` (1<<26) are int32-safe by design; the degenerate/legacy
+                    # buffers below are already int32, so this keeps every branch on one dtype.
+                else:
+                    # Degenerate workload (every document shorter than ``index_topk`` tokens, e.g.
+                    # SFT over short samples): each row's visible prefix is below ``select_k``, so
+                    # the legacy per-segment ``topk(min(select_k, num_pools))`` returns *every*
+                    # real pool column and leaves the rest at ``_SEL_PAD``. That buffer is exactly
+                    # the column-id arange masked by the row prefix -- scoring, the key pad, the
+                    # per-segment pad/topk chain and the batched score buffer are all dead work
+                    # here, so build it directly. Values, per-slot validity and the slot count the
+                    # downstream expand consumes are identical to the legacy buffer; only the order
+                    # of the surviving ids inside a row differs (column order vs score order),
+                    # which the gather consumer sums over insensitively.
+                    col_ids = torch.arange(select_k, device=device, dtype=torch.int32)
+                    sel_all = torch.where(
+                        col_ids.unsqueeze(0) < row_prefix.unsqueeze(-1), col_ids.unsqueeze(0), _SEL_PAD
+                    )
             else:
-                # Degenerate workload (every document shorter than ``index_topk`` tokens, e.g.
-                # SFT over short samples): each row's visible prefix is below ``select_k``, so
-                # the legacy per-segment ``topk(min(select_k, num_pools))`` returns *every*
-                # real pool column and leaves the rest at ``_SEL_PAD``. That buffer is exactly
-                # the column-id arange masked by the row prefix -- scoring, the key pad, the
-                # per-segment pad/topk chain and the batched score buffer are all dead work
-                # here, so build it directly. Values, per-slot validity and the slot count the
-                # downstream expand consumes are identical to the legacy buffer; only the order
-                # of the surviving ids inside a row differs (column order vs score order),
-                # which the gather consumer sums over insensitively.
-                col_ids = torch.arange(select_k, device=device, dtype=torch.int32)
-                sel_all = torch.where(col_ids.unsqueeze(0) < row_prefix.unsqueeze(-1), col_ids.unsqueeze(0), _SEL_PAD)
-        else:
-            # ``select_k``-wide slot buffer, written per segment (only the first
-            # ``min(select_k, num_pools)`` columns); pad columns hold ``_SEL_PAD``, which is never a
-            # valid pool id, so the batched validity test below rejects them without a per-segment
-            # mask. Everything after the loop -- validity, the arithmetic token expand and the
-            # output write -- is then one broadcast per call instead of one chain per segment.
-            sel_all = torch.full((score_len, select_k), _SEL_PAD, dtype=torch.int32, device=device)
-            p_arange = torch.arange(max_pools, device=device)
-            for row_lo, row_hi, pool_lo, pool_hi, _doc_start in ranges:
-                num_pools = pool_hi - pool_lo
-                # A query sees exactly the complete pools formed before it inside its own
-                # document, i.e. the prefix ``[0, (local_pos + 1) // kpool)`` of the segment's
-                # pool slice -- the pool-space analogue of ``packed_causal_query_ranges``.
-                # ``row_prefix`` is the per-row prefix bound; slicing it (and ``p_arange``)
-                # keeps the per-segment mask down to a single compare.
-                visible = p_arange[:num_pools] < row_prefix[row_lo:row_hi].unsqueeze(-1)
+                # ``select_k``-wide slot buffer, written per segment (only the first
+                # ``min(select_k, num_pools)`` columns); pad columns hold ``_SEL_PAD``, which is never a
+                # valid pool id, so the batched validity test below rejects them without a per-segment
+                # mask. Everything after the loop -- validity, the arithmetic token expand and the
+                # output write -- is then one broadcast per call instead of one chain per segment.
+                sel_all = torch.full((score_len, select_k), _SEL_PAD, dtype=torch.int32, device=device)
+                p_arange = torch.arange(max_pools, device=device)
+                for row_lo, row_hi, pool_lo, pool_hi, _doc_start in ranges:
+                    num_pools = pool_hi - pool_lo
+                    # A query sees exactly the complete pools formed before it inside its own
+                    # document, i.e. the prefix ``[0, (local_pos + 1) // kpool)`` of the segment's
+                    # pool slice -- the pool-space analogue of ``packed_causal_query_ranges``.
+                    # ``row_prefix`` is the per-row prefix bound; slicing it (and ``p_arange``)
+                    # keeps the per-segment mask down to a single compare.
+                    visible = p_arange[:num_pools] < row_prefix[row_lo:row_hi].unsqueeze(-1)
 
-                index_scores = _score_pools(
-                    q_local[row_lo:row_hi],
-                    pool_key[pool_lo:pool_hi],
-                    w_all_f[row_lo:row_hi],
-                    index_head_dim,
-                    query_chunk_size,
-                    visible=visible,
-                )
-                selected = index_scores.topk(min(select_k, num_pools), dim=-1).indices
-                sel_all[row_lo:row_hi, : selected.shape[-1]] = selected
+                    index_scores = _score_pools(
+                        q_local[row_lo:row_hi],
+                        pool_key[pool_lo:pool_hi],
+                        w_all_f[row_lo:row_hi],
+                        index_head_dim,
+                        query_chunk_size,
+                        visible=visible,
+                    )
+                    selected = index_scores.topk(min(select_k, num_pools), dim=-1).indices
+                    sel_all[row_lo:row_hi, : selected.shape[-1]] = selected
 
         if partition is not None:
             # Ship the selected pool ids back to the attention owner; column ids are
@@ -896,6 +943,188 @@ def _score_and_topk_batched(
             row_prefix=row_prefix[row_lo:row_hi] if _CAUSAL_CROP else None,
         )
     return scores_all.topk(k, dim=-1).indices
+
+
+def _score_and_topk_aclnn_v2(
+    q_local: Tensor,
+    pool_key: Tensor,
+    w_all_f: Tensor,
+    ranges: list[tuple[int, int, int, int, int]],
+    select_k: int,
+    index_head_dim: int,
+    index_kpool: int,
+    seq_ctx: SequenceContext,
+    shard_start: int | None,
+) -> Tensor | None:
+    """Score every document segment and select top-k pools with one native
+    CANN ``aclnnLightningIndexerV2`` call, replacing the triton
+    score/Fill/Less/topk chain of :func:`_score_and_topk_batched`.
+
+    Each ``(document, row chunk)`` pair becomes one TND batch item: the item's
+    queries are that row chunk of the document's shard rows and its keys are
+    the complete pools formed up to the chunk's end (``shard_end_doc //
+    kpool`` of them, sliced from the document's pool segment -- the trailing
+    partial pool is never selectable and is dropped here). The op derives
+    ``actS2SizeOrig = cuKDiff * kpool + residual == shard_end_doc`` and its
+    lower-causal per-row visible count
+    ``(actS2SizeOrig - actS1Size + i + 1) / kpool`` -- literally this file's
+    ``row_prefix`` arithmetic (``(doc-local token + 1) // kpool``), including
+    mid-document SP shards: the causal base is the doc-local shard start, so
+    rows see the document's pools from zero, exactly the prefix-extended
+    visibility. Rows whose visible prefix is below ``select_k`` come back
+    ``-1``-padded; those slots are rewritten to ``_SEL_PAD`` so the shared
+    ``sel < row_prefix`` validity test rejects them exactly like the triton
+    chain's output. Selection sets agree with the triton chain
+    (oracle-verified against a fp32 reference); slot order may differ on score
+    ties.
+
+    Args:
+        q_local (Tensor): Query rows ``[S, NH, D]`` bf16, shard-local.
+        pool_key (Tensor): Whole-call pool keys ``[P_total, D]`` bf16.
+        w_all_f (Tensor): Per-head weights ``[S, NH]`` fp32, already
+            ``NH**-0.5``-scaled (the head-dim scale is folded here).
+        ranges (list[tuple[int, int, int, int, int]]): ``(row_lo, row_hi,
+            pool_lo, pool_hi, doc_start)`` per intersecting document, from
+            ``_segment_ranges``.
+        select_k (int): Slot width (``index_topk // index_kpool``).
+        index_head_dim (int): Indexer head dimension (scale only).
+        index_kpool (int): Pool size (the op's ``cmp_ratio``).
+        seq_ctx (SequenceContext): Packed-sequence metadata (doc boundaries).
+        shard_start (int | None): Scoring shard start; ``None`` uses the
+            context's attention shard.
+
+    Returns:
+        Tensor: ``[S, select_k]`` int32 document-local pool ids with ``_SEL_PAD``
+        where the row's visible prefix is below ``select_k``. Raises on failure
+        (missing dependency / op error); the caller's ``sel_all is None`` gate then
+        falls back to the triton paths.
+    """
+    try:
+        from cann_ops_transformer.ops import lightning_indexer as _li_v2
+    except ImportError as e:
+        raise ImportError(
+            "aclnn_v2 backend needs the cached-workspace cann_ops_transformer wrapper; "
+            "put xtuner/package/cot_patched first on PYTHONPATH (see the 320B/16N launch "
+            "scripts)."
+        ) from e
+
+    resolved_shard_start = shard_start if shard_start is not None else int(seq_ctx.shard_start)
+    device = q_local.device
+    head_dim_scale = index_head_dim**-0.5
+
+    w_v2 = (w_all_f * head_dim_scale).contiguous()
+    # One op CALL per (document, row chunk) item -- NOT one batched call for the
+    # whole pack. Two measured facts drive this (runs #97-#102, sweep +
+    # in-training deep samples):
+    #   1. The op's per-call runtime grows superlinearly with the item row count
+    #      (a whole 65536-row item runs 314 ms; the same rows chunked to 2048 run
+    #      4.9 ms -- sweep_v2_item_mem.py).
+    #   2. The op materializes a dense [rows x k_rows] fp32 score buffer across
+    #      the WHOLE call, ignoring TND item boundaries (in-training deep sample:
+    #      a 32K-row call with ~130K k rows peaks at 14.5 GB while retaining only
+    #      61 MB). A batched call therefore pays a rows*sum(k) transient, which
+    #      at VL doc sizes is the +12 GB allocator peak of runs #97/#98.
+    # Per-item calls bound each call's cross product at rows_chunk *
+    # max_pools_item (~268 MB fp32 at 2048 x 33K), the per-item k slice is
+    # already contiguous (a pool_key view -- no cat), and the total device work
+    # is unchanged (sum of rows_i * k_i). Device time stays ~ms-level per call.
+    qt = q_local.contiguous()
+    out_parts: list[Tensor] = []
+    n_since_drain = 0
+    # Dense-prefix exclusion (MindSpeed-MM qsa_indexer pattern): rows whose visible
+    # prefix is at most ``select_k`` select every visible pool, so their slot buffer
+    # is pure arithmetic (column ids below the prefix, ``_SEL_PAD`` above) and they
+    # never reach the op. Doc-local position p is dense iff (p + 1) // kpool <=
+    # select_k, i.e. p <= 4*select_k + 2 -- a prefix of each document's shard rows.
+    # Dense iff (p + 1) // kpool <= select_k for every remaining pool the row still
+    # reads, i.e. p <= kpool*(select_k+1)-1 (equals kpool*select_k+3 at kpool=4; the
+    # +3 form was only exact for kpool=4 and silently dropped the newest pool at
+    # kpool in {1,2}).
+    dense_row_cap = index_kpool * (select_k + 1) - 1
+    col_ids = torch.arange(select_k, device=device, dtype=torch.int32)
+    # Pass 1 (host): enumerate a ROW-ORDERED plan of dense fills and op items, and
+    # every scalar the op needs, so the per-item cu/residual inputs come from
+    # device-side views of ONE batched H2D copy. A torch.tensor(list, device=npu)
+    # per item is a pageable H2D, which SYNCHRONIZES the current stream on
+    # torch_npu -- 3 per item x ~30 kpool calls/step stalled the step behind its
+    # own queue for ~8 s (the run #97/#98/#106 tgs deficit; the op itself is only
+    # ~12 ms per call). The plan is row-ordered because ``out_parts`` is cat'ed in
+    # append order -- a two-pass split that appended all dense fills before all op
+    # outputs scrambled the rows (the 76783-row corruption this replaced).
+    plan: list[tuple] = []  # ("dense", n_dense, d0) | ("item", c_lo, c_hi, pool_lo, floor_pools, residual)
+    cu_q_flat: list[int] = []
+    cu_k_flat: list[int] = []
+    res_flat: list[int] = []
+    for row_lo, row_hi, pool_lo, _pool_hi, doc_start in ranges:
+        d0 = resolved_shard_start + row_lo - doc_start
+        # First shard row of this document whose prefix exceeds select_k.
+        dense_end_doc = min(d0 + (row_hi - row_lo), dense_row_cap)
+        n_dense = max(0, dense_end_doc - d0)
+        if n_dense:
+            plan.append(("dense", n_dense, d0))
+        c_start = max(row_lo, row_lo + (dense_end_doc - d0))
+        for c_lo in range(c_start, row_hi, _SCORE_ROW_CHUNK):
+            c_hi = min(c_lo + _SCORE_ROW_CHUNK, row_hi)
+            chunk_end_doc = d0 + (c_hi - row_lo)
+            floor_pools = chunk_end_doc // index_kpool
+            if floor_pools == 0:
+                plan.append(("neg", c_hi - c_lo, 0))
+                continue
+            plan.append(("item", c_lo, c_hi, pool_lo, floor_pools, chunk_end_doc % index_kpool))
+            cu_q_flat.extend((0, c_hi - c_lo))
+            cu_k_flat.extend((0, floor_pools))
+            res_flat.append(chunk_end_doc % index_kpool)
+    # Pass 2: one H2D per metadata table (three pageable copies per pack -- each
+    # synchronizes the stream once, but at per-pack frequency with a few hundred
+    # bytes each this is noise next to the op itself; batching into one buffer
+    # would complicate the per-item views for no measurable win), then walk the
+    # plan in row order --
+    # dense fills and op calls interleave exactly as the rows do.
+    cu_q_dev = torch.tensor(cu_q_flat, dtype=torch.int32, device=device)
+    cu_k_dev = torch.tensor(cu_k_flat, dtype=torch.int32, device=device)
+    res_dev = torch.tensor(res_flat, dtype=torch.int32, device=device)
+    n_i = 0
+    for step in plan:
+        if step[0] == "dense":
+            _, n_dense, d0 = step
+            dense_prefix = (d0 + torch.arange(n_dense, device=device, dtype=torch.int32) + 1) // index_kpool
+            dense_sel = torch.where(col_ids.unsqueeze(0) < dense_prefix.unsqueeze(-1), col_ids.unsqueeze(0), _SEL_PAD)
+            out_parts.append(dense_sel.unsqueeze(1))
+        elif step[0] == "neg":
+            out_parts.append(torch.full((step[1], 1, select_k), -1, dtype=torch.int32, device=device))
+        else:
+            _, c_lo, c_hi, pool_lo, floor_pools, residual = step
+            # The cu/residual inputs are cloned per item: the op may update its
+            # metadata-ish arguments in place, and items' views alias ONE batched
+            # table -- queued calls would overwrite each other's inputs (the
+            # shared-tensor hazard npu_indexer.py warns about). 12-byte copies.
+            indices, _values = _li_v2(
+                qt[c_lo:c_hi],
+                pool_key[pool_lo : pool_lo + floor_pools].unsqueeze(1),
+                w_v2[c_lo:c_hi],
+                select_k,
+                cu_seqlens_q=cu_q_dev[2 * n_i : 2 * n_i + 2].clone(),
+                cu_seqlens_k=cu_k_dev[2 * n_i : 2 * n_i + 2].clone(),
+                cmp_residual_k=res_dev[n_i : n_i + 1].clone(),
+                layout_q="TND",
+                layout_k="TND",
+                mask_mode=3,
+                cmp_ratio=index_kpool,
+                return_value=0,
+            )
+            out_parts.append(indices)
+            n_i += 1
+            n_since_drain += 1
+            # The wrapper allocates each call's workspace at enqueue time, so the
+            # workspaces of in-flight items are LIVE simultaneously (stream-ordered
+            # frees commit late -- run #104). Drain every few items to cap the live
+            # sum; with the per-item H2D syncs gone this is the only remaining stall.
+            if n_since_drain >= 8:
+                _DEVICE_MODULE.synchronize()
+                n_since_drain = 0
+    sel = torch.cat(out_parts, dim=0).squeeze(1)
+    sel.masked_fill_(sel < 0, _SEL_PAD)
+    return sel
 
 
 def _score_pools(
