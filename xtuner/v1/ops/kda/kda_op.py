@@ -281,7 +281,10 @@ def _padded_pack_maps(
             to a multiple of ``CHUNK_SIZE``); ``real_pos``, mapping each packed
             token to its row in the padded rebuild; ``pad_to_pack``, the inverse
             map used to gather the rebuild (real rows point at their packed
-            source row, pad rows at a sentinel row past the pack end); the
+            source row, pad rows at a sentinel row past the pack end;
+            zero-padded to a ``_SEG_COPY_GATHER_ROWS`` row multiple so the
+            triton gather's tail tiles stay in-bounds -- slice it to
+            ``n_padded`` when one entry per padded row is needed); the
             int32 device tables ``cu_t`` / ``pad_cu_t`` of the kept segments
             (real / padded cumulative starts, zero-length segments dropped)
             that drive the segment-copy repack kernel; and the host-side
@@ -312,7 +315,14 @@ def _padded_pack_maps(
         pad_to_pack.extend(range(start, end))
         pad_to_pack.extend([n_tokens] * (padded_length - length))
     real_pos = _h2d_tensor(pos_of, torch.long, device)
-    gather_pos = _h2d_tensor(pad_to_pack, torch.long, device)
+    # Zero-pad the gather table to a multiple of _SEG_COPY_GATHER_ROWS: the
+    # per-dispatch gather_rows = min(that constant, 32768 // row_bytes) is a
+    # power of two that divides it, so every tail tile stays inside the table
+    # without a per-lane row clamp (which would de-affinize the index load).
+    # Consumers that need exactly one entry per padded row slice
+    # ``gather_pos[:n_padded]`` (the monotone F.pad fallback does).
+    gather_len = ((len(pad_to_pack) + _SEG_COPY_GATHER_ROWS - 1) // _SEG_COPY_GATHER_ROWS) * _SEG_COPY_GATHER_ROWS
+    gather_pos = _h2d_tensor(pad_to_pack + [0] * (gather_len - len(pad_to_pack)), torch.long, device)
     cu_t = _h2d_tensor(cu_real, torch.int32, device)
     pad_cu_t = _h2d_tensor(cu_padded, torch.int32, device)
 
@@ -362,46 +372,37 @@ def _varlen_launch_groups(cu_padded: list[int], heads: int) -> list[tuple[int, i
 
 # Row width that separated the segment copy from the gather for the
 # token-major (BSND) rebuild: below it the gather's launch floor used to win.
-# That premise no longer holds: the run128 profile measured the monotone
-# gather at ~1.5 ms per launch on 2-element rows (GatherV3 stalls on the
-# repeated sentinel index filling every pad row; training packs are ~26% pad
-# rows -- 1088 launches = 1.67 s/step), so narrow rows take the flat gather
-# kernel instead and the CANN index_select survives only as the non-pow2
-# fallback.
+# That premise no longer holds: the monotone CANN gather crawls on 2-element
+# rows (GatherV3 stalls on the repeated sentinel index filling every pad row
+# of a training pack), so narrow rows take the flat gather kernel instead and
+# the CANN index_select survives only as the non-pow2 fallback.
 _SEG_COPY_MIN_ROW_ELEMS = 256
 # Rows per tile for the flat narrow-row gather kernel: the tile is only
 # ROWS x W lanes, so it needs a taller row block than the wide kernels to
 # keep the per-iteration overhead off the critical path (910_93 compiles up
-# to ROWS=2048 here; 1024 measured fastest).
+# to ROWS=2048 here).
 _SEG_COPY_GATHER_ROWS = 1024
 _SEG_COPY_D_BLOCK = 256
 _SEG_COPY_ROWS = 64
 # Byte budget for one compiled tile of the seg-copy/gather kernels: BiShengIR's
 # ConvertLinalgRToBinary fails deterministically whenever a single [ROWS, W]
-# tile exceeds 32768 bytes, independent of dtype, SP geometry or triton flags
-# (0924-box 910_9392 sweep: 32768 B tiles compile and copy bit-exact at
-# [128,128] bf16 / [512,32] bf16 / [2,8192] bf16 / [1024,8] fp32; 65536 B
-# tiles fail at [4,8192] bf16 / [1024,16] fp32). The wide kernel's
-# _SEG_COPY_ROWS x _SEG_COPY_D_BLOCK x 2 B tile sits exactly on the budget,
-# and the gather kernel's fixed 1024-row block only fits bf16 rows up to
-# W=16 -- SP64 shards q/k/v/gate to W=128, whose [1024,128] bf16 tile is
-# 256 KB and aborted every rank of the 320B SP64 job at the first q repack.
-# The dispatches below therefore derive ROWS from this budget instead of
-# assuming the constants fit.
+# tile exceeds 32768 bytes, independent of dtype, SP geometry or triton flags.
+# The wide kernel's _SEG_COPY_ROWS x _SEG_COPY_D_BLOCK x 2 B tile sits exactly
+# on the budget, and the gather kernel's fixed 1024-row block only fits bf16
+# rows up to W=16 -- SP64 shards q/k/v/gate to W=128, whose [1024,128] bf16
+# tile is 256 KB and aborts the job at the first q repack. The dispatches
+# below therefore derive ROWS from this budget instead of assuming the
+# constants fit.
 _SEG_COPY_TILE_BYTES = 32768
 # Persistent-grid cap for the segment-copy kernels. Under
 # TRITON_ALL_BLOCKS_PARALLEL=1 the ascend backend clamps every launch's
-# blockNum to the physical block count (launcher C template; measured on
-# 0924-box: 48 in aiv mode, 24 in aicore mode -- mode depends on the
-# kernel's load/store profile) and rewrites the grid with auto-blockify --
-# blocks past the clamp silently never run (0924-box repro: 25-segment
-# launches lose segment 24, 64-segment launches lose 48+, bitwise-checked
-# against the CPU reference pack; both repros use the HTD (seg, head)
-# geometry -- under the old BSND (seg, tile) grid the first lost work shifts
-# to (seg48, tile0)). The cap below must therefore stay <= 24:
-# it has zero margin against the aicore-mode clamp, and a cache whose
-# binaries were compiled without the flag skips the blockify replay loop
-# entirely (the flag is not part of triton's disk-cache key). The same
+# blockNum to the physical block count (48 in aiv mode, 24 in aicore mode --
+# mode depends on the kernel's load/store profile) and rewrites the grid with
+# auto-blockify -- blocks past the clamp silently never run (strided grid
+# geometries lose the trailing segments/tiles). The cap below must therefore
+# stay <= 24: it has zero margin against the aicore-mode clamp, and a cache
+# whose binaries were compiled without the flag skips the blockify replay
+# loop entirely (the flag is not part of triton's disk-cache key). The same
 # miscompile class hit hc_norm_linear and conv1d bwd; both were fixed by
 # capping the grid and striding the logical blocks inside the kernel, which
 # is also the pattern the 65535-program launch cap already required here.
@@ -440,16 +441,41 @@ def _seg_copy_rows_kernel(
         end = tl.load(cu_ptr + pid_seg + 1)
         pstart = tl.load(pad_cu_ptr + pid_seg)
         pend = tl.load(pad_cu_ptr + pid_seg + 1)
-        for t0 in range(0, tl.cdiv(pend - pstart, ROWS)):
-            rows = t0 * ROWS + tl.arange(0, ROWS)
-            in_seg = rows < (end - start)
-            in_pad = rows < (pend - pstart)
-            for d0 in tl.static_range(0, D, D_BLOCK):
-                d = d0 + tl.arange(0, D_BLOCK)
-                src = src_ptr + (start + rows)[:, None].to(tl.int64) * stride_src + d[None, :]
+        seg_len = end - start
+        n_full = seg_len // ROWS
+        rem = seg_len - n_full * ROWS
+        pad_len = (pend - pstart) - seg_len
+        n_tail = (rem + pad_len + ROWS - 1) // ROWS
+        for d0 in tl.static_range(0, D, D_BLOCK):
+            d = d0 + tl.arange(0, D_BLOCK)
+            rows = tl.arange(0, ROWS)
+            # Full tiles: every lane is a real row, so the load needs no mask
+            # and its addresses stay affine -- the backend keeps the block-copy
+            # lowering. A per-lane ``tl.minimum`` clamp would de-affinize the
+            # whole tile; splitting the bulk full tiles from the boundary keeps
+            # the clamp to the tail tiles.
+            for t0 in range(0, n_full):
+                src = src_ptr + (start + t0 * ROWS + rows)[:, None].to(tl.int64) * stride_src + d[None, :]
+                vals = tl.load(src)
+                dst = dst_ptr + (pstart + t0 * ROWS + rows)[:, None].to(tl.int64) * stride_dst + d[None, :]
+                tl.store(dst, vals)
+            # Tail: the boundary remainder (< ROWS real rows) plus the pad
+            # zero fill. Masked MTE on this backend can
+            # be lowered to unmasked issues, so a masked-off lane's address
+            # still reaches the memory system (same hazard class as the
+            # conv-bwd kernel): the load row stays clamped into the segment's
+            # real range (``rem - 1`` also stays in-bounds when ``rem == 0``,
+            # landing on the segment's last real row). Stores keep raw rows
+            # under the in-span mask -- every stored address is < ``pend`` by
+            # construction.
+            for t1 in range(0, n_tail):
+                rows_t = t1 * ROWS + rows
+                in_seg = rows_t < rem
+                rows_ld = tl.minimum(rows_t, rem - 1)
+                src = src_ptr + (start + n_full * ROWS + rows_ld)[:, None].to(tl.int64) * stride_src + d[None, :]
                 vals = tl.load(src, mask=in_seg[:, None], other=0.0)
-                dst = dst_ptr + (pstart + rows)[:, None].to(tl.int64) * stride_dst + d[None, :]
-                tl.store(dst, vals, mask=in_pad[:, None])
+                dst = dst_ptr + (pstart + n_full * ROWS + rows_t)[:, None].to(tl.int64) * stride_dst + d[None, :]
+                tl.store(dst, vals, mask=(rows_t < rem + pad_len)[:, None])
 
 
 @triton.jit
@@ -468,24 +494,37 @@ def _seg_copy_rows_gather_kernel(
     # load on ``src_idx < n_src`` (``other=0.0``) instead of reading a padded
     # sentinel row, so ``F.pad`` disappears too. The CANN ``index_select``
     # this replaces runs the same shape on the GatherV3 engine, which stalls
-    # on the repeated sentinel index that fills every pad row -- training
-    # packs are ~26% pad rows (run128: ~1.5 ms per launch, 1.67 s/step); this
-    # kernel's per-row vector loads and contiguous stores avoid that engine
-    # (~5x measured). Head-major layouts take one whole-pack permute copy on
-    # top (a dedicated ~24 us CANN transpose), which still beats every
-    # in-kernel transposing-store variant measured on 910_93 (they scalarize
-    # the strided half of the move). The flat grid is capped at
-    # _SEG_COPY_MAX_PROGS with tile indices strided inside the kernel
-    # (TRITON_ALL_BLOCKS_PARALLEL blockify guard, see _SEG_COPY_MAX_PROGS).
+    # on the repeated sentinel index that fills every pad row of a training
+    # pack; this kernel's per-row vector loads and contiguous stores avoid
+    # that engine. Head-major layouts take one whole-pack permute copy on top
+    # (a dedicated CANN transpose), which still beats every in-kernel
+    # transposing-store variant (they scalarize the strided half of the
+    # move). The flat grid is capped at _SEG_COPY_MAX_PROGS with tile indices
+    # strided inside the kernel (TRITON_ALL_BLOCKS_PARALLEL blockify guard,
+    # see _SEG_COPY_MAX_PROGS).
     pid = tl.program_id(0)
     nprogs = tl.num_programs(0)
     for t0 in range(pid, tl.cdiv(n_dst, ROWS), nprogs):
         rows = t0 * ROWS + tl.arange(0, ROWS)
         in_dst = rows < n_dst
+        # Masked MTE on this backend can be lowered to unmasked issues, so a
+        # masked-off lane's address still reaches the memory system (same
+        # hazard class as the conv-bwd kernel). Two exposure points, two
+        # mechanisms: the index table is host-side zero-padded to a 1024-row
+        # multiple, so the tail tile's ``rows`` cannot leave the table and the
+        # load keeps its affine form -- a per-lane ``tl.minimum`` clamp here
+        # would de-affinize the tile. Pad rows still carry the sentinel source
+        # row ``n_src``, one row past the source tensor, so that load row
+        # stays clamped into the tensor -- masked-off lanes read the last real
+        # row and still store 0.0 via ``other``. The store keeps the raw row
+        # -- stores have always masked correctly, and clamping a store would
+        # turn a hypothetical mislower into silent corruption instead of a
+        # loud fault.
         src_idx = tl.load(idx_ptr + rows, mask=in_dst, other=0)
         real = (src_idx < n_src) & in_dst
+        src_idx_ld = tl.minimum(src_idx, n_src - 1)
         cols = tl.arange(0, W)
-        vals = tl.load(src_ptr + src_idx[:, None].to(tl.int64) * W + cols[None, :], mask=real[:, None], other=0.0)
+        vals = tl.load(src_ptr + src_idx_ld[:, None].to(tl.int64) * W + cols[None, :], mask=real[:, None], other=0.0)
         tl.store(dst_ptr + rows[:, None].to(tl.int64) * W + cols[None, :], vals, mask=in_dst[:, None])
 
 
@@ -503,17 +542,17 @@ def _repack_padded(
     segment-copy kernel: one launch whose programs move contiguous segment
     tiles and zero-fill the pad tails, with no data-dependent addressing. The
     CANN gather that path replaces reads the pad rows through a repeated
-    sentinel index, which drops the indexed-gather engine to ~45 GB/s on these
-    shapes; the segment copy sustains ~400 GB/s effective. Narrow rows
-    (g / beta) take the flat row gather kernel over the cached ``pad_to_pack``
-    table: pad rows come from masked loads (``other=0.0``) instead of a padded
-    sentinel row, so no ``F.pad`` runs and the CANN ``index_select`` engine --
-    which stalls on that repeated sentinel filling ~26% of a training pack's
-    rows (run128 profile: ~1.5 ms per launch, 1.67 s/step) -- is out of the
-    loop. Tile row counts derive from the 32768-byte BiShengIR tile budget
-    (``_SEG_COPY_TILE_BYTES``); row widths the budget cannot afford (and
-    non-pow2 widths) keep the monotone ``F.pad + index_select`` gather. All
-    paths reproduce the zero-padded rebuild bit-for-bit.
+    sentinel index, which drops the indexed-gather engine to a fraction of
+    the segment copy's effective bandwidth. Narrow rows (g / beta) take the
+    flat row gather kernel over the cached ``pad_to_pack`` table: pad rows
+    come from masked loads (``other=0.0``) instead of a padded sentinel row,
+    so no ``F.pad`` runs and the CANN ``index_select`` engine -- which
+    stalls on that repeated sentinel filling a large fraction of a training
+    pack's rows -- is out of the loop. Tile row counts derive from the
+    32768-byte BiShengIR tile budget (``_SEG_COPY_TILE_BYTES``); row widths
+    the budget cannot afford (and non-pow2 widths) keep the monotone
+    ``F.pad + index_select`` gather. All paths reproduce the zero-padded
+    rebuild bit-for-bit.
     """
     row_elems = tensor.numel() // tensor.shape[1]
     row_bytes = row_elems * tensor.element_size()
@@ -565,7 +604,7 @@ def _repack_padded(
         packed = packed.reshape((1, n_padded, *tensor.shape[2:]))
     else:
         pad_spec = (0, 0, 0, 1) if tensor.dim() == 3 else (0, 0, 0, 0, 0, 1)
-        packed = F.pad(tensor, pad_spec).index_select(1, pad_to_pack)
+        packed = F.pad(tensor, pad_spec).index_select(1, pad_to_pack[:n_padded])
     return packed
 
 

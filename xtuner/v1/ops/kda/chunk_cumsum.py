@@ -27,17 +27,30 @@ def _chunk_cumsum_kernel(
         chunk = tl.load(chunk_indices + 2 * chunk + 1).to(tl.int32)
         start = tl.load(cu_seqlens + document).to(tl.int32)
         stop = tl.load(cu_seqlens + document + 1).to(tl.int32)
+        row0 = start + chunk * BT
+        n_rows = stop
+        g_base = g + head * K
+        o_base = output + head * K
     else:
-        start = batch_head // H * T
-        stop = start + T
-    token = start + chunk * BT + tl.arange(0, BT)
-    feature = feature_block * BK + tl.arange(0, BK)
-    offsets = (token[:, None] * H + head) * K + feature[None, :]
-    valid = (token[:, None] < stop) & (feature[None, :] < K)
-    values = tl.load(g + offsets, mask=valid, other=0).to(tl.float32)
+        row0 = chunk * BT
+        n_rows = T
+        g_base = g + (batch_head // H) * (T * H * K) + head * K
+        o_base = output + (batch_head // H) * (T * H * K) + head * K
+    # The tile moves through make_block_ptr with boundary_check over the
+    # (n_rows, K) window -- exactly the explicit mask this kernel used to
+    # build (token < stop, feature < K): out-of-bounds lanes read zero via
+    # padding_option and never store, so the tail chunk's token overshoot
+    # (up to BT-1 rows past ``stop``) and the last feature block's overshoot
+    # (up to BK-1 columns past ``K``) can never leave the tensor. Per-lane
+    # clamps on the flat offsets de-affinize per-lane address arithmetic on
+    # this backend; the block-pointer idiom -- the same one the SP kernels
+    # already run -- keeps the unclamped speed.
+    p_g = tl.make_block_ptr(g_base, (n_rows, K), (H * K, 1), (row0, feature_block * BK), (BT, BK), (1, 0))
+    values = tl.load(p_g, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
     # Scan before scaling, as in FLA. Changing this order changes rounding.
     prefix = tl.cumsum(values, axis=0) * SCALE
-    tl.store(output + offsets, prefix, mask=valid)
+    p_o = tl.make_block_ptr(o_base, (n_rows, K), (H * K, 1), (row0, feature_block * BK), (BT, BK), (1, 0))
+    tl.store(p_o, prefix, boundary_check=(0, 1))
 
 
 def chunk_cumsum(
