@@ -308,8 +308,13 @@ def _conv_bwd_eager(
 
 
 if _TRITON_IMPORT_OK:
-
-    @triton.jit
+    # ``do_not_specialize`` on T: the packed row length varies per step, and
+    # div-16 specialization would otherwise compile one extra binary per
+    # (ACT, HAS_SEG, ...) cell -- the startup probes exercise only the ACT=1
+    # cell (T=70), so the other cells would compile unprobed binaries on
+    # first use. One unspecialized binary = the probed binary = the production
+    # binary.
+    @triton.jit(do_not_specialize=["T"])
     def _conv_bwd_kernel(
         x_ptr,
         pre_ptr,
@@ -325,20 +330,27 @@ if _TRITON_IMPORT_OK:
         HAS_SEG: tl.constexpr,
         BT: tl.constexpr,
         BC: tl.constexpr,
+        ABP: tl.constexpr,
     ):
         # Persistent grid: one program strides over the [BT, BC] tiles instead
         # of the 2D (t_tiles, c_tiles) grid -- at 64K tokens the 2D grid hosts
         # thousands of programs, the TRITON_ALL_BLOCKS_PARALLEL blockify-replay
-        # transform kicks in (blockNum clamped to the 25/50 physical cores) and
+        # transform kicks in (blockNum clamped to the physical cores: 48 aiv /
+        # 24 aicore) and
         # deterministically miscompiles this kernel in multi-rank training
-        # (grad_norm nan, 0924-box repro; TRITON=0 / conv-bwd=eager healthy).
-        # Same failure mode, same guard as hc_norm_linear's persistent grid.
+        # (grad_norm nan; TRITON=0 / conv-bwd=eager healthy). Same failure
+        # mode, same guard as hc_norm_linear's persistent grid.
         # The per-tile body is unchanged and pdw rows keep the logical tile
         # index, so the host-side sum(0) reduces the identical per-tile fp32
         # partials in the identical order -- dw stays bitwise the same.
         # Tile budget: BT*BC must stay <= 4096 elements -- 8192 (64x128) fails
         # BiShengIR compilation once ACT + segment masks + per-tap reductions
         # coexist (resource limit, probe-verified); 32x128 is the bench optimum.
+        # ABP mirrors TRITON_ALL_BLOCKS_PARALLEL into the cache key: the flag
+        # drives compile-time transforms but is invisible to the on-disk cache,
+        # so a binary compiled under one value gets silently reused under the
+        # other and can crash on the mismatched lowering; the kernel body never
+        # reads ABP.
         pid = tl.program_id(0)
         nprogs = tl.num_programs(0)
         n_c_tiles = C // BC
@@ -351,7 +363,17 @@ if _TRITON_IMPORT_OK:
             t_mask = t_off < T
             c_mask = c_off < C
             m2 = t_mask[:, None] & c_mask[None, :]
-            t64 = t_off[:, None].to(tl.int64) * C
+            # Masked MTE on this backend can be lowered to unmasked issues, so a
+            # masked-off lane's address still reaches the memory system and can
+            # fault with "MTE DDR address out of range" even though every
+            # source-level mask is in place. Clamp every LOAD row index into
+            # [0, T): masked-off lanes then read in-bounds values that the mask
+            # discards, and no load address can leave the tensor. The dx store
+            # below keeps the raw index -- stores have always masked correctly,
+            # and clamping a store would turn a hypothetical mislower into
+            # silent data corruption instead of a loud fault.
+            t_safe = tl.minimum(t_off, T - 1)
+            t64 = t_safe[:, None].to(tl.int64) * C
 
             x = tl.load(x_ptr + t64 + c_off[None, :], mask=m2, other=0.0).to(tl.float32)
             dy = tl.load(dy_ptr + t64 + c_off[None, :], mask=m2, other=0.0).to(tl.float32)
@@ -364,27 +386,29 @@ if _TRITON_IMPORT_OK:
             w0 = tl.load(w_ptr + c_off, mask=c_mask, other=0.0).to(tl.float32)
             dx = dsilu * w0[None, :]
             # Per-tap dw partials reduce the [BT, BC] product along t. The direct
-            # axis=0 reduction compiles on the current BiShengIR (probe-verified,
-            # 2026-10-08) and is ~22-25% faster per call than the prior
-            # ``tl.trans`` + ``axis=1`` workaround, which had been needed when the
-            # 4096-element tile exhausted the older compiler's reduction resource.
-            # dx is bitwise identical to the trans form; dw differs by at most one
-            # bf16 ULP (fp32 reduction-tree change) -- within the kernel's existing
-            # approved precision exception versus the eager bf16 column sums.
+            # axis=0 reduction compiles on the current BiShengIR (covered by the
+            # startup probe) and is faster per call than the prior ``tl.trans`` +
+            # ``axis=1`` workaround, which had been needed when the 4096-element
+            # tile exhausted the older compiler's reduction resource. dx is
+            # bitwise identical to the trans form; dw differs by at most one
+            # bf16 ULP (fp32 reduction-tree change) -- within the kernel's
+            # existing approved precision exception versus the eager bf16 column
+            # sums.
             tl.store(pdw_ptr + (pid_t * W).to(tl.int64) * C + c_off, tl.sum(x * dsilu, axis=0), mask=c_mask)
             if HAS_SEG:
-                seg_t = tl.load(seg_ptr + t_off, mask=t_mask, other=-1)
+                seg_t = tl.load(seg_ptr + t_safe, mask=t_mask, other=-1)
             for k in tl.static_range(1, W):
                 tk = t_off + k
                 vk = tk < T
+                tk_safe = tl.minimum(tk, T - 1)
                 if HAS_SEG:
-                    seg_k = tl.load(seg_ptr + tk, mask=vk, other=-2)
+                    seg_k = tl.load(seg_ptr + tk_safe, mask=vk, other=-2)
                     vk = vk & (seg_k == seg_t)
                 mk = vk[:, None] & c_mask[None, :]
-                dyk = tl.load(dy_ptr + (tk[:, None].to(tl.int64) * C) + c_off[None, :], mask=mk, other=0.0).to(
+                dyk = tl.load(dy_ptr + (tk_safe[:, None].to(tl.int64) * C) + c_off[None, :], mask=mk, other=0.0).to(
                     tl.float32
                 )
-                prek = tl.load(pre_ptr + (tk[:, None].to(tl.int64) * C) + c_off[None, :], mask=mk, other=0.0)
+                prek = tl.load(pre_ptr + (tk_safe[:, None].to(tl.int64) * C) + c_off[None, :], mask=mk, other=0.0)
                 if ACT:
                     sigk = 1.0 / (1.0 + tl.exp(-prek.to(tl.float32)))
                     dsk = dyk * sigk * (1.0 + prek.to(tl.float32) * (1.0 - sigk))
@@ -393,7 +417,9 @@ if _TRITON_IMPORT_OK:
                 wk = tl.load(w_ptr + k * C + c_off, mask=c_mask, other=0.0).to(tl.float32)
                 dx += dsk * wk[None, :]
                 tl.store(pdw_ptr + (pid_t * W + k).to(tl.int64) * C + c_off, tl.sum(x * dsk, axis=0), mask=c_mask)
-            tl.store(dx_ptr + t64 + c_off[None, :], dx.to(dx_ptr.dtype.element_ty), mask=m2)
+            tl.store(
+                dx_ptr + t_off[:, None].to(tl.int64) * C + c_off[None, :], dx.to(dx_ptr.dtype.element_ty), mask=m2
+            )
 
 
 _CONV_BT = 32  # BT*BC <= 4096: 64x128 exceeds the BiShengIR tile resource limit (see kernel comment)
@@ -410,6 +436,13 @@ _CONV_BC = 128
 # future backend ever compiles the kernel aicore-mode.
 _CONV_BWD_MAX_PROGS = 48
 _CONV_BWD_MAX_PROGS_FALLBACK = 24
+
+# TRITON_ALL_BLOCKS_PARALLEL changes compile-time transforms on this backend but
+# is invisible to the triton on-disk cache key, so a binary compiled under one
+# value gets silently reused under the other. Passed to every launch as the ABP
+# constexpr (never read by the kernel body) so each flag value owns its cache
+# entries; see the kernel comment block.
+_ALL_BLOCKS_PARALLEL: bool = os.getenv("TRITON_ALL_BLOCKS_PARALLEL", "0").lower() in ("1", "true")
 
 # seg_id is a pure function of the per-sequence lengths, and the same lengths recur on every
 # backward call of a micro-batch -- rebuilding it per call cost 3 device ops (arange, H2D
@@ -496,6 +529,7 @@ def _conv_bwd_triton(
         HAS_SEG=seg_id is not None,
         BT=_CONV_BT,
         BC=_CONV_BC,
+        ABP=_ALL_BLOCKS_PARALLEL,
         num_warps=4,
     )
     dw = partial.sum(0).to(x2d.dtype)
@@ -549,13 +583,14 @@ def _conv_bwd_probe_max_progs(device: torch.device, has_seg: bool) -> int:
         HAS_SEG=has_seg,
         BT=_CONV_BT,
         BC=_CONV_BC,
+        ABP=_ALL_BLOCKS_PARALLEL,
         num_warps=4,
     )
     return _CONV_BWD_MAX_PROGS if not bool(torch.isnan(dx).any().item()) else _CONV_BWD_MAX_PROGS_FALLBACK
 
 
 def _conv_bwd_triton_available(device: torch.device) -> bool:
-    """Lazy one-shot probe of the triton backward (compile + small launch + cap check)."""
+    """Lazy one-shot probe of the triton backward (compile + small launch + numeric check + cap check)."""
     if not _TRITON_STATE["probed"]:
         _TRITON_STATE["probed"] = True
         if not _TRITON_IMPORT_OK:
@@ -565,7 +600,31 @@ def _conv_bwd_triton_available(device: torch.device) -> bool:
             w = torch.randn(4, 256, dtype=torch.bfloat16, device=device)
             y = torch.randn(1, 70, 256, dtype=torch.bfloat16, device=device)
             out = _conv_bwd_triton(x, y, w, y, [0, 31, 31, 70], activation=1)
-            _TRITON_STATE["ok"] = out is not None and out[0].shape == x.shape and out[1].shape == w.shape
+            if out is None or out[0].shape != x.shape or out[1].shape != w.shape:
+                _TRITON_STATE["ok"] = False
+            else:
+                # A shape-only probe can pass a binary that later dies on
+                # production data, so also run the eager reference and force
+                # a device sync here: NaN / wrong-output classes fail the
+                # numeric check at the probe, and launch-time errors raise at
+                # the sync instead of surfacing mid-training. (The hard
+                # MTE-OOB abort class is device-level and not catchable; the
+                # load clamp in the kernel is what removes that class.)
+                ref = _conv_bwd_eager(x, y, w, y, [0, 31, 31, 70], activation=1)
+                sync = getattr(torch, device.type, None)
+                if sync is not None and hasattr(sync, "synchronize"):
+                    sync.synchronize()
+                if ref is None:
+                    _TRITON_STATE["ok"] = False
+                else:
+                    _TRITON_STATE["ok"] = bool(
+                        torch.isfinite(out[0]).all().item()
+                        and torch.isfinite(out[1]).all().item()
+                        and torch.allclose(out[0].float(), ref[0].float(), atol=5e-2, rtol=5e-2)
+                        and torch.allclose(out[1].float(), ref[1].float(), atol=5e-2, rtol=5e-2)
+                    )
+                if not _TRITON_STATE["ok"]:
+                    print("[glm53] conv-bwd triton probe numeric mismatch; eager fallback", flush=True)
             if _TRITON_STATE["ok"]:
                 # Resolve the persistent-grid cap on the exact constexpr binaries
                 # production launches (single- and multi-segment); the backend
