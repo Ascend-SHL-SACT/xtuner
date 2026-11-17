@@ -457,7 +457,23 @@ def _parse_sfa_grad_row_chunk(raw: str) -> int:
 # chunk's causal extent so the kernel's per-segment causal mask reproduces the unchunked geometry exactly
 # (measured bitwise-equal dq/dq_rope, reassociation-only dk/dv/dk_rope; see
 # :class:`_SpTndSparseMlaChunkedGradFn`). ``0`` restores the stock single-call backward bit for bit.
+#
 _SFA_GRAD_ROW_CHUNK = _parse_sfa_grad_row_chunk(os.environ.get("XTUNER_SFA_GRAD_ROW_CHUNK", "0"))
+# Clamp sub-floor chunk bounds: tiny values collapse the chunked backward into a
+# per-row python loop (one kernel launch per query row). 512 rows keeps the
+# per-call transient at ~0.1 GiB.
+_SFA_GRAD_CHUNK_FLOOR = 512
+if 0 < _SFA_GRAD_ROW_CHUNK < _SFA_GRAD_CHUNK_FLOOR:
+    try:
+        from xtuner.v1.utils.logger import log_rank0
+
+        log_rank0.warning(
+            f"XTUNER_SFA_GRAD_ROW_CHUNK={_SFA_GRAD_ROW_CHUNK} clamped to {_SFA_GRAD_CHUNK_FLOOR} "
+            "(sub-floor values collapse the chunked backward into a per-row python loop)."
+        )
+    except Exception:
+        pass
+    _SFA_GRAD_ROW_CHUNK = _SFA_GRAD_CHUNK_FLOOR
 
 # KV-slice length under which the SP>1 offload path keeps every tensor on device instead of
 # round-tripping pinned CPU copies. The chunked grad's workspace request at those spans is
@@ -928,14 +944,17 @@ def _sfa_grad_chunked(
             return v.to(device, non_blocking=True)
         return v.contiguous()
 
-    dq = torch.empty_like(query_tnd, device=device)
-    dq_rope = torch.empty_like(query_rope_tnd, device=device)
-    dk = torch.zeros(kv_len, key_tnd.shape[1], key_tnd.shape[2], dtype=query_tnd.dtype, device=device)
-    dv = torch.zeros_like(dk)
-    dk_rope = torch.zeros(kv_len, key_rope_tnd.shape[1], key_rope_tnd.shape[2], dtype=query_tnd.dtype, device=device)
-
-    smax_3d = smax.dim() == 3
-    for r0 in range(0, seq_len, row_chunk):
+    # Precompute every chunk's cu tables up front (one H2D) instead of rebuilding
+    # them per chunk (two stream syncs each).
+    n_chunks = max(1, -(-seq_len // row_chunk))
+    q_lo_l = [0] * n_chunks
+    q_hi_l = [0] * n_chunks
+    kv_lo_l = [0] * n_chunks
+    kv_total_l = [0] * n_chunks
+    qlen_rows = []
+    kvlen_rows = []
+    for c in range(n_chunks):
+        r0 = c * row_chunk
         r1 = min(r0 + row_chunk, seq_len)
         first = next(s for s in range(n_seg) if q_bounds[s + 1] > r0)
         last = n_seg - 1
@@ -943,10 +962,7 @@ def _sfa_grad_chunked(
             last -= 1
         q_lo = max(q_bounds[first], r0)
         q_hi = min(q_bounds[last + 1], r1)
-        row_sl = slice(q_lo, q_hi)
-        # End-clip each touched segment's KV span at the chunk's last row's causal extent; interior segments
-        # clamp back to their full span, so the touched spans stay one contiguous KV range.
-        kv_ends: list[int] = []
+        kv_ends = []
         for s in range(first, last + 1):
             shift_s = (k_bounds[s + 1] - k_bounds[s]) - (q_bounds[s + 1] - q_bounds[s])
             kv_ends.append((min(q_bounds[s + 1], r1) - q_bounds[s] - 1) + shift_s + 1)
@@ -958,6 +974,41 @@ def _sfa_grad_chunked(
             running += end_s
             k_cum.append(running)
         k_cum.extend([kv_total] * (n_seg - last - 1))
+        q_lo_l[c] = q_lo
+        q_hi_l[c] = q_hi
+        kv_lo_l[c] = kv_lo
+        kv_total_l[c] = kv_total
+        qlen_rows.append([min(max(b - q_lo, 0), q_hi - q_lo) for b in q_bounds])
+        kvlen_rows.append(k_cum)
+    qlen_table = torch.tensor(qlen_rows, dtype=torch.int32, device=device)
+    kvlen_table = torch.tensor(kvlen_rows, dtype=torch.int32, device=device)
+
+    if seq_len == 0:
+        # Degenerate empty pack: return zero grads like the stock loop's
+        # zero-iteration behavior (n_chunks would otherwise clamp to 1 and crash
+        # on the segment lookup).
+        return (
+            torch.empty_like(query_tnd, device=device),
+            torch.zeros(kv_len, key_tnd.shape[1], key_tnd.shape[2], dtype=query_tnd.dtype, device=device),
+            torch.zeros(kv_len, key_tnd.shape[1], key_tnd.shape[2], dtype=query_tnd.dtype, device=device),
+            torch.empty_like(query_rope_tnd, device=device),
+            torch.zeros(kv_len, key_rope_tnd.shape[1], key_rope_tnd.shape[2], dtype=query_tnd.dtype, device=device),
+        )
+    dq = torch.empty_like(query_tnd, device=device)
+    dq_rope = torch.empty_like(query_rope_tnd, device=device)
+    dk = torch.zeros(kv_len, key_tnd.shape[1], key_tnd.shape[2], dtype=query_tnd.dtype, device=device)
+    dv = torch.zeros_like(dk)
+    dk_rope = torch.zeros(kv_len, key_rope_tnd.shape[1], key_rope_tnd.shape[2], dtype=query_tnd.dtype, device=device)
+
+    smax_3d = smax.dim() == 3
+    for c in range(n_chunks):
+        q_lo = q_lo_l[c]
+        q_hi = q_hi_l[c]
+        kv_lo = kv_lo_l[c]
+        kv_total = kv_total_l[c]
+        seq_qlen = qlen_table[c]
+        seq_kvlen = kvlen_table[c]
+        row_sl = slice(q_lo, q_hi)
         dq_c, dk_c, dv_c, dqr_c, dkr_c = torch_npu.npu_sparse_flash_attention_grad(
             _fetch(query_tnd, row_sl),
             key_tnd[kv_lo : kv_lo + kv_total],
@@ -971,10 +1022,8 @@ def _sfa_grad_chunked(
             1,  # sparse_block_size
             query_rope=_fetch(query_rope_tnd, row_sl),
             key_rope=key_rope_tnd[kv_lo : kv_lo + kv_total],
-            actual_seq_qlen=torch.tensor(
-                [min(max(b - q_lo, 0), q_hi - q_lo) for b in q_bounds], dtype=torch.int32, device=device
-            ),
-            actual_seq_kvlen=torch.tensor(k_cum, dtype=torch.int32, device=device),
+            actual_seq_qlen=seq_qlen,
+            actual_seq_kvlen=seq_kvlen,
             layout="TND",
             sparse_mode=3,
             attention_mode=2,
