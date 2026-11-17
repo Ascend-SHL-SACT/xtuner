@@ -39,12 +39,12 @@ points. Components:
   -- eager chain = 2 Cast + Transpose + broadcast Mul + batched MatMul (K=HC) +
   Add, materialising two ``[T, HC, D]`` intermediates. The kernel replicates
   the three bf16 rounding points (mul result, matmul result, final add) and
-  the K=HC sequential accumulation order; token-tiled vectorised loads make it
-  1.43x the eager fwd+bwd pair at the training shape (910C bench).
+  the K=HC sequential accumulation order; token-tiled vectorised loads keep it
+  well ahead of the eager fwd+bwd pair at training shapes.
 - **Collapse** (:func:`hc_collapse`): the ``hc_pre`` readout tail
   ``collapsed[t, d] = sum_k pre[t, k] * streams[t, k, d]`` -- eager chain =
   broadcast Mul + Sum(dim=2); fp32 accumulation throughout, rounding only the
-  final result (1.4x the eager chain, 910C device bench).
+  final result.
 - **Matmul-form hc_post** (:func:`_hc_post_eager_matmul`): the eager
   ``hc_post`` fallback in the pre-merge implementation's batched-matmul form.
 
@@ -152,8 +152,37 @@ MHC_NORM_LINEAR_SPLIT = os.environ.get("XTUNER_MHC_NORM_LINEAR_SPLIT", "1") != "
 MHC_NORM_LINEAR_BWD_SPLIT = os.environ.get("XTUNER_MHC_NORM_LINEAR_BWD_SPLIT", "1") != "0"
 MHC_SINKHORN_FUSED = os.environ.get("XTUNER_MHC_SINKHORN_FUSED", "1") != "0"
 HC_COMBINE_FUSED = os.environ.get("XTUNER_HC_COMBINE_FUSED", "1") != "0"
+# Native cann_ops_transformer.mhc_post replacement for the triton hc_combine
+# (XTUNER_HC_COMBINE_NATIVE=1). The native op consumes the fp32 sinkhorn mixes
+# without re-rounding, so its numerics match the triton kernel's default fp32
+# mode end to end. Falls back to the triton path when the wrapper package is
+# absent or the op rejects the inputs.
+HC_COMBINE_NATIVE = os.environ.get("XTUNER_HC_COMBINE_NATIVE", "0") == "1"
+try:
+    # The wrapper's eager entry (`ops.mhc.mhc_post.mhc_post`) routes to
+    # MhcPostFunction.apply when any input requires grad, else to the raw op -- the
+    # correct binding either way (the raw torch.ops packet has no backward formula
+    # and would silently drop every grad).
+    from cann_ops_transformer.ops.mhc.mhc_post import mhc_post as _COT_MHC_POST
+except Exception:  # ImportError or lazy-binding failure: triton path stays default
+    _COT_MHC_POST = None
 HC_COLLAPSE_FUSED = os.environ.get("XTUNER_HC_COLLAPSE_FUSED", "1") != "0"
 HC_POST_FUSED = os.environ.get("XTUNER_HC_POST_FUSED", "1") != "0"
+# Precision mode of the triton hc_combine kernels (independent of which backend runs).
+# ``1`` (default): post/comb stay fp32 from load through every fwd/bwd product and the
+# fp32 d_post/d_comb stores -- the sinkhorn mixes are produced fp32 and the native
+# cann_ops mhc_post consumes them fp32 end to end, so this mode aligns the triton
+# numerics with native: the bf16 re-rounding of comb/post is the only difference
+# between the two modes, and un-rounding comb's backward removes the bf16 damage
+# that re-enters the sinkhorn mixes and shows up as grad_norm instability.
+# ``0`` restores the HEAD-bitwise eager-replica rounding:
+# bf16-grid re-rounding of the comb/post loads, bf16-rounded fwd/bwd products, and the
+# bf16 round-trip forced on the fp32 d_post/d_comb accumulator stores.
+HC_COMBINE_TRITON_FP32 = os.environ.get("XTUNER_HC_COMBINE_TRITON_FP32", "1") == "1"
+# Native-path bookkeeping: one-shot engagement print and a latch so a single op-side
+# rejection falls back to triton permanently for this process (the exception text is
+# logged at latch time; nothing is swallowed silently).
+_NATIVE_STATE: dict[str, bool] = {"engaged": False, "latched": False}
 
 
 # ---------------------------------------------------------------------------
@@ -742,8 +771,8 @@ class _MhcNormLinearFn(torch.autograd.Function):
                 # Pass-2 width adaptivity across triton-ascend versions. 512 is
                 # ~27% faster on pass 2 but needs ~384KB UB under 3.6.0
                 # (bishengir auto-multi-buffer doubles the live 64x512 fp32 g/xv
-                # buffers) and fails to compile on the CANN 9.2.1 image (run #87,
-                # Ub overflow 3148800 vs 1572864 bits); 128 matches the split
+                # buffers) and fails to compile on the CANN 9.2.1 image (BiShengIR
+                # Ub overflow: 3148800 vs 1572864 bits); 128 matches the split
                 # path's proven footprint. Pass 2 only recomputes g and stores
                 # elementwise, so its width is bit-free (see _mhc_dx_kernel
                 # comment) -- try 512 first, pin 128 only after a compile failure.
@@ -1579,6 +1608,49 @@ def _bf16_round(x):
 
 
 @triton.jit
+def _cld(v, FP32_MATH: tl.constexpr):
+    """Combine-kernel load-cast for post/comb.
+
+    fp32 mode (default): keep the fp32 value untouched -- the sinkhorn mixes are
+    produced and stored fp32, and the native cann_ops mhc_post consumes them
+    fp32 end to end. HEAD mode: re-round to the bf16 grid after the load,
+    replicating the eager chain's ``comb.to(dtype)`` bitwise.
+    """
+    v = v.to(tl.float32)
+    if not FP32_MATH:
+        v = _bf16_round(v)
+    return v
+
+
+@triton.jit
+def _cmul(a, b, FP32_MATH: tl.constexpr):
+    """Combine-kernel product: fp32 in fp32 mode; HEAD mode rounds the product
+    to the bf16 grid (eager bf16-typed mul materialization)."""
+    if FP32_MATH:
+        return a * b
+    return _bf16_round(a * b)
+
+
+@triton.jit
+def _cmac4(a0, b0, a1, b1, a2, b2, a3, b3, FP32_MATH: tl.constexpr):
+    """Combine-kernel 4-term dot: fp32 accumulate in fp32 mode; HEAD mode
+    rounds the sum once (eager bf16-typed matmul materialization)."""
+    v = a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3
+    if not FP32_MATH:
+        v = _bf16_round(v)
+    return v
+
+
+@triton.jit
+def _cst_fp32(v, FP32_MATH: tl.constexpr):
+    """Store-cast for the fp32 d_post/d_comb accumulators: direct in fp32 mode;
+    HEAD mode forces the eager chain's bf16 round-trip first."""
+    if not FP32_MATH:
+        v = v.to(tl.bfloat16)
+    return v
+
+
+@triton.jit
 def _hc_combine_fwd_kernel(
     post_ptr,
     comb_ptr,
@@ -1593,46 +1665,49 @@ def _hc_combine_fwd_kernel(
     HC: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FP32_MATH: tl.constexpr,
 ):
     # Token-tiled (BLOCK_T rows) rewrite of the original per-token kernel: the
     # 20 per-token scalar loads (post[4] + comb[4x4]) become ~2.8 vector loads
-    # per token and the grid covers all aiv blocks -- 2.2x the eager fwd and
-    # 4.2x the per-token kernel at the training shape (910C spike, fwd+bwd pair
-    # 4.23 -> 2.96 ms). Static-unrolled over HC with plain 2D tiles only
-    # (BiShengIR rejects the 4D broadcast product). The eager bf16 rounding
-    # points are replicated bitwise: mul and matmul results keep the manual
-    # _bf16_round -- BiShengIR promotes bf16 arithmetic to fp32 without
-    # intermediate rounding, so a bf16-typed mul does NOT reproduce the eager
-    # mul cast (bitwise-tested, 1-ulp drift) -- while the final add is rounded
-    # by the bf16 store cast itself (RTNE of the already-rounded add), dropping
-    # one of the three round ops per output element.
+    # per token and the grid covers all aiv blocks. Static-unrolled over HC
+    # with plain 2D tiles only
+    # (BiShengIR rejects the 4D broadcast product). Rounding is selected by
+    # FP32_MATH: the default fp32 mode computes post/comb and every mul/matmul
+    # in fp32 and rounds once at the bf16 store (native mhc_post-aligned), while
+    # HEAD mode (FP32_MATH=0) replicates the eager bf16 rounding points bitwise
+    # via the _c* helpers: mul and matmul results keep the manual _bf16_round --
+    # BiShengIR promotes bf16 arithmetic to fp32 without intermediate rounding,
+    # so a bf16-typed mul does NOT reproduce the eager mul cast (bitwise-tested,
+    # 1-ulp drift) -- while the final add is rounded by the bf16 store cast
+    # itself (RTNE of the already-rounded add), dropping one of the three round
+    # ops per output element.
     pid = tl.program_id(0)
     nprogs = tl.num_programs(0)
     for blk in range(pid, tl.cdiv(T, BLOCK_T), nprogs):
         t_off = (blk * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
         t_mask = t_off < T
         pb = post_ptr + t_off * POST_ST_T
-        p0 = _bf16_round(tl.load(pb + 0, mask=t_mask, other=0.0).to(tl.float32))
-        p1 = _bf16_round(tl.load(pb + 1, mask=t_mask, other=0.0).to(tl.float32))
-        p2 = _bf16_round(tl.load(pb + 2, mask=t_mask, other=0.0).to(tl.float32))
-        p3 = _bf16_round(tl.load(pb + 3, mask=t_mask, other=0.0).to(tl.float32))
+        p0 = _cld(tl.load(pb + 0, mask=t_mask, other=0.0), FP32_MATH)
+        p1 = _cld(tl.load(pb + 1, mask=t_mask, other=0.0), FP32_MATH)
+        p2 = _cld(tl.load(pb + 2, mask=t_mask, other=0.0), FP32_MATH)
+        p3 = _cld(tl.load(pb + 3, mask=t_mask, other=0.0), FP32_MATH)
         cb = comb_ptr + t_off * COMB_ST_T
-        c00 = _bf16_round(tl.load(cb + 0 * COMB_ST_K + 0, mask=t_mask, other=0.0).to(tl.float32))
-        c01 = _bf16_round(tl.load(cb + 0 * COMB_ST_K + 1, mask=t_mask, other=0.0).to(tl.float32))
-        c02 = _bf16_round(tl.load(cb + 0 * COMB_ST_K + 2, mask=t_mask, other=0.0).to(tl.float32))
-        c03 = _bf16_round(tl.load(cb + 0 * COMB_ST_K + 3, mask=t_mask, other=0.0).to(tl.float32))
-        c10 = _bf16_round(tl.load(cb + 1 * COMB_ST_K + 0, mask=t_mask, other=0.0).to(tl.float32))
-        c11 = _bf16_round(tl.load(cb + 1 * COMB_ST_K + 1, mask=t_mask, other=0.0).to(tl.float32))
-        c12 = _bf16_round(tl.load(cb + 1 * COMB_ST_K + 2, mask=t_mask, other=0.0).to(tl.float32))
-        c13 = _bf16_round(tl.load(cb + 1 * COMB_ST_K + 3, mask=t_mask, other=0.0).to(tl.float32))
-        c20 = _bf16_round(tl.load(cb + 2 * COMB_ST_K + 0, mask=t_mask, other=0.0).to(tl.float32))
-        c21 = _bf16_round(tl.load(cb + 2 * COMB_ST_K + 1, mask=t_mask, other=0.0).to(tl.float32))
-        c22 = _bf16_round(tl.load(cb + 2 * COMB_ST_K + 2, mask=t_mask, other=0.0).to(tl.float32))
-        c23 = _bf16_round(tl.load(cb + 2 * COMB_ST_K + 3, mask=t_mask, other=0.0).to(tl.float32))
-        c30 = _bf16_round(tl.load(cb + 3 * COMB_ST_K + 0, mask=t_mask, other=0.0).to(tl.float32))
-        c31 = _bf16_round(tl.load(cb + 3 * COMB_ST_K + 1, mask=t_mask, other=0.0).to(tl.float32))
-        c32 = _bf16_round(tl.load(cb + 3 * COMB_ST_K + 2, mask=t_mask, other=0.0).to(tl.float32))
-        c33 = _bf16_round(tl.load(cb + 3 * COMB_ST_K + 3, mask=t_mask, other=0.0).to(tl.float32))
+        c00 = _cld(tl.load(cb + 0 * COMB_ST_K + 0, mask=t_mask, other=0.0), FP32_MATH)
+        c01 = _cld(tl.load(cb + 0 * COMB_ST_K + 1, mask=t_mask, other=0.0), FP32_MATH)
+        c02 = _cld(tl.load(cb + 0 * COMB_ST_K + 2, mask=t_mask, other=0.0), FP32_MATH)
+        c03 = _cld(tl.load(cb + 0 * COMB_ST_K + 3, mask=t_mask, other=0.0), FP32_MATH)
+        c10 = _cld(tl.load(cb + 1 * COMB_ST_K + 0, mask=t_mask, other=0.0), FP32_MATH)
+        c11 = _cld(tl.load(cb + 1 * COMB_ST_K + 1, mask=t_mask, other=0.0), FP32_MATH)
+        c12 = _cld(tl.load(cb + 1 * COMB_ST_K + 2, mask=t_mask, other=0.0), FP32_MATH)
+        c13 = _cld(tl.load(cb + 1 * COMB_ST_K + 3, mask=t_mask, other=0.0), FP32_MATH)
+        c20 = _cld(tl.load(cb + 2 * COMB_ST_K + 0, mask=t_mask, other=0.0), FP32_MATH)
+        c21 = _cld(tl.load(cb + 2 * COMB_ST_K + 1, mask=t_mask, other=0.0), FP32_MATH)
+        c22 = _cld(tl.load(cb + 2 * COMB_ST_K + 2, mask=t_mask, other=0.0), FP32_MATH)
+        c23 = _cld(tl.load(cb + 2 * COMB_ST_K + 3, mask=t_mask, other=0.0), FP32_MATH)
+        c30 = _cld(tl.load(cb + 3 * COMB_ST_K + 0, mask=t_mask, other=0.0), FP32_MATH)
+        c31 = _cld(tl.load(cb + 3 * COMB_ST_K + 1, mask=t_mask, other=0.0), FP32_MATH)
+        c32 = _cld(tl.load(cb + 3 * COMB_ST_K + 2, mask=t_mask, other=0.0), FP32_MATH)
+        c33 = _cld(tl.load(cb + 3 * COMB_ST_K + 3, mask=t_mask, other=0.0), FP32_MATH)
         for d0 in range(0, D, BLOCK_D):
             d_off = d0 + tl.arange(0, BLOCK_D)
             m2 = t_mask[:, None] & (d_off < D)[None, :]
@@ -1642,17 +1717,17 @@ def _hc_combine_fwd_kernel(
             r2 = tl.load(res_ptr + (t_off * HC + 2)[:, None] * D + d_off[None, :], mask=m2, other=0.0).to(tl.float32)
             r3 = tl.load(res_ptr + (t_off * HC + 3)[:, None] * D + d_off[None, :], mask=m2, other=0.0).to(tl.float32)
             base = (t_off * HC)[:, None] * D + d_off[None, :]
-            mul = _bf16_round(p0[:, None] * out_v)
-            mm = _bf16_round(c00[:, None] * r0 + c10[:, None] * r1 + c20[:, None] * r2 + c30[:, None] * r3)
+            mul = _cmul(p0[:, None], out_v, FP32_MATH)
+            mm = _cmac4(c00[:, None], r0, c10[:, None], r1, c20[:, None], r2, c30[:, None], r3, FP32_MATH)
             tl.store(new_ptr + base + 0 * D, (mul + mm).to(tl.bfloat16), mask=m2)
-            mul = _bf16_round(p1[:, None] * out_v)
-            mm = _bf16_round(c01[:, None] * r0 + c11[:, None] * r1 + c21[:, None] * r2 + c31[:, None] * r3)
+            mul = _cmul(p1[:, None], out_v, FP32_MATH)
+            mm = _cmac4(c01[:, None], r0, c11[:, None], r1, c21[:, None], r2, c31[:, None], r3, FP32_MATH)
             tl.store(new_ptr + base + 1 * D, (mul + mm).to(tl.bfloat16), mask=m2)
-            mul = _bf16_round(p2[:, None] * out_v)
-            mm = _bf16_round(c02[:, None] * r0 + c12[:, None] * r1 + c22[:, None] * r2 + c32[:, None] * r3)
+            mul = _cmul(p2[:, None], out_v, FP32_MATH)
+            mm = _cmac4(c02[:, None], r0, c12[:, None], r1, c22[:, None], r2, c32[:, None], r3, FP32_MATH)
             tl.store(new_ptr + base + 2 * D, (mul + mm).to(tl.bfloat16), mask=m2)
-            mul = _bf16_round(p3[:, None] * out_v)
-            mm = _bf16_round(c03[:, None] * r0 + c13[:, None] * r1 + c23[:, None] * r2 + c33[:, None] * r3)
+            mul = _cmul(p3[:, None], out_v, FP32_MATH)
+            mm = _cmac4(c03[:, None], r0, c13[:, None], r1, c23[:, None], r2, c33[:, None], r3, FP32_MATH)
             tl.store(new_ptr + base + 3 * D, (mul + mm).to(tl.bfloat16), mask=m2)
 
 
@@ -1675,9 +1750,13 @@ def _hc_combine_bwd_kernel(
     HC: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FP32_MATH: tl.constexpr,
 ):
-    # Token-tiled (BLOCK_T rows) rewrite of the original per-token kernel, carrying the
-    # same _bf16_round placement as the eager chain (see _hc_combine_fwd_kernel).
+    # Token-tiled (BLOCK_T rows) rewrite of the original per-token kernel. Precision is
+    # selected by FP32_MATH: the default fp32 mode keeps post/comb and every product
+    # fp32 end to end (native mhc_post-aligned; d_post/d_comb stored fp32 without the
+    # bf16 round-trip), while HEAD mode (FP32_MATH=0) carries the same _bf16_round
+    # placement as the eager chain (see _hc_combine_fwd_kernel) via the _c* helpers.
     # d_out / d_res accumulate element-wise over D, so they stay bitwise-equal to the
     # per-token kernel; d_post / d_comb reduce over D inside BLOCK_D-wide tiles, so
     # their fp32 sums may differ by one ulp where BLOCK_D differs from the old launch.
@@ -1687,27 +1766,27 @@ def _hc_combine_bwd_kernel(
         t_off = (blk * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
         t_mask = t_off < T
         pb = post_ptr + t_off * POST_ST_T
-        p0 = _bf16_round(tl.load(pb + 0, mask=t_mask, other=0.0).to(tl.float32))
-        p1 = _bf16_round(tl.load(pb + 1, mask=t_mask, other=0.0).to(tl.float32))
-        p2 = _bf16_round(tl.load(pb + 2, mask=t_mask, other=0.0).to(tl.float32))
-        p3 = _bf16_round(tl.load(pb + 3, mask=t_mask, other=0.0).to(tl.float32))
+        p0 = _cld(tl.load(pb + 0, mask=t_mask, other=0.0), FP32_MATH)
+        p1 = _cld(tl.load(pb + 1, mask=t_mask, other=0.0), FP32_MATH)
+        p2 = _cld(tl.load(pb + 2, mask=t_mask, other=0.0), FP32_MATH)
+        p3 = _cld(tl.load(pb + 3, mask=t_mask, other=0.0), FP32_MATH)
         cb = comb_ptr + t_off * COMB_ST_T
-        c00 = _bf16_round(tl.load(cb + 0 * COMB_ST_K + 0, mask=t_mask, other=0.0).to(tl.float32))
-        c01 = _bf16_round(tl.load(cb + 0 * COMB_ST_K + 1, mask=t_mask, other=0.0).to(tl.float32))
-        c02 = _bf16_round(tl.load(cb + 0 * COMB_ST_K + 2, mask=t_mask, other=0.0).to(tl.float32))
-        c03 = _bf16_round(tl.load(cb + 0 * COMB_ST_K + 3, mask=t_mask, other=0.0).to(tl.float32))
-        c10 = _bf16_round(tl.load(cb + 1 * COMB_ST_K + 0, mask=t_mask, other=0.0).to(tl.float32))
-        c11 = _bf16_round(tl.load(cb + 1 * COMB_ST_K + 1, mask=t_mask, other=0.0).to(tl.float32))
-        c12 = _bf16_round(tl.load(cb + 1 * COMB_ST_K + 2, mask=t_mask, other=0.0).to(tl.float32))
-        c13 = _bf16_round(tl.load(cb + 1 * COMB_ST_K + 3, mask=t_mask, other=0.0).to(tl.float32))
-        c20 = _bf16_round(tl.load(cb + 2 * COMB_ST_K + 0, mask=t_mask, other=0.0).to(tl.float32))
-        c21 = _bf16_round(tl.load(cb + 2 * COMB_ST_K + 1, mask=t_mask, other=0.0).to(tl.float32))
-        c22 = _bf16_round(tl.load(cb + 2 * COMB_ST_K + 2, mask=t_mask, other=0.0).to(tl.float32))
-        c23 = _bf16_round(tl.load(cb + 2 * COMB_ST_K + 3, mask=t_mask, other=0.0).to(tl.float32))
-        c30 = _bf16_round(tl.load(cb + 3 * COMB_ST_K + 0, mask=t_mask, other=0.0).to(tl.float32))
-        c31 = _bf16_round(tl.load(cb + 3 * COMB_ST_K + 1, mask=t_mask, other=0.0).to(tl.float32))
-        c32 = _bf16_round(tl.load(cb + 3 * COMB_ST_K + 2, mask=t_mask, other=0.0).to(tl.float32))
-        c33 = _bf16_round(tl.load(cb + 3 * COMB_ST_K + 3, mask=t_mask, other=0.0).to(tl.float32))
+        c00 = _cld(tl.load(cb + 0 * COMB_ST_K + 0, mask=t_mask, other=0.0), FP32_MATH)
+        c01 = _cld(tl.load(cb + 0 * COMB_ST_K + 1, mask=t_mask, other=0.0), FP32_MATH)
+        c02 = _cld(tl.load(cb + 0 * COMB_ST_K + 2, mask=t_mask, other=0.0), FP32_MATH)
+        c03 = _cld(tl.load(cb + 0 * COMB_ST_K + 3, mask=t_mask, other=0.0), FP32_MATH)
+        c10 = _cld(tl.load(cb + 1 * COMB_ST_K + 0, mask=t_mask, other=0.0), FP32_MATH)
+        c11 = _cld(tl.load(cb + 1 * COMB_ST_K + 1, mask=t_mask, other=0.0), FP32_MATH)
+        c12 = _cld(tl.load(cb + 1 * COMB_ST_K + 2, mask=t_mask, other=0.0), FP32_MATH)
+        c13 = _cld(tl.load(cb + 1 * COMB_ST_K + 3, mask=t_mask, other=0.0), FP32_MATH)
+        c20 = _cld(tl.load(cb + 2 * COMB_ST_K + 0, mask=t_mask, other=0.0), FP32_MATH)
+        c21 = _cld(tl.load(cb + 2 * COMB_ST_K + 1, mask=t_mask, other=0.0), FP32_MATH)
+        c22 = _cld(tl.load(cb + 2 * COMB_ST_K + 2, mask=t_mask, other=0.0), FP32_MATH)
+        c23 = _cld(tl.load(cb + 2 * COMB_ST_K + 3, mask=t_mask, other=0.0), FP32_MATH)
+        c30 = _cld(tl.load(cb + 3 * COMB_ST_K + 0, mask=t_mask, other=0.0), FP32_MATH)
+        c31 = _cld(tl.load(cb + 3 * COMB_ST_K + 1, mask=t_mask, other=0.0), FP32_MATH)
+        c32 = _cld(tl.load(cb + 3 * COMB_ST_K + 2, mask=t_mask, other=0.0), FP32_MATH)
+        c33 = _cld(tl.load(cb + 3 * COMB_ST_K + 3, mask=t_mask, other=0.0), FP32_MATH)
         dp0 = tl.zeros([BLOCK_T], dtype=tl.float32)  # d_post[t, n], accumulated across D chunks
         dp1 = tl.zeros([BLOCK_T], dtype=tl.float32)
         dp2 = tl.zeros([BLOCK_T], dtype=tl.float32)
@@ -1743,16 +1822,16 @@ def _hc_combine_bwd_kernel(
             r2 = tl.load(res_ptr + row + 2 * D, mask=m2, other=0.0).to(tl.float32)
             r3 = tl.load(res_ptr + row + 3 * D, mask=m2, other=0.0).to(tl.float32)
             # d_out[t, d] = sum_n bf16(post[n] * g[n, d])  (Mul-bwd + ReduceSum, sequential over HC)
-            do_acc = _bf16_round(p0[:, None] * g0)
-            do_acc += _bf16_round(p1[:, None] * g1)
-            do_acc += _bf16_round(p2[:, None] * g2)
-            do_acc += _bf16_round(p3[:, None] * g3)
+            do_acc = _cmul(p0[:, None], g0, FP32_MATH)
+            do_acc += _cmul(p1[:, None], g1, FP32_MATH)
+            do_acc += _cmul(p2[:, None], g2, FP32_MATH)
+            do_acc += _cmul(p3[:, None], g3, FP32_MATH)
             tl.store(d_out_ptr + orow, do_acc.to(tl.bfloat16), mask=m2)
             # d_post[t, n] = sum_d bf16(g[n, d] * out[d])  (Mul-bwd + ReduceSum over D)
-            dp0 += tl.sum(_bf16_round(g0 * out_v), axis=1)
-            dp1 += tl.sum(_bf16_round(g1 * out_v), axis=1)
-            dp2 += tl.sum(_bf16_round(g2 * out_v), axis=1)
-            dp3 += tl.sum(_bf16_round(g3 * out_v), axis=1)
+            dp0 += tl.sum(_cmul(g0, out_v, FP32_MATH), axis=1)
+            dp1 += tl.sum(_cmul(g1, out_v, FP32_MATH), axis=1)
+            dp2 += tl.sum(_cmul(g2, out_v, FP32_MATH), axis=1)
+            dp3 += tl.sum(_cmul(g3, out_v, FP32_MATH), axis=1)
             # d_res[t, k, d] = sum_n comb[k, n] * g[n, d]  (MatMul-bwd, fp32 accumulation)
             dr0 = c00[:, None] * g0 + c01[:, None] * g1 + c02[:, None] * g2 + c03[:, None] * g3
             dr1 = c10[:, None] * g0 + c11[:, None] * g1 + c12[:, None] * g2 + c13[:, None] * g3
@@ -1779,27 +1858,27 @@ def _hc_combine_bwd_kernel(
             q31 += tl.sum(r3 * g1, axis=1)
             q32 += tl.sum(r3 * g2, axis=1)
             q33 += tl.sum(r3 * g3, axis=1)
-        tl.store(d_post_ptr + t_off * HC + 0, dp0.to(tl.bfloat16).to(d_post_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_post_ptr + t_off * HC + 1, dp1.to(tl.bfloat16).to(d_post_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_post_ptr + t_off * HC + 2, dp2.to(tl.bfloat16).to(d_post_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_post_ptr + t_off * HC + 3, dp3.to(tl.bfloat16).to(d_post_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_post_ptr + t_off * HC + 0, _cst_fp32(dp0, FP32_MATH).to(d_post_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_post_ptr + t_off * HC + 1, _cst_fp32(dp1, FP32_MATH).to(d_post_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_post_ptr + t_off * HC + 2, _cst_fp32(dp2, FP32_MATH).to(d_post_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_post_ptr + t_off * HC + 3, _cst_fp32(dp3, FP32_MATH).to(d_post_ptr.dtype.element_ty), mask=t_mask)
         qb = t_off * (HC * HC)
-        tl.store(d_comb_ptr + qb + 0, q00.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 1, q01.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 2, q02.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 3, q03.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 4, q10.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 5, q11.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 6, q12.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 7, q13.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 8, q20.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 9, q21.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 10, q22.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 11, q23.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 12, q30.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 13, q31.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 14, q32.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
-        tl.store(d_comb_ptr + qb + 15, q33.to(tl.bfloat16).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 0, _cst_fp32(q00, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 1, _cst_fp32(q01, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 2, _cst_fp32(q02, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 3, _cst_fp32(q03, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 4, _cst_fp32(q10, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 5, _cst_fp32(q11, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 6, _cst_fp32(q12, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 7, _cst_fp32(q13, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 8, _cst_fp32(q20, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 9, _cst_fp32(q21, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 10, _cst_fp32(q22, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 11, _cst_fp32(q23, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 12, _cst_fp32(q30, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 13, _cst_fp32(q31, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 14, _cst_fp32(q32, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
+        tl.store(d_comb_ptr + qb + 15, _cst_fp32(q33, FP32_MATH).to(d_comb_ptr.dtype.element_ty), mask=t_mask)
 
 
 @triton.jit
@@ -1898,9 +1977,9 @@ def _probe_max_progs(device: torch.device) -> int:
     # are fp32 on both norm paths) with comb as the padded [B, S, HC, 8]
     # buffer's ``[:, :, :, :HC]`` slice view: POST_ST_T=4, COMB_ST_T=32,
     # COMB_ST_K=8; out/res/new/d_out/d_res are bf16 and d_post/d_comb follow
-    # post/comb's fp32. (The former bf16/packed probe -- POST_ST_T=1,
-    # COMB_ST_T=4, COMB_ST_K=1 -- verified binaries production never ran,
-    # leaving the real cap-48 grid unguarded.) Runtime ints T/D only specialize
+    # post/comb's fp32. A probe that does not mirror these dtypes/strides would
+    # compile and verify different binaries than production launches, leaving the
+    # real cap-48 grid unguarded. Runtime ints T/D only specialize
     # on (==1, %16), which the probe values share with the training shape.
     pad_align = 8  # the sinkhorn forward's block_align: the padded comb row stride
     post = torch.zeros(1, t, _PROD_HC, dtype=torch.float32, device=device)
@@ -1924,6 +2003,7 @@ def _probe_max_progs(device: torch.device) -> int:
         HC=_PROD_HC,
         BLOCK_T=_COMBINE_BLOCK_T,
         BLOCK_D=d,
+        FP32_MATH=HC_COMBINE_TRITON_FP32,
     )
     if torch.isnan(new).any().item():
         return _MAX_PROGS_FALLBACK
@@ -1949,6 +2029,7 @@ def _probe_max_progs(device: torch.device) -> int:
         HC=_PROD_HC,
         BLOCK_T=_COMBINE_BLOCK_T,
         BLOCK_D=d,
+        FP32_MATH=HC_COMBINE_TRITON_FP32,
     )
     if any(torch.isnan(x).any().item() for x in (d_post, d_comb, d_out, d_res)):
         return _MAX_PROGS_FALLBACK
@@ -2004,7 +2085,16 @@ def _combine_eager(
     out: torch.Tensor,
     res: torch.Tensor,
 ) -> torch.Tensor:
-    """Eager reference: the decoder-layer stream-update chain verbatim."""
+    """Eager reference: the decoder-layer stream-update chain verbatim.
+
+    Numerics note: this chain intentionally keeps the HEAD bf16 semantics
+    (``post/comb.to(dtype)``), i.e. it does NOT follow
+    ``XTUNER_HC_COMBINE_TRITON_FP32``. It only runs where the fused triton path is
+    unavailable (non-NPU reference runs, ``XTUNER_HC_COMBINE_FUSED=0``, or
+    non-servable shapes/dtypes), so its role is the HEAD bit-level reference and
+    unit-test oracle -- aligning it to the fp32 mode would break the HF-reference
+    tests this oracle exists for. Production NPU paths never land here.
+    """
     dtype = res.dtype
     return post.to(dtype).unsqueeze(-1) * out.unsqueeze(-2) + torch.matmul(comb.to(dtype).transpose(-1, -2), res)
 
@@ -2015,7 +2105,13 @@ def _collapse_eager(pre: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
 
 
 class _HcCombineFunction(torch.autograd.Function):
-    """Fused combine forward/backward matching the eager autograd chain."""
+    """Fused combine forward/backward.
+
+    FP32_MATH=0 (HEAD mode) matches the eager autograd chain bitwise; the default
+    fp32 mode instead matches the native ``mhc_post`` numerics (fp32 post/comb and
+    products, fp32 d_post/d_comb stores -- see ``_combine_eager`` for the eager
+    reference the HEAD mode replicates).
+    """
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -2045,6 +2141,7 @@ class _HcCombineFunction(torch.autograd.Function):
             HC=hc,
             BLOCK_T=_COMBINE_BLOCK_T,
             BLOCK_D=_COMBINE_BLOCK_D,
+            FP32_MATH=HC_COMBINE_TRITON_FP32,
         )
         ctx.save_for_backward(post, comb, out2, res2)  # type: ignore[attr-defined]
         ctx.orig_shapes = (post.shape, comb.shape, out.shape, res.shape)  # type: ignore[attr-defined]
@@ -2080,6 +2177,7 @@ class _HcCombineFunction(torch.autograd.Function):
             HC=hc,
             BLOCK_T=_COMBINE_BLOCK_T,
             BLOCK_D=_COMBINE_BLOCK_D,
+            FP32_MATH=HC_COMBINE_TRITON_FP32,
         )
         post_shape, comb_shape, out_shape, res_shape = ctx.orig_shapes  # type: ignore[attr-defined]
         return (
@@ -2153,6 +2251,19 @@ def _combine_servable(post: torch.Tensor, comb: torch.Tensor, out: torch.Tensor,
     )
 
 
+def _combine_native_servable(post: torch.Tensor, comb: torch.Tensor) -> bool:
+    """Extra preconditions for the native ``mhc_post`` call, on top of
+    :func:`_combine_servable`.
+
+    The aclnn/GE contract pins ``h_res``/``h_post`` to DT_FLOAT (the fp32 sinkhorn
+    mixes); ``_combine_servable`` deliberately still admits bf16 post/comb for the
+    triton path (unit-test configs), so without this check a bf16 call would reach
+    the native op, raise, and rely on the fallback path -- now the fp32 requirement
+    is decided here, before any op call.
+    """
+    return post.dtype == torch.float32 and comb.dtype == torch.float32
+
+
 def _collapse_servable(pre: torch.Tensor, streams: torch.Tensor) -> bool:
     """Fused-path eligibility: NPU, hc_mult=4, bf16 streams, fp32/bf16 pre.
 
@@ -2189,7 +2300,29 @@ def hc_combine(
     Returns:
         torch.Tensor: Updated streams ``[B, S, H, D]``.
     """
-    if not (HC_COMBINE_FUSED and _combine_servable(post, comb, out, res)):
+    servable = _combine_servable(post, comb, out, res)
+    if HC_COMBINE_NATIVE and _COT_MHC_POST is not None and servable and _combine_native_servable(post, comb):
+        if not _NATIVE_STATE["latched"]:
+            try:
+                if not _NATIVE_STATE["engaged"]:
+                    _NATIVE_STATE["engaged"] = True
+                    try:
+                        rank = torch.distributed.get_rank()
+                    except Exception:  # not launched under torch.distributed (unit tests)
+                        rank = 0
+                    print(f"[glm53] hc_combine native mhc_post engaged (rank {rank})", flush=True)
+                return _COT_MHC_POST(res, comb, out, post)
+            except Exception as exc:
+                # Latch after the first rejection so a broken op-side contract costs one
+                # failed call instead of one failed call per hc_combine invocation for the
+                # rest of the process; the exception text is logged, never swallowed.
+                _NATIVE_STATE["latched"] = True
+                print(
+                    f"[glm53] hc_combine native mhc_post rejected ({exc!r}); "
+                    "latching the triton fallback for the rest of this process",
+                    flush=True,
+                )
+    if not (HC_COMBINE_FUSED and servable):
         return _combine_eager(post, comb, out, res)
     _resolve_max_progs(res.device)
     if not _LOG_STATE["combine"]:
