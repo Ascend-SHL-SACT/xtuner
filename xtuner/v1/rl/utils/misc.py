@@ -128,6 +128,19 @@ def sort_rollout_state_for_deterministic(data_groups: list[list[RolloutState]]) 
     return sorted_groups
 
 
+def validate_image_only_rollout(state: RolloutState) -> None:
+    """Reject video inputs unsupported by the built-in online rollout
+    transports."""
+    has_video = state.extra_fields.get("video_data") or (
+        state.mm_info is not None and state.mm_info.get("pixel_values_videos") is not None
+    )
+    if has_video:
+        raise NotImplementedError(
+            "Online video rollout/teacher scoring is not supported by the built-in transports. "
+            "Use image/text prompts online; video multimodal inputs are supported for training replay only."
+        )
+
+
 def load_function(path):
     """Load a function from a module.
 
@@ -245,6 +258,19 @@ def get_eos_token(model_path: str) -> int | List[int]:
     return eos_token_id
 
 
+def _post_proxy_admin(url: str, payload: dict, headers: dict, *, read_timeout: float):
+    # Retry only connect timeouts: no request reached the admin server yet.
+    # Read timeouts have an ambiguous mutation outcome and must propagate.
+    for attempt in range(5):
+        try:
+            return requests.post(url, json=payload, headers=headers, timeout=(5, read_timeout))
+        except requests.exceptions.ConnectTimeout:
+            if attempt == 4:
+                raise
+            logger.warning(f"Proxy admin connect timeout; retry {attempt + 1}/4: {url}")
+            time.sleep(1)
+
+
 def register_to_routedapiproxy(admin_url: str, model_name: str, api_server_url: str) -> dict:
     url = f"{admin_url.rstrip('/')}/v1/models/new"
     payload = {
@@ -256,7 +282,7 @@ def register_to_routedapiproxy(admin_url: str, model_name: str, api_server_url: 
         "accept": "application/json",
         "Content-Type": "application/json",
     }
-    resp = requests.post(url, json=payload, headers=headers, timeout=180)
+    resp = _post_proxy_admin(url, payload, headers, read_timeout=180)
     resp.raise_for_status()
     return resp.json()
 
@@ -272,7 +298,7 @@ def delete_from_routedapiproxy(admin_url: str, model_name: str, api_server_url: 
         "accept": "application/json",
         "Content-Type": "application/json",
     }
-    resp = requests.post(url, json=payload, headers=headers, timeout=30)
+    resp = _post_proxy_admin(url, payload, headers, read_timeout=30)
     resp.raise_for_status()
 
 

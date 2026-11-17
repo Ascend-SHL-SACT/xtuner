@@ -4,17 +4,15 @@ import os
 import types
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Callable, Literal, Self, Sequence, TypedDict, cast
-from weakref import WeakKeyDictionary
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from cyclopts import Parameter
-from pydantic import ConfigDict
+from pydantic import ConfigDict, model_validator
 from torch import nn
 from torch.distributed._functional_collectives import all_reduce
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.distributed_c10d import ReduceOp
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -48,6 +46,7 @@ from xtuner.v1.model.base import (
     ModelOutputs,
     TorchCompileOption,
     TransformerConfig,
+    reduce_replicated_grads,
 )
 from xtuner.v1.model.fsdp_fuse import shard_decoder_layers
 from xtuner.v1.model.utils import (
@@ -60,7 +59,6 @@ from xtuner.v1.module import (
     GatedDeltaNetConfig,
     GreedyRouterConfig,
     KDAConfig,
-    LMHead,
     MHAConfig,
     MLAConfig,
     NoAuxRouter,
@@ -187,6 +185,13 @@ class MoEConfig(TransformerConfig):
     # keeping it unsharded after forward to avoid repeated all-gathers.
     embed_reshard_after_forward: bool = True
 
+    @model_validator(mode="after")
+    def _validate_critic_head(self) -> Self:
+        """Reject MTP on value-head (critic) models."""
+        if self.head_config.type == "value_head" and self.mtp_config is not None:
+            raise ValueError("head_config.type='value_head' does not support MTP; set mtp_config=None")
+        return self
+
     def build(self) -> "MoE":
         from xtuner.v1.model.moe.moe import MoE
 
@@ -237,50 +242,6 @@ def nonpad_index_and_count(seq_ctx_list: list[SequenceContext]) -> tuple[torch.T
     non_pad_token = offset - num_padding_total
     nonpad_indices = torch.cat(nonpad_parts) if len(nonpad_parts) > 1 else nonpad_parts[0]
     return nonpad_indices, non_pad_token
-
-
-# Sub-meshes derived in ``scale_and_reduce_grad`` are deterministic per (parent mesh,
-# replicate-dim names), but ``DeviceMesh.__getitem__``/``_flatten`` rebuild them from
-# scratch on every call (pure host-side work on torch 2.9.1; measured 1128
-# rebuilds/step at 30B/16-NPU). Cache the derived meshes instead.
-# XTUNER_MOE_FLAT_MESH_CACHE=0 restores the per-call rebuild.
-#
-# Lifetime note: entries are process-lifetime in practice, NOT garbage-collected with
-# the parent -- deriving a sub-mesh strongly pins the parent in torch's global mesh
-# registry (``_MeshResources.child_to_root_mapping``), so the weak key only covers the
-# never-derived parent. The cache is bounded by the small number of distinct
-# (parent mesh, replicate-dims) pairs, and it assumes the world process group is not
-# destroyed and re-created within the process: a re-created world whose new mesh
-# compares value-equal to an old one would hit a stale entry holding a dead group.
-_FLAT_REPLICATE_MESH_CACHE: WeakKeyDictionary[DeviceMesh, dict[tuple[str, ...], DeviceMesh]] = WeakKeyDictionary()
-_MOE_FLAT_MESH_CACHE = os.environ.get("XTUNER_MOE_FLAT_MESH_CACHE", "1") == "1"
-
-
-def _flat_replicate_mesh(mesh: DeviceMesh, replicate_dim_names: tuple[str, ...]) -> DeviceMesh:
-    # Lock-free get->create->insert: benign under the GIL (worst case an equivalent entry
-    # is derived twice). The only caller runs on the main training thread.
-    per_mesh = _FLAT_REPLICATE_MESH_CACHE.get(mesh)
-    if per_mesh is None:
-        per_mesh = {}
-        _FLAT_REPLICATE_MESH_CACHE[mesh] = per_mesh
-    flat_mesh = per_mesh.get(replicate_dim_names)
-    if flat_mesh is not None:
-        return flat_mesh
-    # `DeviceMesh.get_group()` only supports a single mesh dimension, so calling it
-    # directly on a multi-dim sub-mesh raises RuntimeError. `_flatten()` collapses all
-    # Replicate dims into a 1D mesh whose process group covers every rank across those
-    # dimensions, allowing a single all_reduce regardless of how many Replicate dims
-    # exist.
-    if len(replicate_dim_names) > 1:
-        flat_mesh = mesh[replicate_dim_names]._flatten()
-    else:
-        # In the case that only one replicate dim, in pt2.8 _flatten is worked due to a bug.
-        # in pt2.9.1 this bug is fixed and _flatten will raise error when the mesh is already 1D,
-        # which means replicate_dim_names represents an existing single mesh dimension
-        # so we directly get the submesh without flatten in this case.
-        flat_mesh = mesh[replicate_dim_names[0]]
-    per_mesh[replicate_dim_names] = flat_mesh
-    return flat_mesh
 
 
 class MoE(BaseModel):
@@ -371,7 +332,7 @@ class MoE(BaseModel):
             self.ep_tp_mesh = None
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
-        self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = config.build_head()
 
         self.layers = self.build_layers(config)
         self.rotary_emb = self.build_rotary_embedding(config)
@@ -385,8 +346,6 @@ class MoE(BaseModel):
         # torch.tensor(list, device=...) that stalls the host on the tail of backward.
         self._ep_load_pinned: torch.Tensor | None = None
         self._ep_load_local: torch.Tensor | None = None
-
-        self.fp32_layers = [self.rotary_emb]
 
         # TODO(@yehaochen): 把这两行移除 _maybe_compile_layers 要把 compile 相关的 setting 放到 fsdp_config 之外
         # _init_load_spec 放到 post init 里
@@ -1567,13 +1526,8 @@ class MoE(BaseModel):
 
         self.fsdp_config = fsdp_config
         assert self.fsdp_config.ep_size == self.config.ep_size
-        self.mp_policy = MixedPrecisionPolicy(
-            param_dtype=self.fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype
-        )
-        if self.fsdp_config.fp32_lm_head:
-            lm_head_mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
-        else:
-            lm_head_mp_policy = self.mp_policy
+        if self.config.head_fp32(self.fsdp_config):
+            self.precision.pin_unit(self.lm_head)
         self._init_device_mesh(fsdp_config)
 
         if self.config.float8_cfg is not None:
@@ -1610,6 +1564,7 @@ class MoE(BaseModel):
         mp_policy = MixedPrecisionPolicy(
             param_dtype=self.fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype
         )
+        self.precision.set_default_mp_policy(mp_policy)
         checkpoint_preserve_rng_state = fsdp_config.checkpoint_preserve_rng_state
 
         # XTUNER_FSDP_FUSE_K (default 1 = per-layer = unchanged): group K
@@ -1643,7 +1598,6 @@ class MoE(BaseModel):
 
             self._fully_shard(
                 mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-                mp_policy=mp_policy,
                 reshard_after_forward=reshard_after_forward,
                 offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
                 module=layer,
@@ -1673,7 +1627,6 @@ class MoE(BaseModel):
 
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-            mp_policy=mp_policy,
             reshard_after_forward=self.config.embed_reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
             module=self.embed_tokens,
@@ -1681,7 +1634,6 @@ class MoE(BaseModel):
 
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-            mp_policy=mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
             module=self.norm,
@@ -1689,7 +1641,6 @@ class MoE(BaseModel):
 
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-            mp_policy=lm_head_mp_policy,
             reshard_after_forward=False,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
             module=self.lm_head,
@@ -1710,7 +1661,6 @@ class MoE(BaseModel):
                 reshard_after_forward = mtp_idx != len(self.mtp_block.layers) - 1
                 self._fully_shard(
                     mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-                    mp_policy=mp_policy,
                     reshard_after_forward=reshard_after_forward,
                     offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
                     module=mtp_layer,
@@ -1727,7 +1677,6 @@ class MoE(BaseModel):
 
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-            mp_policy=mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
         )
@@ -1755,58 +1704,23 @@ class MoE(BaseModel):
 
     @torch.no_grad  # type: ignore
     def scale_and_reduce_grad(self):
-        # Bucket gradients that need a cross-rank reduction by their target process
-        # group. Each bucket is reduced with a single coalesced NCCL all_reduce
-        # instead of one launch per parameter, which used to dominate latency for
-        # models with many small replicated tensors.
-        grads_by_group: dict[dist.ProcessGroup, list[torch.Tensor]] = {}
+        # Deliberately not calling `super()`: the selection below already covers every pinned FP32
+        # parameter (they are DTensors with a Replicate dimension), and reducing them twice would
+        # square the mean.
+        expert_parallel_size = (self.ep_mesh.size() if self.ep_mesh is not None else 1) * self.config.expert_tp_size
 
-        for name, param in self.trainable_parameters():
-            if param.grad is None:
-                continue
+        def jobs():
+            for name, param in self.trainable_parameters():
+                if param.grad is None:
+                    continue
+                # 中文注释：expert 参数会在 EP 和 expert TP 维度上看到全量 token 梯度和，
+                # 需要按参与该 expert 计算的 rank 数平均，才能对齐普通 DP/FSDP baseline。
+                if expert_parallel_size > 1 and ".experts" in name:
+                    param.grad.div_(expert_parallel_size)  # type: ignore
+                    continue
+                yield name, param
 
-            expert_parallel_size = (
-                self.ep_mesh.size() if self.ep_mesh is not None else 1
-            ) * self.config.expert_tp_size
-            # 中文注释：expert 参数会在 EP 和 expert TP 维度上看到全量 token 梯度和，
-            # 需要按参与该 expert 计算的 rank 数平均，才能对齐普通 DP/FSDP baseline。
-            if expert_parallel_size > 1 and ".experts" in name:
-                param.grad.div_(expert_parallel_size)  # type: ignore
-                continue
-
-            if not isinstance(param, DTensor):
-                continue
-
-            replicate_dim_names = tuple(
-                param.device_mesh.mesh_dim_names[i] for i, p in enumerate(param.placements) if isinstance(p, Replicate)
-            )
-            if not replicate_dim_names:
-                continue
-
-            # `_flat_replicate_mesh` (cache hit) or the torch sub-mesh builders below
-            # collapse all Replicate dims into a 1D mesh whose process group covers
-            # every rank across those dimensions, so one all_reduce suffices.
-            if _MOE_FLAT_MESH_CACHE:
-                flat_mesh = _flat_replicate_mesh(param.device_mesh, replicate_dim_names)
-            elif len(replicate_dim_names) > 1:
-                flat_mesh = param.device_mesh[replicate_dim_names]._flatten()
-            else:
-                # In the case that only one replicate dim, in pt2.8 _flatten is worked due to a bug.
-                # in pt2.9.1 this bug is fixed and _flatten will raise error when the mesh is already 1D,
-                # which means replicate_dim_names represents an existing single mesh dimension
-                # so we directly get the submesh without flatten in this case.
-                flat_mesh = param.device_mesh[replicate_dim_names[0]]
-
-            grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
-            # Pre-scale locally so the SUM all_reduce below yields the mean across replicas.
-            grad.div_(flat_mesh.size())  # type: ignore
-            grads_by_group.setdefault(flat_mesh.get_group(), []).append(grad)  # type: ignore
-
-        # One coalesced all_reduce per process group covers all replicated grads.
-        for group, grads in grads_by_group.items():
-            with dist._coalescing_manager(group=group):
-                for grad in grads:
-                    dist.all_reduce(grad, ReduceOp.SUM, group=group)
+        reduce_replicated_grads(jobs())
 
     def cal_grad_norm(self, grads: list[DTensor], dtype=torch.float32):
         # Keep the established reduction order (and therefore FP8 training
