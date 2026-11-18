@@ -450,12 +450,24 @@ def npu_kpool_topk_indices(
         )
 
         max_pools = max(r[3] - r[2] for r in ranges)
+        # Whether the call's plan carries any op item: a shard row reaches the op iff
+        # its doc-local position is at or beyond ``index_kpool * (select_k + 1)`` --
+        # every row below that is a dense-prefix row (see ``dense_row_cap`` in
+        # _score_and_topk_aclnn_v2). ``shard_start + range end`` is the doc-local end
+        # of the range's shard rows, the same quantity the plan's ``chunk_end_doc``
+        # computes at ``row_hi``. Host-only, from ranges; ceil pool counts would let
+        # documents whose floor pools equal select_k through as zero-item calls.
+        shard_start = score_shard_start if score_shard_start is not None else int(seq_ctx.shard_start)
+        has_op_rows = any(
+            (shard_start + r[1] - r[4]) >= index_kpool * (select_k + 1) for r in ranges
+        )
         sel_all = None
         if (
             _INDEXER_ACLNN_V2
             and q_local.device.type == "npu"
             and select_k <= 8192
             and (select_k <= 2048 or select_k % 1024 == 0)
+            and has_op_rows
         ):
             # Native CANN LightningIndexerV2 backend (XTUNER_KPOOL_INDEXER_BACKEND=aclnn_v2):
             # one op call replaces the triton score/Fill/Less/topk chain. Gate limits are
@@ -463,10 +475,13 @@ def npu_kpool_topk_indices(
             # matching the op's TND key tiling), not measured cliffs. Orthogonal to
             # XTUNER_KPOOL_CAUSAL_CROP: that knob shapes the triton fallback chain only;
             # the V2 path carries the same causal-visibility idea in its plan geometry.
-            # Covers both the
-            # select_k <= max_pools case and the degenerate below-width case uniformly --
-            # the op -1-pads rows whose visible prefix is below select_k and the helper
-            # rewrites those slots to _SEL_PAD for the shared validity test below.
+            # ``has_op_rows`` keeps the below-width workload (every shard row's visible
+            # prefix at or below select_k) off this path: its plan carries zero op items,
+            # so the scorer would only emit per-document dense-prep launches rebuilding
+            # the degenerate ``col_ids < row_prefix`` buffer built below. Mixed packs
+            # still pass; the op -1-pads rows whose visible prefix is below select_k and
+            # the helper rewrites those slots to _SEL_PAD for the shared validity test
+            # below.
             sel_all = _score_and_topk_aclnn_v2(
                 q_local,
                 pool_key,
@@ -484,14 +499,15 @@ def npu_kpool_topk_indices(
                 and lightning_indexer_score_into is not None
                 and q_local.device.type == "npu"
             ):
-                if select_k <= max_pools:
+                if has_op_rows:
                     # Batched scoring: one kernel launch per segment into a whole-call fp32 buffer
                     # and one whole-shard topk -- no per-segment pad / topk / scatter (see
                     # _score_and_topk_batched). The returned ids are document-local column ids
                     # exactly like the legacy slot buffer's; where the legacy path held
                     # ``_SEL_PAD`` these hold real column ids past the row's visible prefix, which
-                    # the shared validity test below rejects the same way. The gate is only
-                    # ``select_k <= max_pools`` (the *largest* segment): rows whose own visible
+                    # the shared validity test below rejects the same way. The gate is
+                    # ``has_op_rows`` (at least one shard row above the dense cap; zero-item
+                    # calls fall to the degenerate branch below): rows whose own visible
                     # prefix is narrower still keep every real column, because visible columns
                     # score above the ``finfo.min`` prefill and every prefill/pad id fails the
                     # prefix test (see the ``select_k`` contract in ``_score_and_topk_batched``).
@@ -515,8 +531,8 @@ def npu_kpool_topk_indices(
                     # ``_SEL_PAD`` (1<<26) are int32-safe by design; the degenerate/legacy
                     # buffers below are already int32, so this keeps every branch on one dtype.
                 else:
-                    # Degenerate workload (every document shorter than ``index_topk`` tokens, e.g.
-                    # SFT over short samples): each row's visible prefix is below ``select_k``, so
+                    # Degenerate workload (every shard row's visible prefix at or below
+                    # ``select_k`` -- short samples, or dense-head shards of longer documents):
                     # the legacy per-segment ``topk(min(select_k, num_pools))`` returns *every*
                     # real pool column and leaves the rest at ``_SEL_PAD``. That buffer is exactly
                     # the column-id arange masked by the row prefix -- scoring, the key pad, the
