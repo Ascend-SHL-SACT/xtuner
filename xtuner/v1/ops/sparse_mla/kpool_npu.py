@@ -1063,8 +1063,14 @@ def _score_and_topk_aclnn_v2(
         if n_dense:
             plan.append(("dense", n_dense, d0))
         c_start = max(row_lo, row_lo + (dense_end_doc - d0))
-        for c_lo in range(c_start, row_hi, _SCORE_ROW_CHUNK):
-            c_hi = min(c_lo + _SCORE_ROW_CHUNK, row_hi)
+        # ``_SCORE_ROW_CHUNK <= 0`` selects the whole-shard layout (parser contract): one
+        # [c_start, row_hi) item per range block. Note the per-item op cross product then
+        # spans the whole block's rows x max_pools -- the whole-shard footprint, not the
+        # chunked one. max(.., 1) keeps the range legal for fully-dense blocks
+        # (c_start == row_hi -> empty range, no items, same as the chunked path).
+        chunk = _SCORE_ROW_CHUNK if _SCORE_ROW_CHUNK > 0 else max(row_hi - c_start, 1)
+        for c_lo in range(c_start, row_hi, chunk):
+            c_hi = min(c_lo + chunk, row_hi)
             chunk_end_doc = d0 + (c_hi - row_lo)
             floor_pools = chunk_end_doc // index_kpool
             if floor_pools == 0:
