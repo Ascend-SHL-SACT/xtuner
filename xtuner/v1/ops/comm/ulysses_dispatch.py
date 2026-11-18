@@ -40,6 +40,15 @@ consumption):
   NOT wait -- waiting at the issue point would re-serialize the compute
   stream. The output glue (permute/reshape) cannot run yet either, so the
   caller applies ``finish_ulysses_*`` (fence + glue) at the consumption point.
+- ``issue_ulysses_dim1_seq_send`` / ``finish_ulysses_dim1_seq_send`` (env
+  ``XTUNER_KDA_A2A_SEQ_SEND``, read once at import, default off): the same
+  head-scatter movement with the input taken sequence-major, so the received
+  buffer is already sequence-major and the finish glue is a ``view`` instead
+  of a permutation copy. Values are unchanged; the GEMM backward downstream
+  sees a contiguous gradient where the head-major path handed it a transposed
+  view. Only the KDA deferred primitives' consumption points pass through
+  here (``kda_lever`` gates the call sites); with ``XTUNER_KDA_SP_A2A_DEFER=0``
+  the blocking schedule does not run and this env is ineffective.
 - The backward of the autograd wrapper runs the reverse a2a inline: the a2a
   is a pure permutation, so the data gradient is the same all-to-all applied
   to the output grad followed by the inverse reshape, and the consuming
@@ -370,6 +379,103 @@ def finish_ulysses_dim1_seq_major(recv: torch.Tensor, work: _WorkOpt) -> torch.T
     return out.reshape(1, recv.shape[0] * recv.shape[2], recv.shape[1])
 
 
+A2A_SEND_SEQ_MAJOR: bool = os.getenv("XTUNER_KDA_A2A_SEQ_SEND", "0") == "1"
+
+
+class _AsyncUlyssesDim1SeqSend(torch.autograd.Function):
+    """Head-scatter Ulysses a2a taking the input directly in sequence-major
+    layout (``[1, S/sp, A]``, contiguous), producing a sequence-major output
+    (``[1, S, A/sp]``) as a pure view of the received buffer.
+
+    Equivalent value movement to ``_AsyncUlyssesDim1`` fed the transposed
+    view plus ``finish_ulysses_dim1_seq_major`` -- output element ``(s, a)``
+    is head-shard element ``a`` of global token ``s`` either way -- but with
+    one fewer full-tensor copy per direction: the send buffer is built
+    token-major within each chunk (``send[w, l, a]`` = local token ``l``,
+    slice-``w`` element ``a``), so the received buffer's ``(w, l)`` pair
+    already flattens into the global token index and the finish glue is a
+    ``view`` instead of a permutation copy. The backward mirrors it: the
+    output gradient's view is already chunked per destination rank for the
+    reverse all-to-all, and only the received-side regroup into the input
+    layout copies.
+
+    Forward returns the raw received buffer (``[world, S/sp, A/sp]``) plus
+    the work handle; the caller fences via ``finish_ulysses_dim1_seq_send``
+    at the consumption point, exactly like the head-major issue.
+    """
+
+    @staticmethod
+    def forward(  # noqa: ANN001
+        ctx,
+        input: torch.Tensor,
+        group: dist.ProcessGroup,
+    ) -> tuple[torch.Tensor, _WorkOpt]:
+        world = dist.get_world_size(group)
+        ctx.group = group
+        if world == 1:
+            return input, None
+        if not input.is_contiguous():
+            input = input.contiguous()
+        send = input.view(input.shape[1], world, input.shape[2] // world).permute(1, 0, 2).contiguous()
+        return _a2a_issue(send, group)
+
+    @staticmethod
+    def backward(  # noqa: ANN001
+        ctx, grad_recv: torch.Tensor, _grad_work: None
+    ) -> tuple[torch.Tensor | None, None]:
+        world = dist.get_world_size(ctx.group)
+        if world == 1:
+            return grad_recv, None
+        grad_recv = grad_recv.contiguous()
+        grad_w, work = _a2a_issue(grad_recv, ctx.group)
+        _wait_a2a(work)
+        d_x = grad_w.permute(1, 0, 2).contiguous().view(1, grad_w.shape[1], grad_w.shape[0] * grad_w.shape[2])
+        return d_x, None
+
+
+def issue_ulysses_dim1_seq_send(x: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch.Tensor, _WorkOpt, torch.Size]:
+    """Issue the head-scatter Ulysses a2a from a sequence-major input.
+
+    Args:
+        x (torch.Tensor): Batch-1 ``[1, S/sp, A]`` contiguous input (the
+            projection output as produced; no transpose glue).
+        group (dist.ProcessGroup): Sequence-parallel process group.
+
+    Returns:
+        tuple[torch.Tensor, dist.Work | None, torch.Size]: The raw received
+            buffer ``[world, S/sp, A/sp]`` (unreadable until fenced), the work
+            handle, and the ``[1, S, A/sp]`` output shape for
+            ``finish_ulysses_dim1_seq_send``.
+    """
+    world = dist.get_world_size(group)
+    out_shape = torch.Size((1, x.shape[1] * world, x.shape[2] // world))
+    if world == 1:
+        # Honour the "returned as is" contract: Function.apply materializes a
+        # fresh alias even for the world==1 passthrough.
+        return x, None, out_shape
+    recv, work = _AsyncUlyssesDim1SeqSend.apply(x, group)
+    return recv, work, out_shape
+
+
+def finish_ulysses_dim1_seq_send(recv: torch.Tensor, work: _WorkOpt) -> torch.Tensor:
+    """Consume an ``issue_ulysses_dim1_seq_send`` result: fence, then view.
+
+    The received buffer is already sequence-major within and across its
+    per-rank chunks (global token ``s = w * (S/sp) + l`` for chunk ``w``), so
+    no permutation copy is needed.
+
+    Args:
+        recv (torch.Tensor): Raw received buffer from the issue call.
+        work (dist.Work | None): Work handle returned by the issue call.
+
+    Returns:
+        torch.Tensor: The ``[1, S, A/sp]`` movement output, contiguous,
+            safe to read on the current stream.
+    """
+    _wait_a2a(work)
+    return recv.view(1, recv.shape[0] * recv.shape[1], recv.shape[2])
+
+
 def issue_ulysses_dim2(x: torch.Tensor, group: dist.ProcessGroup) -> tuple[torch.Tensor, _WorkOpt, torch.Size]:
     """Issue the sequence-scatter Ulysses a2a without blocking the caller.
 
@@ -455,10 +561,13 @@ def ulysses_scatter_seq_blocking(x: torch.Tensor, group: dist.ProcessGroup) -> t
 __all__ = [
     "a2a_async_enabled",
     "A2A_ASYNC",
+    "A2A_SEND_SEQ_MAJOR",
     "issue_ulysses_dim1",
+    "issue_ulysses_dim1_seq_send",
     "issue_ulysses_dim2",
     "finish_ulysses_dim1",
     "finish_ulysses_dim1_seq_major",
+    "finish_ulysses_dim1_seq_send",
     "finish_ulysses_dim2",
     "ulysses_scatter_heads_blocking",
     "ulysses_scatter_seq_blocking",

@@ -40,6 +40,15 @@ value-correct but deliberately keeps the fla_npu ``input_guard`` clone tax
   ``cached_gate_param`` skips re-deriving the fp32 form of long-lived
   forget-gate parameters on every call (~2.4k materialize chains per training
   step at 30B/128K).
+- ``A2A_SEND_SEQ_MAJOR`` (``XTUNER_KDA_A2A_SEQ_SEND``, default ``0``): the
+  deferred projection a2as issue straight from the sequence-major projections
+  (``issue_ulysses_dim1_seq_send``) and every finish glue is a view, removing
+  one full-tensor permutation copy per direction per a2a versus the
+  head-major issue. Forward values are unchanged; the linear backward now
+  receives a contiguous gradient where the head-major path handed it a
+  transposed view, so GEMM-backward accumulation order (and with it
+  grad_norm at bf16-rounding scale) differs from the head-major path.
+  Ineffective when ``SP_A2A_DEFER=0`` (the blocking schedule does not run).
 
 The ``XTUNER_KDA_SP_A2A_ASYNC`` gate lives in ``xtuner.v1.ops.comm.ulysses_dispatch``
 (consulted inside ``all_to_all.ulysses_all_to_all`` and the deferred primitives'
@@ -57,7 +66,14 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.ops.comm.ulysses_dispatch import finish_ulysses_dim1, finish_ulysses_dim1_seq_major, issue_ulysses_dim1
+from xtuner.v1.ops.comm.ulysses_dispatch import (
+    A2A_SEND_SEQ_MAJOR,
+    finish_ulysses_dim1,
+    finish_ulysses_dim1_seq_major,
+    finish_ulysses_dim1_seq_send,
+    issue_ulysses_dim1,
+    issue_ulysses_dim1_seq_send,
+)
 from xtuner.v1.utils.dtensor import materialize_full
 
 
@@ -190,9 +206,12 @@ def _finish_short_conv(
     sp_rank: int,
     sp_size: int,
     cu_seqlens: torch.Tensor | list[int] | None,
+    seq_send: bool = False,
 ) -> torch.Tensor:
     recv, work, out_shape = issued
-    if SP_A2A_DIRECT_CONV:
+    if seq_send:
+        x = finish_ulysses_dim1_seq_send(recv, work)
+    elif SP_A2A_DIRECT_CONV:
         x = finish_ulysses_dim1_seq_major(recv, work)
     else:
         x = finish_ulysses_dim1(recv, work, out_shape)
@@ -239,26 +258,42 @@ def sp_deferred_projections(
     """
     group = sp_mesh.get_group()
     projection_size = attn.num_heads * attn.head_dim
-    q_local = attn.q_proj(hidden_states).transpose(1, 2)
-    dq = issue_ulysses_dim1(q_local, group)
-    k_local = attn.k_proj(hidden_states).transpose(1, 2)
-    dk = issue_ulysses_dim1(k_local, group)
-    v_local = attn.v_proj(hidden_states).transpose(1, 2)
-    dv = issue_ulysses_dim1(v_local, group)
-    g_raw = attn.f_b_proj(attn.f_a_proj(hidden_states))
-    g_send = g_raw.view(batch_size, seq_len, projection_size).transpose(1, 2)
-    dg = issue_ulysses_dim1(g_send, group)
-    beta_send = attn.b_proj(hidden_states).float().transpose(1, 2)
-    dbeta = issue_ulysses_dim1(beta_send, group)
+    if A2A_SEND_SEQ_MAJOR:
+        # Issue straight from the sequence-major projections: the received
+        # buffers land sequence-major and every finish below is a view.
+        dq = issue_ulysses_dim1_seq_send(attn.q_proj(hidden_states), group)
+        dk = issue_ulysses_dim1_seq_send(attn.k_proj(hidden_states), group)
+        dv = issue_ulysses_dim1_seq_send(attn.v_proj(hidden_states), group)
+        g_raw = attn.f_b_proj(attn.f_a_proj(hidden_states))
+        dg = issue_ulysses_dim1_seq_send(g_raw.view(batch_size, seq_len, projection_size), group)
+        dbeta = issue_ulysses_dim1_seq_send(attn.b_proj(hidden_states).float(), group)
+        seq_send = True
+    else:
+        q_local = attn.q_proj(hidden_states).transpose(1, 2)
+        dq = issue_ulysses_dim1(q_local, group)
+        k_local = attn.k_proj(hidden_states).transpose(1, 2)
+        dk = issue_ulysses_dim1(k_local, group)
+        v_local = attn.v_proj(hidden_states).transpose(1, 2)
+        dv = issue_ulysses_dim1(v_local, group)
+        g_raw = attn.f_b_proj(attn.f_a_proj(hidden_states))
+        g_send = g_raw.view(batch_size, seq_len, projection_size).transpose(1, 2)
+        dg = issue_ulysses_dim1(g_send, group)
+        beta_send = attn.b_proj(hidden_states).float().transpose(1, 2)
+        dbeta = issue_ulysses_dim1(beta_send, group)
+        seq_send = False
 
-    q = _finish_short_conv(attn.q_conv1d, dq, sp_rank, sp_size, cu_seqlens)
-    k = _finish_short_conv(attn.k_conv1d, dk, sp_rank, sp_size, cu_seqlens)
-    v = _finish_short_conv(attn.v_conv1d, dv, sp_rank, sp_size, cu_seqlens)
+    q = _finish_short_conv(attn.q_conv1d, dq, sp_rank, sp_size, cu_seqlens, seq_send=seq_send)
+    k = _finish_short_conv(attn.k_conv1d, dk, sp_rank, sp_size, cu_seqlens, seq_send=seq_send)
+    v = _finish_short_conv(attn.v_conv1d, dv, sp_rank, sp_size, cu_seqlens, seq_send=seq_send)
     # Contiguous by construction; the head-major finish's transposed view would be
     # cloned by the chunk kernel's input_guard on every call (see module docstring).
-    g_raw = finish_ulysses_dim1_seq_major(dg[0], dg[1])
+    if seq_send:
+        g_raw = finish_ulysses_dim1_seq_send(dg[0], dg[1])
+        beta = finish_ulysses_dim1_seq_send(dbeta[0], dbeta[1]).sigmoid()  # (B, L, H/sp)
+    else:
+        g_raw = finish_ulysses_dim1_seq_major(dg[0], dg[1])
+        beta = finish_ulysses_dim1_seq_major(dbeta[0], dbeta[1]).sigmoid()  # (B, L, H/sp)
     g_raw = g_raw.view(batch_size, seq_len * sp_size, attn.num_heads // sp_size, attn.head_dim)
-    beta = finish_ulysses_dim1_seq_major(dbeta[0], dbeta[1]).sigmoid()  # (B, L, H/sp)
     return q, k, v, g_raw, beta
 
 
