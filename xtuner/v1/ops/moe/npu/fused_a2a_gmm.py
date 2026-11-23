@@ -38,13 +38,15 @@ activation + the shared-experts/post-moe merge around ``fused_dispatch_mlp_combi
 
 from __future__ import annotations
 
+import math
 import os
 from typing import TYPE_CHECKING, Any, Callable, cast
 
 import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401  -- NPU-only module; registers npu_alltoallv_gmm / npu_gmm_alltoallv
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from xtuner.v1.module.dispatcher.torch_all2all import (
     TorchAll2AllDispatcher,
@@ -52,6 +54,161 @@ from xtuner.v1.module.dispatcher.torch_all2all import (
 )
 from xtuner.v1.module.grouped_linear.moe_group_linear import GroupedLinear
 from xtuner.v1.ops import permute, unpermute
+from xtuner.v1.utils.dtensor import group_tensors_by_device_mesh_and_placements
+from xtuner.v1.ops.moe.npu.group_gemm import _bwd_power2_scale, _rescale
+
+# ---------------------------------------------------------------------------
+# Host-side arming flag shared by the overflow-safe backward guards (this
+# module's dW loop, the grouped-GEMM backward in group_gemm.py, and the
+# hc_post backward guard in module/decoder_layer/mhc.py). The guards make
+# every storm-step product representable with an exact power-of-two rescale,
+# but deciding whether a rescale is needed costs amax reductions plus a host
+# sync per guarded call -- measurable when every healthy step pays it.
+# Healthy training steps sit 70+ binary orders below any overflow-capable
+# magnitude, so the guards only need to be active once the step's global grad
+# norm leaves the healthy band.
+#
+# The per-step grad-norm computation already pulls the norm to the host, and
+# calls ``arm_from_grad_norm`` once there; the guards consult
+# ``overflow_guard_armed`` (a plain bool read, no device work) at every call. Both states compute the same
+# math: armed runs the power-of-two rescale path, disarmed runs the
+# unmodified original path, which is exact whenever values are inside the
+# healthy band. The default is armed so a cold start (no step has set the
+# flag yet) is never unprotected.
+#
+# The arm threshold (1e4, the same band the grad-NaN diagnostics use) is
+# conservative by construction: a global norm of 1e4 bounds typical elements
+# near 1e2-1e4 and even 1e10-scaled saturated-pack spikes stay tens of binary
+# orders below the ~2^115 product exponent where fp32 accumulation could
+# overflow.
+# ---------------------------------------------------------------------------
+_ARM_NORM_THRESHOLD = 1e4
+# A second, higher band: norms up to this bound keep the guards fully
+# passthrough even while armed, because every operand stays tens of binary
+# orders below any overflow-capable magnitude (a norm of 1e14 bounds
+# elements near 2^30 at most, so the worst product exponent is ~2^60 -- more
+# than 50 bits under the fp32 accumulator's 2^128 cap even after the
+# per-expert row-sum growth budget). Only past this bound do the guards run
+# their per-call amax + sync measurement.
+_DEEP_ARM_NORM_THRESHOLD = 1e14
+_OVERFLOW_GUARD_ARMED = [True]
+_OVERFLOW_GUARD_DEEP = [False]
+
+
+def overflow_guard_armed() -> bool:
+    """Return whether the overflow-safe backward guards should run."""
+    return _OVERFLOW_GUARD_ARMED[0]
+
+
+def overflow_guard_set_armed(armed: bool) -> None:
+    """Force the guard state (tests / tooling): arming also raises the deep
+    band so a forced storm measurement actually engages; disarming clears
+    both."""
+    _OVERFLOW_GUARD_ARMED[0] = bool(armed)
+    _OVERFLOW_GUARD_DEEP[0] = bool(armed)
+
+
+def overflow_guard_deep_armed() -> bool:
+    """Return whether the guards must run their per-call measurement."""
+    return _OVERFLOW_GUARD_DEEP[0]
+
+
+def arm_from_grad_norm(grad_norm) -> None:
+    """Arm the guards when the step's global grad norm leaves the healthy band.
+
+    Called once per optimizer step from the grad-norm computation (which
+    already pulls the norm to the host), so this adds no new sync. A
+    non-finite norm keeps the guards armed (the honest propagation is the
+    guards' passthrough behaviour).
+    """
+    val = grad_norm.detach().float().item()
+    nonfinite = not math.isfinite(val)
+    magnitude = abs(val)
+    _OVERFLOW_GUARD_ARMED[0] = nonfinite or magnitude > _ARM_NORM_THRESHOLD
+    _OVERFLOW_GUARD_DEEP[0] = nonfinite or magnitude > _DEEP_ARM_NORM_THRESHOLD
+
+
+def _overflow_safe_group_norm(tensors: list[DTensor], dtype: torch.dtype) -> torch.Tensor:
+    """L2 norm over one device-mesh group with absmax rescaling (BLAS *LASSQ style).
+
+    The plain sum-of-squares in fp32 overflows to inf for finite gradients
+    whose elements exceed ~1e19 (their squares pass the fp32 cap), which turns
+    a finite-but-huge gradient into an "inf" grad norm and a skipped optimizer
+    step. Scaling each tensor by its absmax before squaring keeps every
+    intermediate O(1): finite inputs yield the exact finite norm whenever it
+    is representable in ``dtype``, while genuine inf/nan elements still
+    propagate to a non-finite result (the step is then skipped, as before).
+    Empty local shards (a legal Shard/_StridedShard shape when the global dim
+    is smaller than the mesh) contribute an exact zero.
+    """
+    per_tensor = []
+    for t in tensors:
+        lt = t.to_local() if isinstance(t, DTensor) else t
+        lt = lt.detach().to(dtype)
+        if lt.numel() == 0:
+            per_tensor.append(lt.new_zeros((), dtype=dtype))
+            continue
+        m = lt.abs().max()
+        n = torch.linalg.vector_norm(lt / m.clamp_min(torch.finfo(dtype).tiny), 2.0, dtype=dtype) * m
+        per_tensor.append(n)
+    stacked = torch.stack(per_tensor)
+    local_scale = stacked.max()
+    local_norm = (
+        torch.linalg.vector_norm(stacked / local_scale.clamp_min(torch.finfo(dtype).tiny), 2.0, dtype=dtype)
+        * local_scale
+    )
+
+    # Distributed combine: an all-reduce of the raw squares would overflow for
+    # the same reason, so reduce the MAX of the local norms first, then the
+    # scaled (<=1) squared norms.
+    placements = tensors[0].placements
+    device_mesh = tensors[0].device_mesh
+    global_scale = local_norm.clone()
+    for i, placement in enumerate(placements):
+        if isinstance(placement, (Shard, _StridedShard)):
+            dist.all_reduce(global_scale, op=dist.ReduceOp.MAX, group=device_mesh.get_group(i))
+        elif isinstance(placement, Replicate):
+            pass
+        else:
+            raise ValueError(f"Unsupported placement type {placement} in overflow_safe_cal_grad_norm")
+    scaled_sq = torch.where(
+        torch.isfinite(local_norm),
+        (local_norm / global_scale.clamp_min(torch.finfo(dtype).tiny)) ** 2,
+        local_norm,
+    )
+    for i, placement in enumerate(placements):
+        if isinstance(placement, (Shard, _StridedShard)):
+            dist.all_reduce(scaled_sq, group=device_mesh.get_group(i))
+        elif isinstance(placement, Replicate):
+            pass
+        else:
+            raise ValueError(f"Unsupported placement type {placement} in overflow_safe_cal_grad_norm")
+    return global_scale * scaled_sq**0.5
+
+
+def overflow_safe_cal_grad_norm(grads: list[DTensor], dtype: torch.dtype = torch.float32):
+    """Overflow-safe L2 grad norm over DTensor gradients; returns ``(total_norm, grouped_grads)``.
+
+    Same grouping and return contract as ``utils.grad_norm.cal_grad_norm``;
+    the reduction is absmax-rescaled so finite-but-huge gradients (saturated
+    safe-gate packs drive expert gradients to 1e24-1e29 per element) yield an
+    exact finite norm instead of inf, and the step clips instead of skipping.
+    Arms the overflow-safe backward guards from the resulting norm.
+    """
+    grouped_all_grads = group_tensors_by_device_mesh_and_placements(grads)
+    per_group = [_overflow_safe_group_norm(group, dtype) for group in grouped_all_grads.values()]
+    stacked = torch.stack(per_group)
+    group_scale = stacked.max()
+    grad_norm = (
+        torch.linalg.vector_norm(stacked / group_scale.clamp_min(torch.finfo(dtype).tiny), 2.0, dtype=dtype)
+        * group_scale
+    ).to(grads[0].dtype)
+    arm_from_grad_norm(grad_norm)
+    return grad_norm, grouped_all_grads
+
+
+
+
 
 
 if TYPE_CHECKING:
@@ -182,6 +339,17 @@ def _dw_matmul_loop(
     ``[E, out, in]`` layout (no transpose). Tolerates empty expert groups (``tokens == 0``) and
     non-contiguous operands, unlike ``npu_gmm_backward``.
 
+    Overflow-safe: the loop
+    contracts huge saturated-gate upstream grads against activations; when the
+    |grad_out| * |gmm_input| product exponent passes the fp32 budget, an exact
+    power-of-two scale (see ``group_gemm._bwd_power2_scale``; s == 0 on
+    healthy steps, so the loop is bit-identical then) keeps every product and partial
+    sum representable and the unscaled result is the true gradient up to
+    normal fp rounding. The sibling dX alltoall+gmm op is NOT rescaled: its
+    a2a mixes rows across EP ranks, so a rank-local scale cannot be undone
+    uniformly -- dX partials are structurally bounded by |grad| * |weight| and
+    no overflow has been observed on that leg.
+
     Args:
         weight (torch.Tensor): native weight ``[E_local, out, in]`` (only its shape/dtype/device
             are used to allocate the result).
@@ -192,14 +360,23 @@ def _dw_matmul_loop(
     Returns:
         torch.Tensor: the weight grad, native ``[E_local, out, in]``.
     """
+    # Disarmed, armed-shallow, and armed-healthy (s == 0) all feed grad_out
+    # to the loop unchanged -- zero copies, bit-identical to the former code;
+    # chunks are GB-scale, so an unconditional copy both wastes bandwidth and
+    # risks OOM. Only past the deep-arm band does a storm chunk (s > 0) scale
+    # the grad copy and unscale the freshly built grad_weight in place.
+    s = _bwd_power2_scale(grad_out, gmm_input) if overflow_guard_deep_armed() else 0
+    grad_src = grad_out if s == 0 else _rescale(grad_out, math.ldexp(1.0, -s))
     grad_weight = torch.zeros_like(weight)
     offset = 0
     for expert in range(weight.shape[0]):
         size = group_list[expert]
         if size > 0:
-            grad_weight[expert] = grad_out[offset : offset + size].t() @ gmm_input[offset : offset + size]
+            grad_weight[expert] = grad_src[offset : offset + size].t() @ gmm_input[offset : offset + size]
         offset += size
-    return grad_weight
+    if s == 0:
+        return grad_weight
+    return _rescale(grad_weight, math.ldexp(1.0, s), inplace=True)
 
 
 class AlltoallvPermuteGmm(torch.autograd.Function):

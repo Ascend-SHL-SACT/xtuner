@@ -102,6 +102,7 @@ carry no runtime probe (see the constants comment and
 
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -2376,3 +2377,106 @@ def _hc_post_eager_matmul(x: Tensor, residual: Tensor, post: Tensor, comb: Tenso
     return post.to(residual.dtype).unsqueeze(-1) * x.unsqueeze(-2) + torch.matmul(
         comb.to(residual.dtype).transpose(-1, -2), residual
     )
+
+
+# ---------------------------------------------------------------------------
+# Overflow-safe backward guard for the hc_post stream update
+# (``new = post ⊙ out + combᵀ @ res``). Lives here with the other mHC
+# autograd components; the decoder layer's ``hc_post`` only wires it.
+#
+# The hc_post backward contracts the huge saturated-pack upstream grad dOut
+# (finite, ~1e28 elements on the storm steps) against the forward operands --
+# ``d(out) = sum_h post_h * dOut_h``, ``d(post) = sum_d dOut * out``,
+# ``d(comb) = sum_d residual * dOut``, ``d(residual) = comb @ dOut`` -- and
+# the elementwise products pass the fp32 cap (2^128) while the reduced true
+# gradients stay representable. The guard scales dOut by an exact power-of-two
+# 2^-s (host-side, s from the four legs' worst product exponent over the
+# budget) entering the inner backward, and unscales the four input grads by
+# 2^s, so every inner product/partial stays in range and the returned grads
+# equal the true values up to normal fp rounding. s == 0 on healthy steps:
+# every hook passes its tensor through unchanged (same object --
+# bit-identical grads). Non-finite operands keep s == 0 so their honest
+# propagation is untouched. Not a fallback: no detection-and-replace, an
+# exact representation choice, same technique as the grouped-GEMM backward
+# guard (ops/moe/npu/group_gemm.py).
+# ---------------------------------------------------------------------------
+_HC_POST_BWD_BUDGET = 96
+
+
+class _HcPostGradScale(torch.autograd.Function):
+    """Identity forward; backward unscales by the hc_post guard's 2^s.
+
+    Sits on the ``residual`` input only: ``residual`` has a second consumer
+    (the paired ``hc_pre``), so its TOTAL grad cannot be rescaled at the
+    tensor-hook level -- this node isolates and unscales exactly the hc_post
+    contribution. Returns the input tensor as-is (bit-identical forward).
+    """
+
+    @staticmethod
+    def forward(ctx, t, state):
+        ctx.state = state
+        return t
+
+    @staticmethod
+    def backward(ctx, g):
+        s = ctx.state["s"]
+        if s <= 0.0:
+            return g, None
+        return g * 2.0**s, None
+
+
+def wrap_hc_post_residual(residual: Tensor, state: dict) -> Tensor:
+    """Phase 1 of the hc_post guard: the ``_HcPostGradScale`` pass-through on
+    ``residual`` -- must run before the inner hc_post call, because residual
+    also feeds the paired ``hc_pre`` and its hc_post contribution has to be
+    isolated up front. Phase 2 (:func:`arm_hc_post_bwd_guard`) attaches the
+    rescale hooks on the inner-call output.
+    """
+    return _HcPostGradScale.apply(residual, state)
+
+
+def arm_hc_post_bwd_guard(out: Tensor, x: Tensor, post: Tensor, comb: Tensor, residual: Tensor, state: dict) -> None:
+    """Phase 2: attach the out-scaling hook and input-unscale hooks (see the
+    section docstring above; the residual pass-through was applied by
+    :func:`wrap_hc_post_residual` before the inner call)."""
+
+    def _exp(t: Tensor) -> tuple[Tensor, Tensor]:
+        m = t.detach().abs().amax()
+        tiny = torch.finfo(t.dtype).tiny
+        e = torch.log2(m.clamp_min(tiny)).floor()
+        return torch.where(torch.isfinite(m), e, torch.zeros_like(e)), m
+
+    def out_hook(g: Tensor) -> Tensor:
+        # Contraction bits per leg: sums over hc_mult (~2^2) for the post/comb
+        # legs, over hidden (~2^13) for the out/residual legs. The finite mask
+        # folds into s (non-finite -> 0 = pass-through), so a single host
+        # read decides the branch.
+        exps, ms = zip(*(_exp(t) for t in (post, x, comb)))
+        res_e, res_m = _exp(residual)
+        e_g, m_g = _exp(g)
+        finite = torch.stack([m_g, res_m, *ms]).isfinite().all()
+        e_max = e_g + torch.stack(exps + (res_e,)).amax() + 13.0  # worst leg reduces over hidden (~2^13)
+        s = torch.where(finite, (e_max - _HC_POST_BWD_BUDGET).clamp_min(0), torch.zeros_like(e_max))
+        s_val = int(s.item())
+        state["s"] = float(s_val)
+        if s_val == 0:
+            return g
+        return g * math.ldexp(1.0, -s_val)
+
+    def make_in_hook():
+        def in_hook(g: Tensor) -> Tensor:
+            s = state["s"]
+            if s <= 0.0:
+                return g
+            return g * math.ldexp(1.0, int(s))
+
+        return in_hook
+
+    out.register_hook(out_hook)
+    # Input hooks only on inputs that carry grad: register_hook raises on a
+    # non-requires-grad tensor, and frozen-input mixed scenarios (partial
+    # freeze) must not crash the guard. A no-grad input receives no gradient,
+    # so skipping its hook is mathematically identical.
+    for t in (x, post, comb):
+        if t.requires_grad:
+            t.register_hook(make_in_hook())

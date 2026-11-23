@@ -556,7 +556,14 @@ def _repack_padded(
     """
     row_elems = tensor.numel() // tensor.shape[1]
     row_bytes = row_elems * tensor.element_size()
-    wide = tensor.dim() in (3, 4) and row_elems >= _SEG_COPY_MIN_ROW_ELEMS and row_elems % _SEG_COPY_D_BLOCK == 0
+    # The triton segment-copy/gather kernels receive raw device pointers: a
+    # CPU tensor's host address reaches the vector core as a device pointer
+    # and faults (aivec invalid-GM, launched asynchronously -- it only
+    # surfaces at the next full stream synchronization). CPU callers take the
+    # pure-torch path below, which is bit-for-bit identical by construction.
+    on_device = tensor.is_npu
+    wide = (on_device and tensor.dim() in (3, 4) and row_elems >= _SEG_COPY_MIN_ROW_ELEMS
+            and row_elems % _SEG_COPY_D_BLOCK == 0)
     if wide:
         # bf16 keeps the tuned 64-row tile (exactly on the byte budget); wider
         # dtypes shrink the row block so the compiled tile stays inside it.
@@ -579,7 +586,8 @@ def _repack_padded(
             num_warps=4,
         )
         return dst.reshape((1, n_padded, *tensor.shape[2:]))
-    if tensor.dim() in (3, 4) and (row_elems & (row_elems - 1)) == 0 and row_bytes <= _SEG_COPY_TILE_BYTES:
+    if (on_device and tensor.dim() in (3, 4) and (row_elems & (row_elems - 1)) == 0
+            and row_bytes <= _SEG_COPY_TILE_BYTES):
         # Narrow rows: flat row gather over the cached pad_to_pack table; the
         # pow2 row-width guard keeps the W arange legal (non-pow2 rows fall
         # through to the monotone gather below). ROWS shrinks with the row
