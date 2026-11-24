@@ -12,14 +12,23 @@ SparseMLABackend = Literal["torch", "tilelang", "cudnn_dsa", "flash_mla", "flash
 DSAIndexerBackend = Literal[
     "torch", "tilelang", "cudnn_dsa", "flash_mla", "torch_npu", "deep_gemm_fp8", "cute_dsl", "tilelang_deepselect"
 ]
-# GLM-5.3-Flash's KPool indexer (design doc F5.a) only has these two: "torch" is the eager
-# reference path, "tilelang" is the only production kernel today -- unlike GLM-5.2's per-token
-# DSAIndexerBackend, there's no cudnn_dsa/flash_mla/deep_gemm_fp8/cute_dsl KPool kernel.
-# "torch_npu" adds the Ascend backend (fused lightning scoring on NPU, chunked-eager fallback
-# elsewhere). "tilelang_cooperative" is cooperative BF16 scoring + DeepSelect and retains the
-# original TileLang backend. "tilelang_deepselect" replaces only the TopK; both DeepSelect
-# variants keep KPool's TileLang-compatible output contract.
-KPoolIndexerBackend = Literal["torch", "tilelang", "tilelang_cooperative", "tilelang_deepselect", "torch_npu"]
+# GLM-5.3-Flash's KPool indexer (design doc F5.a): "torch" is the eager reference path,
+# "tilelang" is the production kernel -- unlike GLM-5.2's per-token DSAIndexerBackend, there's
+# no cudnn_dsa/flash_mla/deep_gemm_fp8/cute_dsl KPool kernel. "torch_npu" adds the Ascend
+# backend (fused lightning scoring on NPU, chunked-eager fallback elsewhere).
+# "tilelang_cooperative" is cooperative BF16 scoring + DeepSelect and retains the original
+# TileLang backend. "tilelang_deepselect" replaces only the TopK; both DeepSelect variants
+# keep KPool's TileLang-compatible output contract. "lmdeploy_fp8"/"lmdeploy_bf16" add the
+# LMDeploy KPool backends.
+KPoolIndexerBackend = Literal[
+    "torch",
+    "tilelang",
+    "tilelang_cooperative",
+    "tilelang_deepselect",
+    "torch_npu",
+    "lmdeploy_fp8",
+    "lmdeploy_bf16",
+]
 
 
 class SparseMLAOutputs(NamedTuple):

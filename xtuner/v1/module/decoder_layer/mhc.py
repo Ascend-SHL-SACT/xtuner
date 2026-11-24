@@ -10,7 +10,8 @@
 # shared, model-agnostic ``xtuner/v1/module/decoder_layer/mhc.py`` the design doc calls for
 # (doc/xtuner_glm5p3flash_design.md F4), dropping the DeepSeek-V4-specific
 # ``XTUNER_V4_HF_PARITY`` global toggle and the optional ``quack`` fused-RMSNorm fast path
-# (neither exists on this branch; the eager fallback here is already bit-faithful to HF).
+# (neither exists on this branch). The post expansion retains FP32 coefficients and
+# intermediates, rather than reproducing HF's intermediate BF16 rounding.
 """Manifold-Constrained Hyper-Connections (mHC) primitives.
 
 The HC machinery keeps ``hc_mult`` copies of the hidden state and replaces the plain
@@ -82,14 +83,15 @@ __all__ = ["MHCConfig", "hc_split_sinkhorn", "hc_pre", "hc_post"]
 # doc/progress.md F4) rather than silently wired to a nonexistent module.
 _USE_MHC_KERNELS = os.getenv("XTUNER_USE_MHC_KERNELS", "0") == "1"
 
-# Debug-only parity escape for NPU: XTUNER_HC_POST_FUSED=0 restores HEAD's HF
-# broadcast form (_hc_post_eager) for regression bisecting / HF parity debugging. The
-# default NPU numerics are deliberately the matmul form (_hc_post_eager_matmul, run81
-# anchor; approved 1.9e-4 loss deviation from the broadcast form) -- without this
-# switch no env combination reproduces HEAD bit-for-bit on NPU. The broadcast form
-# costs ~14 s/step at the 30B shape (materializes the [B, S, H, H, D] intermediate);
-# never set 0 for production runs. The flag is defined in xtuner.v1.ops.mhc_fused and
-# imported above.
+# Debug-only parity escape for NPU: XTUNER_HC_POST_FUSED=0 restores the HF
+# broadcast form (_hc_post_eager, fp32) for regression bisecting. The default NPU
+# numerics are deliberately the matmul form (_hc_post_eager_matmul, approved
+# 1.9e-4 loss deviation from the broadcast form) -- the two forms are close but
+# NOT bit-identical on NPU, and the broadcast form costs ~14 s/step at the 30B
+# shape (materializes the [B, S, H, H, D] intermediate); never set 0 for
+# production runs. The flag is defined in xtuner.v1.ops.mhc_fused and imported
+# above. After the mainline fp32-math sync, the broadcast form is fp32-exact,
+# so bit-comparisons should anchor on the matmul form, not on it.
 
 
 class MHCConfig(BaseModel):
@@ -222,13 +224,13 @@ def hc_pre(
     """
     shape, dtype = x.size(), x.dtype
     x_flat = x.flatten(2)
-    # NPU fused path (the pre-merge GLM-5.3 implementation's default, i.e. the run81 128K
-    # anchor numerics): bf16 norm+projection via the rstd-factoring identity -- never
-    # materialises the [T, H*D] fp32 normed copy -- plus the on-chip split-Sinkhorn (the
-    # eager chain issues ~5 tiny kernels per Sinkhorn iteration, ~700K instances/step).
-    # Both ops fall back internally (``None`` return / device+hc_mult gate) and the eager
-    # chain below is the CPU reference; the readout is the fused triton collapse by
-    # default (as run81), with XTUNER_HC_COLLAPSE_FUSED=0 falling back to eager.
+    # NPU fused path (the GLM-5.3 implementation's default numerics): bf16
+    # norm+projection via the rstd-factoring identity -- never materialises the
+    # [T, H*D] fp32 normed copy -- plus the on-chip split-Sinkhorn (the eager chain
+    # issues ~5 tiny kernels per Sinkhorn iteration, ~700K instances/step). Both ops
+    # fall back internally (``None`` return / device+hc_mult gate) and the eager chain
+    # below is the CPU reference; the readout is the fused triton collapse by default,
+    # with XTUNER_HC_COLLAPSE_FUSED=0 falling back to eager.
     fused_mixes = None
     if _mhc_norm_linear is not None and x_flat.device.type == "npu":
         fused_mixes = _mhc_norm_linear(x_flat.reshape(-1, x_flat.size(-1)), hc_fn.to(dtype), norm_eps)
@@ -261,21 +263,17 @@ def hc_post(x: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
     """Expand the single-stream block output back into ``hc_mult`` streams.
 
     ``out[..., h, d] = post[..., h] * x[..., d] + sum_{h'} comb[..., h', h] * residual[..., h', d]``,
-    matching HF's ``Glm5NextTextDecoderLayer.forward``::
+    with the mathematical contraction::
 
-        hidden_states = post.to(dtype).unsqueeze(-1) * hidden_states.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), residual
-        )
+        out = post.float().unsqueeze(-1) * x.float().unsqueeze(-2)
+        out += torch.matmul(comb.float().transpose(-1, -2), residual.float())
 
     ``comb`` is doubly-stochastic but **not symmetric**, so the ``transpose(-1, -2)`` (the
     reduction runs over the *first* hc axis of ``comb``) is semantically required, not a
     perf rearrangement.
 
-    Dispatches to a fused Triton kernel (:func:`xtuner.v1.ops.hc_post.hc_post_fused`) on the
-    default bf16/CUDA path: the naive broadcast-multiply + reduce-sum below re-reads
-    ``residual`` once per output stream, which is HBM-bound at pack=16384; the Triton kernel
-    reads ``residual`` once per token and does the ``hc_mult x hc_mult`` mix in registers.
-    Non-CUDA / non-bf16 inputs fall back to the eager path.
+    CUDA BF16 inputs use the fused kernel. Coefficients and intermediates stay
+    FP32 until the final output cast; the fallback uses the same precision policy.
 
     Args:
         x (Tensor): Inner-block output, shape ``[B, S, hidden_size]``.
@@ -287,7 +285,7 @@ def hc_post(x: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
 
     Returns:
         Tensor: Updated HC-expanded streams, shape ``[B, S, hc_mult, hidden_size]``, cast
-            back to ``x.dtype``.
+            back to ``residual.dtype``.
     """
     if _USE_MHC_KERNELS:
         raise NotImplementedError(
@@ -356,24 +354,11 @@ def _hc_post_fused_available() -> bool:
 
 @maybe_compile
 def _hc_post_eager(x: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
-    """Eager fp32-accumulate ``hc_post``, bit-faithful to HF's ``torch.matmul``
-    expression.
+    """FP32-coefficient fallback with one final output cast.
 
-    WARNING: this function MUST stay in the active compile cfg. Running it eagerly would
-    materialize the ``[B, S, H, H, D]`` intermediate the broadcast-multiply implies -- at
-    pack=16384, ``hc_mult=4``, ``hidden_size=4096`` that is ~8 GB. Under compile, inductor
-    fuses the multiply with the trailing ``sum(dim=-2)`` into a single kernel that never
-    materializes it. Both GLM-5.3-Flash tables in ``xtuner/v1/model/moe/glm53/glm53.py`` list
-    it by name, including the EP one, which drops the enclosing decoder-layer boundary.
+    The explicit stream loop avoids materializing an H-by-H-by-D intermediate.
     """
-    post_dt = post.to(residual.dtype)
-    comb_b = comb.to(residual.dtype)
-    mixed = (
-        (
-            comb_b.float().transpose(-1, -2).unsqueeze(-1)  # [B, S, H_out, H_in, 1]
-            * residual.float().unsqueeze(-3)  # [B, S, 1,     H_in, D]
-        )
-        .sum(dim=-2)
-        .to(residual.dtype)
-    )  # -> [B, S, H_out, D]  (sum over H_in)
-    return post_dt.unsqueeze(-1) * x.unsqueeze(-2) + mixed
+    out = post.float().unsqueeze(-1) * x.float().unsqueeze(-2)
+    for hi in range(residual.size(-2)):
+        out = out + comb[..., hi, :].float().unsqueeze(-1) * residual[..., hi, :].float().unsqueeze(-2)
+    return out.to(residual.dtype)
