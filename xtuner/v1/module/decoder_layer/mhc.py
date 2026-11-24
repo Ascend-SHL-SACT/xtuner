@@ -25,6 +25,7 @@ Consumed by ``xtuner/v1/model/moe/glm53/decoder_layer.py``, which wraps its atte
 FFN sub-blocks with this ``hc_pre`` / sub_block / ``hc_post`` pattern.
 """
 
+import math
 import os
 
 import torch
@@ -299,20 +300,42 @@ def hc_post(x: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
         # report ``is_cuda == True``, which would route Ascend onto the CUDA-only Triton
         # kernel below and die in BiShengIR (UB overflow compiling _hc_post_bwd_dred_kernel
         # on 910C), so the NPU dispatch must return before the CUDA gate is evaluated.
+        from xtuner.v1.ops.moe.npu.fused_a2a_gmm import overflow_guard_deep_armed
+
+        # Overflow-safe backward guard (see xtuner.v1.ops.mhc_fused): the implementation
+        # lives with the other mHC autograd components; this site only wires it, and only
+        # past the deep-arm grad-norm band (shallower steps take the unmodified path below
+        # with zero overhead). residual is wrapped BEFORE the dispatch -- it has a second
+        # consumer (the paired hc_pre), so its hc_post contribution must be isolated up front.
+        from xtuner.v1.ops.mhc_fused import arm_hc_post_bwd_guard, wrap_hc_post_residual
+
+        guard_state = (
+            {"s": 0.0, "residual": residual}
+            if overflow_guard_deep_armed()
+            and torch.is_grad_enabled()
+            and (x.requires_grad or residual.requires_grad or post.requires_grad or comb.requires_grad)
+            else None
+        )
+        if guard_state is not None:
+            residual = wrap_hc_post_residual(residual, guard_state)
         if not _HC_POST_FUSED:
             # Parity escape hatch (see the module-level env note): HEAD's HF broadcast
             # form, slow but bit-comparable against non-NPU reference runs.
-            return _hc_post_eager(x, residual, post, comb)
+            out = _hc_post_eager(x, residual, post, comb)
         # Fused triton combine by default (XTUNER_HC_COMBINE_FUSED=1, net device-time
         # win); XTUNER_HC_COMBINE_FUSED=0 falls back to the matmul form in
         # xtuner.v1.ops.mhc_fused.
-        if _hc_combine is not None:
-            return _hc_combine(post, comb, x, residual)
-        if _hc_post_eager_matmul is not None:
-            return _hc_post_eager_matmul(x, residual, post, comb)
-        # mhc_fused failed to import (triton-less NPU box): fall back to the pure-torch
-        # broadcast form, which is NPU-safe and bit-comparable against HEAD.
-        return _hc_post_eager(x, residual, post, comb)
+        elif _hc_combine is not None:
+            out = _hc_combine(post, comb, x, residual)
+        elif _hc_post_eager_matmul is not None:
+            out = _hc_post_eager_matmul(x, residual, post, comb)
+        else:
+            # mhc_fused failed to import (triton-less NPU box): fall back to the pure-torch
+            # broadcast form, which is NPU-safe and bit-comparable against HEAD.
+            out = _hc_post_eager(x, residual, post, comb)
+        if guard_state is not None:
+            arm_hc_post_bwd_guard(out, x, post, comb, residual, guard_state)
+        return out
     if residual.is_cuda and residual.dtype == torch.bfloat16 and _hc_post_fused_available():
         from xtuner.v1.ops.hc_post import hc_post_fused
 
