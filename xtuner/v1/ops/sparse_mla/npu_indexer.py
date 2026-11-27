@@ -20,11 +20,8 @@ import weakref
 from collections.abc import Callable
 
 import torch
-import torch_npu
 
 from xtuner.v1.data_proto import SequenceContext
-
-from .kpool_npu import pack_visible_tail_enabled
 
 
 def npu_dsa_topk_indices(
@@ -37,7 +34,15 @@ def npu_dsa_topk_indices(
     index_topk: int,
     query_chunk_size: int | None = None,
 ) -> torch.Tensor:
-    """NPU fused DSA top-k index computation.
+    """NPU fused DSA top-k index computation (GLM-5.2 per-token producer).
+
+    Unconditionally unavailable: index rows are span-dense packed (see
+    :func:`kpool_npu.pack_visible_tail_into`) and this producer pads -1 at
+    arbitrary in-span slots, which the kernel backward reads as raw negative
+    indices (AICORE exception). The legacy rewrite-to-self consumer that made
+    it runnable was removed with the packed-layout owner decision (xtuner#153);
+    the GLM-5.3 kpool producer (:func:`kpool_npu.npu_kpool_topk_indices`) builds
+    the packed rows directly.
 
     Args:
         q: Indexer query ``[1, S, Ni, Di]``.
@@ -51,53 +56,15 @@ def npu_dsa_topk_indices(
             launch, and non-``None`` values are rejected upstream by
             ``_validate_query_chunk_size``.
 
-    Returns:
-        ``[S, 1, K]`` int32 tensor. Invalid slots padded with -1.
+    Raises:
+        RuntimeError: always -- see the module note above.
     """
-    # This producer pads -1 at arbitrary in-span slots. Under the pack gate the
-    # consumer passes rows through unrewritten, and the kernel backward reads an
-    # in-span -1 as a raw negative index (AICORE exception), so fail loudly here.
-    if pack_visible_tail_enabled():
-        raise RuntimeError(
-            "npu_dsa_topk_indices pads -1 inside the causal read span and must not run "
-            "while XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL is enabled"
-        )
-    # Contract (see DSATopKIndicesProtocol): implementations own the full
-    # Indexer score scaling, including ``Ni**-0.5``; the caller passes the raw
-    # float32 ``weights_proj`` output. The TND/BSND paths below additionally
-    # apply the ``Di**-0.5`` factor their fused kernels expect.
-    weights = weights * (q.shape[2] ** -0.5)
-    query_len = q.shape[1]
-    kv_len = k.shape[1]
-    topk = min(index_topk, kv_len)
+    raise RuntimeError(
+        "npu_dsa_topk_indices pads -1 inside the causal read span and cannot produce "
+        "the span-dense packed index rows the sparse_mode=3 kernels require "
+        "(use kpool_npu.npu_kpool_topk_indices)"
+    )
 
-    cu_seq_lens = seq_ctx.cu_seq_lens_q
-    num_segments = cu_seq_lens.numel() - 1
-
-    if num_segments > 1:
-        topk_indices = _indexer_tnd_packed(
-            q,
-            k,
-            weights,
-            seq_ctx,
-            cu_seq_lens,
-            query_len,
-            kv_len,
-            topk,
-            index_head_dim,
-        )
-    else:
-        topk_indices = _indexer_bsnd_single(q, k, weights, seq_ctx, query_len, kv_len, topk)
-    # Keep the [S, 1, K] top-k cache int32: indices are bounded by the global
-    # kv_len (< 2**31), every consumer (ring remap, _rewrite_invalid_indices,
-    # _global_to_local_indices, npu_sparse_flash_attention[_grad]) is
-    # dtype-following, and the kernel takes int32. Halves the long-lived
-    # per-rank cache residency ([S_local, 1, K] per shared-source layer; e.g.
-    # 2 such layers at the 13B default cadence, 128 MiB per source at
-    # 256K/CP16). Arithmetic transients are only partially affected: the cast
-    # adds one [S, 1, K] copy here, while the packed-causal mask fill in the
-    # TND path below stays int32 end to end (the BSND path still fills int64).
-    return topk_indices.to(torch.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -237,232 +204,3 @@ def _compute_prefix_extended_kv_slice(
     cu_q = torch.tensor(rank_cu_q, dtype=torch.int32, device=device)
     cu_kv = torch.tensor(rank_cu_kv, dtype=torch.int32, device=device)
     return cu_q, cu_kv, kv_start, kv_end
-
-
-def _local_to_global_indices(
-    topk_indices: torch.Tensor,
-    cu_seq_q_local: torch.Tensor,
-    cu_seq_k_local: torch.Tensor,
-    kv_slice_offset: int,
-    query_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Convert per-segment local indices to global indices.
-
-    Both V1 and V2 kernels return per-segment local indices (each segment
-    starts from 0). This function converts them to global indices via::
-
-        global = local + kv_seg_start + kv_slice_offset
-
-    where ``kv_seg_start`` is the KV segment's start in the local KV slice
-    (from ``cu_seq_k_local[:-1]``), and ``kv_slice_offset`` is the global
-    offset of the KV slice (``kv_start`` for SP>1, 0 for SP=1).
-    """
-    kv_seg_starts = cu_seq_k_local[:-1]
-    q_positions = torch.arange(query_len, device=device)
-    seg_idx = torch.searchsorted(cu_seq_q_local[1:], q_positions, right=True)
-    seg_offsets = kv_seg_starts[seg_idx] + kv_slice_offset
-
-    topk_indices = topk_indices.squeeze(1)  # [S, K]
-    valid = topk_indices >= 0
-    topk_indices = torch.where(valid, topk_indices + seg_offsets[:, None], topk_indices)
-    return topk_indices.unsqueeze(1)  # [S, 1, K]
-
-
-def _apply_packed_causal_mask(
-    topk_indices: torch.Tensor,
-    seq_ctx: SequenceContext,
-    query_len: int,
-    kv_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Filter global indices through packed causal mask.
-
-    Sets indices to -1 for KV positions beyond the query's causal range
-    (query at global position ``p`` can only attend to ``[seg_start, p+1)``).
-    """
-    starts, ends = seq_ctx.packed_causal_query_ranges(query_len, device)
-    safe = topk_indices.clamp(min=0, max=kv_len - 1)
-    # Broadcast range check: valid[q,j] = starts[q] <= safe[q,j] < ends[q].
-    # Avoids building a [query_len, kv_len] bool mask and gathering over it.
-    valid = (safe >= starts[:, None, None]) & (safe < ends[:, None, None])
-    # Arithmetic fill (not masked_fill): valid slot -> topk_indices, invalid -> -1.
-    # Keep the fill in the indices' own dtype (int32); index values are
-    # bounded by kv_len so the products stay representable.
-    fill = valid.to(topk_indices.dtype)
-    return topk_indices * fill - (~valid).to(topk_indices.dtype)
-
-
-def _packed_causal_mask(
-    seq_ctx: SequenceContext,
-    query_len: int,
-    kv_len: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Build packed causal mask ``[query_len, kv_len]``."""
-    starts, ends = seq_ctx.packed_causal_query_ranges(query_len, device)
-    cols = torch.arange(kv_len, device=device)[None, :]
-    return (cols >= starts[:, None]) & (cols < ends[:, None])
-
-
-# ---------------------------------------------------------------------------
-# Single-sequence path (BSND)
-# ---------------------------------------------------------------------------
-
-
-def _indexer_bsnd_single(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    seq_ctx: SequenceContext,
-    query_len: int,
-    kv_len: int,
-    topk: int,
-) -> torch.Tensor:
-    """Single-sequence: BSND layout, sparse_mode=3 handles causal."""
-    q_bsnd = q.contiguous().to(torch.bfloat16)
-    k_bsnd = k.unsqueeze(2).contiguous().to(torch.bfloat16)
-    w_bsnd = weights.contiguous().to(torch.bfloat16)
-
-    topk_indices, _ = torch_npu.npu_lightning_indexer(
-        q_bsnd,
-        k_bsnd,
-        w_bsnd,
-        layout_query="BSND",
-        layout_key="BSND",
-        sparse_count=topk,
-        sparse_mode=3,
-        return_value=True,
-    )
-    topk_indices = topk_indices.squeeze(0).to(torch.int64)  # [S, 1, K]
-
-    # Safety: apply packed causal mask (no-op for single sequence)
-    if hasattr(seq_ctx, "packed_causal_query_ranges"):
-        topk_indices = _apply_packed_causal_mask(
-            topk_indices,
-            seq_ctx,
-            query_len,
-            kv_len,
-            q.device,
-        )
-    return topk_indices
-
-
-# ---------------------------------------------------------------------------
-# Packed multi-sequence path (TND)
-# ---------------------------------------------------------------------------
-
-
-def _indexer_tnd_packed(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    seq_ctx: SequenceContext,
-    cu_seq_lens: torch.Tensor,
-    query_len: int,
-    kv_len: int,
-    topk: int,
-    index_head_dim: int,
-) -> torch.Tensor:
-    """Packed multi-sequence: TND layout + cu_seq_lens.
-
-    SP=1: V1 ``npu_lightning_indexer`` with global KV and global cu_seq_lens.
-    SP>1: V2 ``cann_ops_transformer.lightning_indexer`` with prefix-extended
-          KV slice and asymmetric cu_seq_q / cu_seq_kv (same segment count,
-          different per-segment lengths — V2 supports this natively).
-    """
-    device = q.device
-    shard_start = getattr(seq_ctx, "_shard_start", 0)
-
-    # BSND → TND: [1, S, N, D] → [S, N, D]
-    q_tnd = q.squeeze(0).contiguous().to(torch.bfloat16)  # [S, Ni, Di]
-    # V2 requires float32 weights; V1 also accepts float32
-    w_tnd = (weights.squeeze(0) * (index_head_dim**-0.5)).contiguous().to(torch.float32)
-
-    is_sp1, cu_seq_q_global, slice_meta = get_sp_mode_and_slice(
-        seq_ctx, shard_start, query_len, device, _compute_prefix_extended_kv_slice
-    )
-
-    if is_sp1:
-        # ── SP=1: V1 kernel with global KV ──
-        k_tnd = k.squeeze(0).unsqueeze(1).contiguous().to(torch.bfloat16)
-        cu_seq_q_local = cu_seq_q_global
-        cu_seq_k_local = seq_ctx.cu_seq_lens_k_on(device).to(torch.int32)
-        kv_slice_offset = 0
-
-        topk_indices, _ = torch_npu.npu_lightning_indexer(
-            q_tnd,
-            k_tnd,
-            w_tnd,
-            actual_seq_lengths_query=cu_seq_q_local,
-            actual_seq_lengths_key=cu_seq_k_local,
-            layout_query="TND",
-            layout_key="TND",
-            sparse_count=topk,
-            sparse_mode=3,
-            return_value=True,
-        )
-    else:
-        # ── SP>1: V2 kernel with prefix-extended KV slice ──
-        from cann_ops_transformer.ops import lightning_indexer as _li_v2
-        from cann_ops_transformer.ops import lightning_indexer_metadata as _li_v2_meta
-
-        assert slice_meta is not None
-        cu_seq_q_local, cu_seq_k_local, kv_start, kv_end = slice_meta
-
-        # Slice KV to [kv_start, kv_end] — may be wider than [shard_start, shard_end]
-        k_tnd = k.squeeze(0)[kv_start:kv_end].unsqueeze(1).contiguous().to(torch.bfloat16)
-        kv_slice_offset = kv_start
-
-        meta = _li_v2_meta(
-            num_heads_q=q.shape[2],
-            num_heads_k=1,
-            head_dim=index_head_dim,
-            topk=topk,
-            cu_seqlens_q=cu_seq_q_local,
-            cu_seqlens_k=cu_seq_k_local,
-            batch_size=cu_seq_q_local.numel() - 1,
-            max_seqlen_q=query_len,
-            max_seqlen_k=kv_end - kv_start,
-            layout_q="TND",
-            layout_k="TND",
-            mask_mode=3,
-            cmp_ratio=1,
-        )
-        topk_indices, _ = _li_v2(
-            q_tnd,
-            k_tnd,
-            w_tnd,
-            topk,
-            cu_seqlens_q=cu_seq_q_local,
-            cu_seqlens_k=cu_seq_k_local,
-            metadata=meta,
-            max_seqlen_q=query_len,
-            layout_q="TND",
-            layout_k="TND",
-            mask_mode=3,
-            cmp_ratio=1,
-            return_value=0,
-        )
-
-    # ── Common: per-segment local → global indices ──
-    # Stay in the kernel's native int32: every value is bounded by the
-    # global kv_len and the returned cache dtype is int32 anyway.
-    topk_indices = topk_indices.to(torch.int32)
-    topk_indices = _local_to_global_indices(
-        topk_indices,
-        cu_seq_q_local,
-        cu_seq_k_local,
-        kv_slice_offset,
-        query_len,
-        device,
-    )
-
-    # ── Common: packed causal mask filter ──
-    return _apply_packed_causal_mask(
-        topk_indices,
-        seq_ctx,
-        query_len,
-        kv_len,
-        device,
-    )

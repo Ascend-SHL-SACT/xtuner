@@ -29,7 +29,7 @@ TestKpoolDegenerateSlot（NPU）
         零打分 spy、dtype/shape 契约与"两条路径顺序确有差异"。
     test_degenerate_slot_set_equivalence_tie_stress: q/k 取三值 randint(-1,0,1) 制造大量精确 fp32 平分、
         分数序任意时集合级契约仍成立。
-    test_degenerate_slot_layout_edge_cases: 单 token 文档（prefix=0 全无效）、len<kpool、len%kpool!=0、
+    test_degenerate_slot_layout_edge_cases: 单 token 文档（prefix=0 行 = [自身] + -1）、len<kpool、len%kpool!=0、
         单文档等退化布局逐一集合等价。
     test_degenerate_boundary_max_pools_select_k_minus_one: 2044-token 文档使 max_pools == select_k - 1，
         恰走退化分支：spy 全零、dtype/shape 与集合等价成立。
@@ -183,7 +183,7 @@ def _run_topk(
         index_kpool (int): 池大小。
 
     Returns:
-        Tensor: ``[S, 1, kpool_output_width(...)]`` int32 输出。
+        Tensor: ``[S, 1, index_topk]`` int32 packed 输出。
     """
     monkeypatch.setattr(kpool_npu, "_BATCHED_SCORE", batched)
     q, k, gate, weights, ape = inputs
@@ -243,123 +243,6 @@ def score_spy(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     return counts
 
 
-def _row_prefixes(doc_lens: list[int], index_kpool: int) -> list[int]:
-    """逐行的因果可见池前缀 ``(local_pos + 1) // index_kpool``（展平后的 packed 行序）。
-
-    Args:
-        doc_lens (list[int]): 各文档 token 数。
-        index_kpool (int): 池大小。
-
-    Returns:
-        list[int]: 长度 ``sum(doc_lens)`` 的每行可见池数。
-    """
-    prefixes: list[int] = []
-    for ln in doc_lens:
-        for pos in range(ln):
-            prefixes.append((pos + 1) // index_kpool)
-    return prefixes
-
-
-def _row_tail_counts(doc_lens: list[int], index_kpool: int) -> list[int]:
-    """逐行的可见尾 token 数 ``(local_pos + 1) % index_kpool``（展平后的 packed 行序）。
-
-    Args:
-        doc_lens (list[int]): 各文档 token 数。
-        index_kpool (int): 池大小。
-
-    Returns:
-        list[int]: 长度 ``sum(doc_lens)`` 的每行尾 token 数。
-    """
-    tails: list[int] = []
-    for ln in doc_lens:
-        for pos in range(ln):
-            tails.append((pos + 1) % index_kpool)
-    return tails
-
-
-def _monotone_inputs(
-    doc_lens: list[int],
-    *,
-    num_heads: int = 8,
-    head_dim: int = 128,
-    index_kpool: int = 4,
-    device: str | torch.device = DEVICE,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """构造"池分数随文档内列 id 严格单调递增"的输入（两条路径的选中列顺序因此可预测）。
-
-    手法：k 只在 dim 0 取 ``(文档内列 id + 1)``、其余维全 0；q 只在 dim 0 取 1；gate 与 ape 全 0 使池内
-    softmax 均匀、池键恰等于池内公共 token 值；weights 全 1。于是 ``score(row, c)`` 严格随列 id ``c``
-    递增：legacy 的降序 topk 给出降列序，退化分支给出升列序，顺序差异可被闭式金标准逐位锁定。
-
-    Args:
-        doc_lens (list[int]): 各文档 token 数（须全部短于 ``select_k * index_kpool``，即退化负载）。
-        num_heads (int): indexer 头数 NH。
-        head_dim (int): indexer 头维 D（也是 index_head_dim）。
-        index_kpool (int): 池大小。
-        device (str | torch.device): 张量设备。
-
-    Returns:
-        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: ``(q, k, gate_scores, weights, kpool_ape)``，形状依次为
-            ``[1, S, NH, D]`` / ``[1, S, D]`` / ``[1, S, D]`` / ``[1, S, NH]`` / ``[index_kpool, D]``（与
-            ``npu_kpool_topk_indices`` 的入参契约一致，``k``/``gate_scores`` 必须带批量维——单 token 文档的
-            ``[S, D]`` 输入会被 ``squeeze(0)`` 误降维）。
-    """
-    total = sum(doc_lens)
-    col_of_token = torch.zeros(total, dtype=torch.int64, device=device)
-    start = 0
-    for ln in doc_lens:
-        col_of_token[start : start + ln] = torch.arange(ln, device=device) // index_kpool
-        start += ln
-    k = torch.zeros(1, total, head_dim, dtype=torch.bfloat16, device=device)
-    k[:, :, 0] = (col_of_token + 1).to(torch.bfloat16)
-    q = torch.zeros(1, total, num_heads, head_dim, dtype=torch.bfloat16, device=device)
-    q[..., 0] = 1.0
-    gate = torch.zeros(1, total, head_dim, dtype=torch.bfloat16, device=device)
-    weights = torch.ones(1, total, num_heads, dtype=torch.bfloat16, device=device)
-    ape = torch.zeros(index_kpool, head_dim, dtype=torch.bfloat16, device=device)
-    return q, k, gate, weights, ape
-
-
-def _degenerate_golden(
-    doc_lens: list[int],
-    *,
-    index_topk: int,
-    index_kpool: int,
-    column_order: str,
-) -> Tensor:
-    """退化负载下 ``npu_kpool_topk_indices`` 语义区 + 尾槽的闭式金标准（纯 CPU 算术，不依赖实现）。
-
-    每行可见前缀 ``prefix = (local_pos + 1) // index_kpool`` 个真实池列全部有效：``column_order="column_asc"``
-    对应退化分支的列序（第 j 个选中列 = j），``"score_desc"`` 对应 legacy 在严格递增分数下的降序 topk
-    （第 j 个选中列 = prefix - 1 - j）。池列 c 覆盖 token ``doc_start + c * index_kpool + slot``；尾槽与
-    ``_visible_tail_tokens`` 同式（``token_id - tail_count + 1 + i``，i < tail_count），其余槽 -1。
-
-    Args:
-        doc_lens (list[int]): 各文档 token 数（须全部短于 ``select_k * index_kpool``）。
-        index_topk (int): 语义 token 预算。
-        index_kpool (int): 池大小。
-        column_order (str): ``"column_asc"``（退化分支列序）或 ``"score_desc"``（legacy 分数序）。
-
-    Returns:
-        Tensor: ``[S, kpool_output_width(index_topk, index_kpool, 512)]`` int32 CPU 金标准。
-    """
-    width = kpool.kpool_output_width(index_topk, index_kpool, 512)
-    exp = torch.full((sum(doc_lens), width), -1, dtype=torch.int32)
-    select_k = index_topk // index_kpool
-    doc_start = 0
-    for ln in doc_lens:
-        for local in range(ln):
-            row = doc_start + local
-            prefix = min((local + 1) // index_kpool, select_k)
-            for j in range(prefix):
-                col = j if column_order == "column_asc" else prefix - 1 - j
-                for slot in range(index_kpool):
-                    exp[row, j * index_kpool + slot] = doc_start + col * index_kpool + slot
-            tail_count = (local + 1) % index_kpool
-            for i in range(tail_count):
-                exp[row, index_topk + i] = row - tail_count + 1 + i
-        doc_start += ln
-    return exp
 
 
 def _assert_prefix_complete_set_equivalence(
@@ -370,19 +253,21 @@ def _assert_prefix_complete_set_equivalence(
     index_topk: int,
     index_kpool: int,
 ) -> None:
-    """断言两条路径输出满足"可见前缀内的池列全部有效"的集合级契约（刻意不做逐位比较）。
+    """断言两条路径输出满足 packed 行集合契约（刻意不做逐位比较）。
 
-    契约来源：select_k 不小于任何行的可见前缀时（退化负载必然如此；max_pools == select_k 的批量分支
-    边界亦然），两条路径每行选中的都是该行可见前缀内的全部真实池列，经算术展开后有效 token id 恰为连续
-    区间 ``[doc_start, doc_start + prefix * index_kpool)``。因此断言：每行有效 slot 数相等且等于
-    ``prefix * index_kpool``、排序后的有效 token id 等于该区间。有效 id 的行内顺序刻意不比较——列序与
-    分数序是设计内差异（下游 gather 消费者以 fp32 累加、对顺序不敏感）。
+    契约分两类行：
+    - ``p+1 <= index_topk``（读窗行）：可见池全部入选，packed 读窗 = 连续区间
+      ``[doc_start, doc_start + min(local_pos + 1, index_topk))``——两臂都等于该闭式。
+    - ``p+1 > index_topk``（边界行）：可见池多于 select_k，入选集由分数决定（top select_k 个
+      可见池），无闭式——断言两臂排序后集合一致、计数 == index_topk、id 全部因果且去重。
+    每行有效 slot 数恒等于 ``min(local_pos + 1, index_topk)``。有效 id 的行内顺序刻意不比较
+    （列序与分数序是设计内差异，下游 gather 消费者以 fp32 累加、对顺序不敏感）。
 
     Args:
-        actual (Tensor): 待测路径输出 ``[S, 1, width]`` int32。
-        expected (Tensor): 参照路径输出 ``[S, 1, width]`` int32。
+        actual (Tensor): 待测路径输出 ``[S, 1, index_topk]`` int32。
+        expected (Tensor): 参照路径输出 ``[S, 1, index_topk]`` int32。
         doc_lens (list[int]): 各文档 token 数。
-        index_topk (int): 语义 token 预算。
+        index_topk (int): 语义 token 预算（packed 行宽）。
         index_kpool (int): 池大小。
     """
     assert actual.dtype == expected.dtype == torch.int32
@@ -393,38 +278,88 @@ def _assert_prefix_complete_set_equivalence(
     counts_expected = (sem_expected >= 0).sum(-1).cpu()
     assert torch.equal(counts_actual, counts_expected), "per-row valid slot counts must match between the two paths"
 
-    prefix = torch.tensor(_row_prefixes(doc_lens, index_kpool), dtype=torch.int64)
-    assert torch.equal(counts_actual.to(torch.int64), prefix * index_kpool), (
-        "per-row valid slot count must equal prefix * index_kpool"
+    local_per_row: list[int] = []
+    for ln in doc_lens:
+        local_per_row.extend(range(ln))
+    span = torch.tensor([min(local + 1, index_topk) for local in local_per_row], dtype=torch.int64)
+    assert torch.equal(counts_actual.to(torch.int64), span), (
+        "per-row valid slot count must equal the dense causal span min(local_pos + 1, index_topk)"
     )
 
     doc_starts: list[int] = []
+    locals_per_row: list[int] = []
     doc_start = 0
     for ln in doc_lens:
         doc_starts.extend([doc_start] * ln)
+        locals_per_row.extend(range(ln))
         doc_start += ln
     doc_start_t = torch.tensor(doc_starts, dtype=torch.int64).unsqueeze(-1)  # [S, 1]
-    pos = torch.arange(index_topk).unsqueeze(0)  # [1, index_topk]
-    sentinel = 1 << 30  # 高于任何合法 token id：-1 槽替换后排序沉底
-    sorted_expected = torch.where(
-        pos < counts_actual.to(torch.int64).unsqueeze(-1),
-        doc_start_t + pos,
-        torch.full((len(doc_starts), index_topk), sentinel, dtype=torch.int64),
-    )
-    for name, sem in (("actual", sem_actual), ("expected", sem_expected)):
-        vals = torch.where(sem >= 0, sem, torch.full_like(sem, sentinel))
-        sorted_vals = vals.sort(dim=-1).values.cpu().to(torch.int64)
-        assert torch.equal(sorted_vals, sorted_expected), f"{name}: sorted valid token ids must equal the closed form"
+    local_t = torch.tensor(locals_per_row, dtype=torch.int64).unsqueeze(-1)  # [S, 1]
+    row_t = local_t + doc_start_t
+    sentinel = 1 << 30  # 高于任何合法 token id：空槽替换后排序沉底
+
+    def _sorted_vals(sem: Tensor) -> Tensor:
+        s = sem.cpu().to(torch.int64)
+        return torch.where(s >= 0, s, torch.full_like(s, sentinel)).sort(-1).values
+
+    sorted_a = _sorted_vals(sem_actual)
+    sorted_e = _sorted_vals(sem_expected)
+
+    # 读窗行（p+1 <= topk）：可见池全部入选，packed 读窗 = 连续区间闭式。
+    closed = (local_t + 1 <= index_topk) & (counts_actual.to(torch.int64).unsqueeze(-1) == local_t + 1)
+    closed_flat = closed.squeeze(-1)
+    open_rows = ~closed
+    open_flat = open_rows.squeeze(-1)
+    if closed.any():
+        t_t = (local_t + 1) % index_kpool
+        hist_len = local_t + 1 - t_t  # = prefix * index_kpool（闭式行全部可见池入选）
+        pos = torch.arange(index_topk).unsqueeze(0)
+        hist = torch.where(pos < hist_len, doc_start_t + pos, torch.full_like(doc_start_t, sentinel))
+        tail_idx = pos - hist_len
+        tail = torch.where(
+            (tail_idx >= 0) & (tail_idx < t_t),
+            row_t - t_t + 1 + tail_idx,
+            torch.full_like(doc_start_t, sentinel),
+        )
+        sorted_closed = torch.minimum(hist, tail).sort(dim=-1).values
+        assert torch.equal(sorted_a[closed_flat], sorted_closed[closed_flat]), "actual: read-span rows must equal the closed form"
+        assert torch.equal(sorted_e[closed_flat], sorted_closed[closed_flat]), (
+            "expected: read-span rows must equal the closed form"
+        )
+
+    # 边界行（p+1 > topk）：入选集由分数决定，无闭式——两臂排序集合一致 + 因果 + 去重。
+    if open_rows.any():
+        assert torch.equal(sorted_a[open_flat], sorted_e[open_flat]), (
+            "boundary rows: the two paths must select the same pool set"
+        )
+        for name, s_o in (("actual", sorted_a[open_flat]), ("expected", sorted_e[open_flat])):
+            # 计数 == index_topk（span 断言已覆盖）→ 排序后无哨兵槽；相邻相等即重复。
+            assert not bool((s_o[:, 1:] == s_o[:, :-1]).any()), f"{name}: boundary rows must be duplicate-free"
+            assert bool((s_o < sentinel).all()), f"{name}: boundary rows must have exactly index_topk valid slots"
+            # t>0 的边界行尾段以 query 结尾 → 最深 token == 查询自身；t=0 边界行是纯历史段
+            # （query 所在池可能未入选），无此保证。
+            t_open = ((local_t + 1) % index_kpool).squeeze(-1)[open_flat]
+            has_tail = t_open > 0
+            if bool(has_tail.any()):
+                deepest = s_o.max(-1).values[has_tail]
+                assert bool((deepest == row_t.squeeze(-1)[open_flat][has_tail]).all()), (
+                    f"{name}: tailed boundary row's deepest token must be the query itself"
+                )
 
 
 class TestKpoolBatchedScoreEquivalence:
     @_requires_accelerator
     @_requires_fused_indexer
     @pytest.mark.gpu
-    def test_mixed_packed_documents_bitwise_equal(
+    def test_mixed_packed_documents_set_equal(
         self, monkeypatch: pytest.MonkeyPatch, batched_spy: list[bool]
     ) -> None:
-        """混合长短文档布局：门开（批量）与门关（legacy）输出逐位一致，批量门恰派发一次。"""
+        """混合长短文档布局：门开（批量）与门关（legacy）输出满足 packed 读窗集合契约，批量门恰派发一次。
+
+        刻意不锁逐位：含 64/65-token 文档的布局存在 p+1 == index_topk 的边界长行，其历史段保持
+        topk 的选择序，而两条打分路径的输入宽度不同（[S, P] vs [S, P+slack]），平分列的 topk 顺序是
+        实现定义的——packed 稠密行把该顺序暴露为行内差异。短行则被打包规范化为 dense arange。
+        """
         doc_lens = [200, 3, 17, 64, 65, 1, 129, 300, 7, 77]
         ctx = _make_ctx(doc_lens)
         inputs = _make_inputs(doc_lens, seed=1)
@@ -433,7 +368,7 @@ class TestKpoolBatchedScoreEquivalence:
         batched = _run_topk(monkeypatch, inputs, ctx, batched=True)
         assert batched_spy == [True], batched_spy
         assert batched.dtype == torch.int32 and batched.shape == legacy.shape
-        assert torch.equal(batched, legacy)
+        _assert_prefix_complete_set_equivalence(batched, legacy, doc_lens, index_topk=64, index_kpool=4)
 
     @_requires_accelerator
     @_requires_fused_indexer
@@ -450,14 +385,18 @@ class TestKpoolBatchedScoreEquivalence:
     @_requires_accelerator
     @_requires_fused_indexer
     @pytest.mark.gpu
-    def test_many_small_documents_bitwise_equal(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """大量小文档：段数多、前缀参差，可见池少于 select_k 的行批量 topk 尾槽同样掩回 -1。"""
+    def test_many_small_documents_set_equal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """大量小文档：段数多、前缀参差，可见池少于 select_k 的行批量 topk 尾槽同样掩回 -1。
+
+        含 64-token 文档（p+1 == index_topk 边界长行），topk 平分列的顺序是实现定义的，故锁集合级
+        契约而非逐位（同 test_mixed_packed_documents_set_equal）。
+        """
         doc_lens = [5, 9, 1, 2, 33, 16, 8, 4, 64, 12, 3, 27]
         ctx = _make_ctx(doc_lens)
         inputs = _make_inputs(doc_lens, seed=3)
         legacy = _run_topk(monkeypatch, inputs, ctx, batched=False)
         batched = _run_topk(monkeypatch, inputs, ctx, batched=True)
-        assert torch.equal(batched, legacy)
+        _assert_prefix_complete_set_equivalence(batched, legacy, doc_lens, index_topk=64, index_kpool=4)
 
     @_requires_accelerator
     @_requires_fused_indexer
@@ -495,24 +434,28 @@ class TestKpoolBatchedScoreFallback:
     @_requires_accelerator
     @pytest.mark.gpu
     def test_gate_off_minus_one_padding_semantics(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """门关路径 -1 填充语义：可见池之外的槽全 -1、界内槽全非负、尾槽为查询自身全局位置。"""
+        """legacy 打分臂的 packed 行语义：读窗内稠密因果去重、窗外全 -1、末个有效槽 == 查询自身。"""
         doc_lens = [200, 3, 17]
         index_kpool, index_topk = 4, 64
         ctx = _make_ctx(doc_lens)
         inputs = _make_inputs(doc_lens, seed=8, index_kpool=index_kpool)
         out = _run_topk(monkeypatch, inputs, ctx, batched=False, index_topk=index_topk, index_kpool=index_kpool)
         assert out.dtype == torch.int32
-        assert out.shape == (sum(doc_lens), 1, 512)
-        visible = out[:, 0, :index_topk]
-        for row, prefix in enumerate(_row_prefixes(doc_lens, index_kpool)):
-            n_valid = min(prefix, index_topk // index_kpool)
-            if n_valid > 0:
-                assert (visible[row, : n_valid * index_kpool] >= 0).all(), f"row {row} valid slots must be >= 0"
-            assert (visible[row, n_valid * index_kpool :] == -1).all(), f"row {row} pad slots must be -1"
-        # 尾槽锚：尾数非零的行，其最后一个有效尾槽 == 查询自身全局位置（尾数按文档内 local_pos 计）。
-        for row, tail_count in enumerate(_row_tail_counts(doc_lens, index_kpool)):
-            if tail_count > 0:
-                assert out[row, 0, index_topk + tail_count - 1].item() == row
+        assert out.shape == (sum(doc_lens), 1, index_topk)
+        doc_start = 0
+        for ln in doc_lens:
+            for local in range(ln):
+                row = doc_start + local
+                span = min(local + 1, index_topk)
+                valid = out[row, 0, :span]
+                assert (valid >= doc_start).all() and (valid <= row).all(), f"row {row} span must be dense causal"
+                assert valid.unique().numel() == span, f"row {row} span must be duplicate-free"
+                assert (out[row, 0, span:] == -1).all(), f"row {row} out-of-span slots must be -1"
+                # 末有效槽 == 查询自身：短行（规范序 [doc_start..row]）与带尾长行（尾段以 query 结尾）
+                # 恒成立；t=0 的边界长行是纯历史段（整行 = 所选池展开），无自身槽保证。
+                if (local + 1) % index_kpool != 0 or local + 1 < index_topk:
+                    assert out[row, 0, span - 1].item() == row, f"row {row} last valid slot must be the query itself"
+            doc_start += ln
 
 
 class TestKpoolDegenerateSlot:
@@ -537,11 +480,11 @@ class TestKpoolDegenerateSlot:
         assert batched_spy == [], batched_spy
         assert score_spy == legacy_counts, "degenerate branch must not score at all"
         assert degenerate.dtype == legacy.dtype == torch.int32
-        width = kpool.kpool_output_width(index_topk, index_kpool, 512)
-        assert degenerate.shape == legacy.shape == (sum(doc_lens), 1, width)
-        # 有效 token id 的行内顺序是设计内差异（退化分支列序 vs legacy 分数序）；随机分数 + 数百行下
-        # 两条路径逐行同序的概率可忽略，锁定"确有顺序差异"以防集合契约退化为平凡恒等。
-        assert not torch.equal(degenerate[:, 0, :index_topk], legacy[:, 0, :index_topk])
+        assert degenerate.shape == legacy.shape == (sum(doc_lens), 1, index_topk)
+        # 打包把短行（prefix < select_k）规范化为 dense arange（历史段 = 池 0..prefix-1 顺序展开、
+        # 尾段紧随），两条打分路径的选择序差异被擦除——退化负载下两臂输出逐位一致；集合契约
+        # 仍由下方 helper 锁定。
+        assert torch.equal(degenerate[:, 0, :index_topk], legacy[:, 0, :index_topk])
         _assert_prefix_complete_set_equivalence(
             degenerate, legacy, doc_lens, index_topk=index_topk, index_kpool=index_kpool
         )
@@ -570,7 +513,7 @@ class TestKpoolDegenerateSlot:
     @pytest.mark.gpu
     @pytest.mark.parametrize("doc_lens", [[1], [4], [7], [16], [1, 9, 1], [3, 1, 2]])
     def test_degenerate_slot_layout_edge_cases(self, monkeypatch: pytest.MonkeyPatch, doc_lens: list[int]) -> None:
-        """退化布局边缘：单 token 文档（prefix=0 全无效）、len<kpool、len%kpool!=0、单/多小文档。"""
+        """退化布局边缘：单 token 文档（prefix=0 行 = [自身] + -1）、len<kpool、len%kpool!=0、单/多小文档。"""
         index_topk = 128
         assert max(-(-ln // 4) for ln in doc_lens) < index_topk // 4, "layout must stay in the degenerate workload"
         ctx = _make_ctx(doc_lens)
@@ -578,7 +521,10 @@ class TestKpoolDegenerateSlot:
         legacy = _run_topk(monkeypatch, inputs, ctx, batched=False, index_topk=index_topk)
         degenerate = _run_topk(monkeypatch, inputs, ctx, batched=True, index_topk=index_topk)
         if max(doc_lens) == 1:
-            assert (degenerate[:, 0, :index_topk] == -1).all(), "prefix=0 rows must have no valid slot at all"
+            # packed 契约: prefix=0 行 = [自身位置] + -1（读窗 [0, 1) 稠密）。
+            self_ids = torch.arange(sum(doc_lens), dtype=torch.int32, device=degenerate.device).unsqueeze(-1)
+            assert torch.equal(degenerate[:, 0, :1], self_ids), "prefix=0 rows must hold exactly the self slot"
+            assert (degenerate[:, 0, 1:] == -1).all(), "prefix=0 rows must hold nothing beyond the self slot"
         _assert_prefix_complete_set_equivalence(degenerate, legacy, doc_lens, index_topk=index_topk, index_kpool=4)
 
     @_requires_accelerator
@@ -601,8 +547,7 @@ class TestKpoolDegenerateSlot:
         degenerate = _run_topk(monkeypatch, inputs, ctx, batched=True, index_topk=index_topk, index_kpool=index_kpool)
         assert batched_spy == [], batched_spy
         assert score_spy == legacy_counts, "degenerate branch must not score at all"
-        width = kpool.kpool_output_width(index_topk, index_kpool, 512)
-        assert degenerate.shape == legacy.shape == (sum(doc_lens), 1, width)
+        assert degenerate.shape == legacy.shape == (sum(doc_lens), 1, index_topk)
         _assert_prefix_complete_set_equivalence(
             degenerate, legacy, doc_lens, index_topk=index_topk, index_kpool=index_kpool
         )
@@ -610,57 +555,26 @@ class TestKpoolDegenerateSlot:
     @_requires_accelerator
     @_requires_fused_indexer
     @pytest.mark.gpu
-    def test_boundary_max_pools_equal_select_k_dispatches_batched(
+    def test_boundary_max_pools_equal_select_k_stays_unbatched(
         self, monkeypatch: pytest.MonkeyPatch, batched_spy: list[bool]
     ) -> None:
-        """2045-token 文档使 max_pools == select_k：恰好回落批量打分分支（派发一次、与 legacy 集合等价）。"""
+        """max_pools == select_k 仍不派发批量打分：批量门的 ``has_op_rows`` 要求行深达到
+        ``kpool * (select_k + 1)``（2045 < 2052，派发边界在 doc ≥ 2053，与 max_pools 无关）。
+        两臂 packed 行满足读窗集合契约（本布局全部行 p+1 < index_topk，读窗即连续区间）。
+        """
         doc_lens = [2045, 3]
         index_topk, index_kpool = 2048, 4
         select_k = index_topk // index_kpool
-        assert max(-(-ln // index_kpool) for ln in doc_lens) == select_k, "layout must sit exactly on the batched side"
+        assert max(-(-ln // index_kpool) for ln in doc_lens) == select_k, "layout must sit exactly on the boundary"
         ctx = _make_ctx(doc_lens)
         inputs = _make_inputs(doc_lens, seed=25, index_kpool=index_kpool)
         legacy = _run_topk(monkeypatch, inputs, ctx, batched=False, index_topk=index_topk, index_kpool=index_kpool)
         assert batched_spy == [], "legacy run must not dispatch the batched scorer"
         batched = _run_topk(monkeypatch, inputs, ctx, batched=True, index_topk=index_topk, index_kpool=index_kpool)
-        assert batched_spy == [True], batched_spy
-        # 生产规模下两条路径的 topk 输入宽度不同（[S, P] vs [S, P + slack]），平分列的 topk 顺序是实现
-        # 定义的，故此处锁定集合级契约；小规模逐位等价由 TestKpoolBatchedScoreEquivalence 覆盖。
+        assert batched_spy == [], "has_op_rows must keep the batched scorer off at max_pools == select_k"
         _assert_prefix_complete_set_equivalence(
             batched, legacy, doc_lens, index_topk=index_topk, index_kpool=index_kpool
         )
-
-    @_requires_accelerator
-    @_requires_fused_indexer
-    @pytest.mark.gpu
-    def test_gate_off_keeps_score_order_bitwise_golden(
-        self, monkeypatch: pytest.MonkeyPatch, batched_spy: list[bool], score_spy: dict[str, int]
-    ) -> None:
-        """严格递增分数下：门关逐位等于分数序（降列序）金标准、门开逐位等于列序金标准。
-
-        门关路径若被退化分支污染（顺序变成列序），降列序金标准即刻失配——这是"门关不参与退化分支"的
-        逐位证明；门开金标准同时锁定退化分支的列序语义与尾槽。
-        """
-        doc_lens = [9, 1, 17, 4]
-        index_topk, index_kpool = 128, 4
-        select_k = index_topk // index_kpool
-        assert max(-(-ln // index_kpool) for ln in doc_lens) < select_k, "layout must stay in the degenerate workload"
-        ctx = _make_ctx(doc_lens)
-        inputs = _monotone_inputs(doc_lens, index_kpool=index_kpool)
-        legacy = _run_topk(monkeypatch, inputs, ctx, batched=False, index_topk=index_topk, index_kpool=index_kpool)
-        legacy_counts = dict(score_spy)
-        assert legacy_counts["_score_pools"] >= 1, "gate-off run must dispatch legacy scoring"
-        degenerate = _run_topk(monkeypatch, inputs, ctx, batched=True, index_topk=index_topk, index_kpool=index_kpool)
-        assert batched_spy == [] and score_spy == legacy_counts, "degenerate branch must not score at all"
-        golden_desc = _degenerate_golden(
-            doc_lens, index_topk=index_topk, index_kpool=index_kpool, column_order="score_desc"
-        )
-        golden_asc = _degenerate_golden(
-            doc_lens, index_topk=index_topk, index_kpool=index_kpool, column_order="column_asc"
-        )
-        assert not torch.equal(golden_asc, golden_desc), "the two orders must genuinely differ in this layout"
-        assert torch.equal(legacy[:, 0].cpu(), golden_desc), "gate-off output must keep the legacy score order"
-        assert torch.equal(degenerate[:, 0].cpu(), golden_asc), "gate-on output must be the degenerate column order"
 
     @_requires_accelerator
     @_requires_fused_indexer

@@ -111,7 +111,6 @@ from torch import Tensor
 
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.ops.sparse_mla import kpool_npu
-from xtuner.v1.ops.sparse_mla.kpool import kpool_output_width
 from xtuner.v1.utils.device import get_device
 
 
@@ -351,19 +350,20 @@ def _assert_public_row_contract(
     shard_start: int = 0,
     select_k: int = SELECT_K,
 ) -> None:
-    """锁定公开入口输出的行级展开契约（形状 / dtype / 有效槽计数 / 文档跨度 / 互异 /
-    below-width 行的闭式升序布局）。
+    """锁定公开入口输出的行级展开契约（packed 形状 / dtype / 读窗计数 / 文档跨度 / 互异 /
+    below-width 读窗行的闭式升序布局）。
 
-    below-width 行（``prefix <= select_k``）的 slot buffer 是纯算术闭式解，token 恰为
-    ``arange(doc_start, doc_start + prefix*kpool)`` 升序、其余 ``index_topk`` 内槽位
-    -1；op 行（``prefix > select_k``）的 id 集合由分数决定，只锁互异与 in-span。
+    packed 行契约：读窗 ``[0, min(local_pos + 1, topk))`` 内稠密因果去重、窗外全 -1。
+    below-width 且 ``local_pos + 1 <= topk`` 的行（``prefix <= select_k``，全部可见池入选）
+    的读窗是纯算术闭式解，token 恰为 ``arange(lo, lo + span)`` 升序；op 行
+    （``prefix > select_k``）与 ``local_pos + 1 > topk`` 的边界行 id 集合由分数决定，只锁
+    读窗计数、互异与因果上界（最深 token = query 自身）。
     shard 行（``shard_start > 0``，mid-pack/mid-doc 几何）的行号是 shard-local，token
     锚回 global 文档头。
     """
     total = row_prefix.shape[0]
-    width = kpool_output_width(select_k * INDEX_KPOOL, INDEX_KPOOL, alignment=512)
     topk_width = select_k * INDEX_KPOOL
-    assert out.shape == (total, 1, width), f"{label}: out shape {tuple(out.shape)} != {(total, 1, width)}"
+    assert out.shape == (total, 1, topk_width), f"{label}: out shape {tuple(out.shape)} != {(total, 1, topk_width)}"
     assert out.dtype == torch.int32, f"{label}: out dtype {out.dtype} != torch.int32"
 
     flat = out[:, 0, :]
@@ -377,28 +377,28 @@ def _assert_public_row_contract(
     for r in range(total):
         prefix = int(row_prefix[r])
         lo = doc_start_of[r]
-        slots = flat[r][:topk_width]
+        gpos = shard_start + r  # 该行 query 的 global token
+        local = gpos - lo  # 文档内 local_pos
+        span = min(local + 1, topk_width)  # packed 读窗
+        slots = flat[r]
         valid = slots[slots >= 0]
-        expect_valid = min(prefix, select_k) * INDEX_KPOOL
-        assert valid.numel() == expect_valid, (
-            f"{label}: row {r} prefix={prefix} valid token slots {valid.numel()} != {expect_valid}"
+        assert valid.numel() == span, (
+            f"{label}: row {r} prefix={prefix} valid token slots {valid.numel()} != read span {span}"
         )
-        hi = lo + prefix * INDEX_KPOOL
-        assert bool(((valid >= lo) & (valid < hi)).all()), (
-            f"{label}: row {r} token ids outside doc span [{lo}, {hi}): {valid.tolist()}"
+        assert bool(((valid >= lo) & (valid <= gpos)).all()), (
+            f"{label}: row {r} token ids outside causal doc span [{lo}, {gpos}]: {valid.tolist()}"
         )
         assert torch.unique(valid).numel() == valid.numel(), f"{label}: row {r} duplicate token ids"
-        if prefix <= select_k:
-            # 闭式升序布局：有效段恰为 arange，pad 段全 -1（V2 dense fill / 退化闭式解
-            # 的列序都保证这一点；legacy per-segment 分数的列序不保证——依赖该断言的
-            # 用例须先确保退化分支可达）。
-            expect = torch.arange(lo, hi, device=flat.device, dtype=torch.int32)
-            assert torch.equal(slots[: prefix * INDEX_KPOOL], expect), (
+        if prefix <= select_k and local + 1 <= topk_width:
+            # 闭式升序布局：读窗 [0, span) 恰为 arange（全部可见池入选，历史段顺序展开 +
+            # 尾段紧随；V2 dense fill / 退化闭式解的列序都保证这一点），窗外全 -1。
+            expect = torch.arange(lo, lo + span, device=flat.device, dtype=torch.int32)
+            assert torch.equal(slots[:span], expect), (
                 f"{label}: row {r} prefix={prefix} closed-form token layout mismatch: "
                 f"got={slots.tolist()} expect head={expect.tolist()}"
             )
-            assert bool((slots[prefix * INDEX_KPOOL :] == -1).all()), (
-                f"{label}: row {r} prefix={prefix} pad slots must stay -1: {slots.tolist()}"
+            assert bool((slots[span:] == -1).all()), (
+                f"{label}: row {r} prefix={prefix} out-of-span slots must stay -1: {slots.tolist()}"
             )
 
 

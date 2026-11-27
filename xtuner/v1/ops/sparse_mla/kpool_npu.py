@@ -58,7 +58,7 @@ from xtuner.v1.ops.comm import gather_for_sequence_parallel
 from xtuner.v1.utils import get_torch_device_module
 
 from . import kpool
-from .kpool import _visible_tail_tokens, build_pool_index, build_pools, kpool_output_width
+from .kpool import _visible_tail_tokens, build_pool_index, build_pools
 from .sequence_parallel_indexer import get_indexer_sp_partition, redistribute_indexer_queries
 
 
@@ -69,7 +69,7 @@ except ImportError:  # triton-ascend unavailable (CPU CI / reference boxes): eag
     triton = None  # type: ignore[assignment]
     tl = None  # type: ignore[assignment]
 
-__all__ = ["npu_kpool_topk_indices", "pack_visible_tail_enabled", "pack_visible_tail_into"]
+__all__ = ["npu_kpool_topk_indices", "pack_visible_tail_into"]
 
 # Batched indexer scoring (one score launch per document segment into a whole-call score
 # buffer + one whole-shard topk) instead of the per-segment pad -> score -> topk -> scatter
@@ -91,9 +91,11 @@ _BATCHED_SCORE = os.environ.get("XTUNER_GLM53_KPOOL_BATCHED_SCORE", "1") == "1"
 _CAUSAL_CROP = os.environ.get("XTUNER_KPOOL_CAUSAL_CROP", "1") == "1"
 
 # Span-dense packed index rows (built by ``pack_visible_tail_into`` below): each row dense
-# with distinct visible tokens inside its causal read span, -1 only beyond it. The default
-# ``0`` keeps the legacy -1-padded layout bit for bit.
-_PACK_VISIBLE_TAIL = os.environ.get("XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL", "0") == "1"
+# with distinct visible tokens inside its causal read span, -1 only beyond it. This is the
+# only layout (owner decision, xtuner#153): the legacy -1-padded rectangle whose
+# invalid slots were rewritten to the query's own position biased the softmax by duplicate
+# self slots (multiset accumulation, ~75% of queries, self weight x1-3) and broke dkv; the
+# gate that switched between the two layouts is gone with the legacy path.
 
 # Indexer score+topk backend. ``triton`` (default) keeps the fused in-house chain
 # (_score_and_topk_batched); ``aclnn_v2`` replaces the whole score/Fill/Less/topk chain
@@ -205,17 +207,6 @@ _POOL_INDEX_CACHE: weakref.WeakKeyDictionary[SequenceContext, dict[tuple[int, in
 )
 
 
-def pack_visible_tail_enabled() -> bool:
-    """Whether span-dense packed index rows are enabled.
-
-    Returns:
-        bool: True when ``XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL=1`` (default off). The
-            GLM-5.2 per-token ``npu_dsa_topk_indices`` producer pads -1 inside the
-            read span and must not run while this gate is on (it raises instead).
-    """
-    return _PACK_VISIBLE_TAIL
-
-
 def pack_visible_tail_into(
     out: Tensor,
     sel_all: Tensor,
@@ -231,13 +222,14 @@ def pack_visible_tail_into(
     into ``out``.
 
     The kernel cannot take the reference path's -1-padded layout as is: its backward
-    reads an in-span -1 slot as a raw negative index and raises an AICORE exception,
-    which is why ``_rewrite_invalid_indices`` rewrites -1 to the query's own global
-    position by default. That rewrite makes rows duplicate-laden, and the kernel
-    accumulates duplicate slots per-slot (multiset softmax, not dedup): the forward
-    deviates from the reference "invalid slot contributes nothing" semantics, and with
-    duplicates present the backward dkv is no longer the gradient of the forward
-    (cross-row shared positions are corrupted).
+    reads an in-span -1 slot as a raw negative index and raises an AICORE exception.
+    The legacy workaround rewrote -1 to the query's own global position, which made
+    rows duplicate-laden: the kernel accumulates duplicate slots per-slot (multiset
+    softmax, not dedup), so the forward deviated from the reference "invalid slot
+    contributes nothing" semantics (~75% of queries carried a duplicate self slot,
+    self weight biased x1-3) and the backward dkv was no longer the gradient of the
+    forward (xtuner#153). That rewrite and its env gate are gone -- the layout built
+    here is the only form.
 
     The layout built here is the only form that is both exact and safe: each row is
     DENSE with distinct visible tokens inside the kernel's causal read span
@@ -351,8 +343,10 @@ def npu_kpool_topk_indices(
         index_topk (int): Semantic token budget (e.g. 2048); must be divisible by
             ``index_kpool``.
         index_kpool (int): Pool size.
-        always_select_tail (bool): Whether to append the incomplete trailing pool. Required
-            under ``XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL=1``.
+        always_select_tail (bool): Whether to append the incomplete trailing pool.
+            Required (the packed rows carry the tail inside the row).
+        alignment (int): Call-site protocol parity only; unused under the packed layout
+            (the row width is ``index_topk``).
         alignment (int): Output width alignment of the chosen SparseMLA forward backend
             (``torch_npu`` uses 1 -- the kernel takes any index width).
         query_chunk_size (int | None): Eager-fallback query-chunk bound; ignored by the fused
@@ -366,17 +360,16 @@ def npu_kpool_topk_indices(
             pool width) unless ``XTUNER_INDEXER_SP_WORK_RATIO`` sets an explicit ratio.
 
     Returns:
-        Tensor: ``[S, 1, kpool_output_width(index_topk, index_kpool, alignment)]`` int32;
-            with ``XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL=1`` the width is ``index_topk`` and each
-            row is dense with distinct visible tokens inside its causal read span, holding -1
-            only beyond it (see :func:`pack_visible_tail_into`).
+        Tensor: ``[S, 1, index_topk]`` int32; each row is dense with distinct visible
+            tokens inside its causal read span, holding -1 only beyond it (see
+            :func:`pack_visible_tail_into`).
     """
     assert index_topk % index_kpool == 0
-    pack = pack_visible_tail_enabled()
-    if pack and not always_select_tail:
-        # Without the visible tail the pack cannot fill the causal read span, and the
-        # kernel's backward reads in-span -1 slots as raw negative indices.
-        raise ValueError("XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL=1 requires always_select_tail=True")
+    if not always_select_tail:
+        # The packed rows carry the incomplete trailing pool inside the row; without it
+        # the pack cannot fill the causal read span, and the kernel's backward reads
+        # in-span -1 slots as raw negative indices.
+        raise ValueError("span-dense packed index rows require always_select_tail=True")
     # SP: queries stay sharded; the key side gathers *before* pooling, because a pool can
     # straddle the shard seam (see build_pools).
     sp_mesh = seq_ctx.sequence_parallel_mesh
@@ -387,9 +380,9 @@ def npu_kpool_topk_indices(
 
     q_local = q.squeeze(0).contiguous()  # [S, NH, Di]
     seq_len, device = q_local.shape[0], q_local.device
-    # Pack gate: rows shrink to index_topk (the tail moves inside the row), so the
-    # separate tail columns and the alignment no longer apply.
-    width = index_topk if pack else kpool_output_width(index_topk, index_kpool, alignment)
+    # Rows shrink to index_topk (the tail moves inside the row), so the separate tail
+    # columns and the alignment no longer apply.
+    width = index_topk
     out = torch.full((seq_len, width), -1, dtype=torch.int32, device=device)
 
     select_k = index_topk // index_kpool
@@ -595,32 +588,24 @@ def npu_kpool_topk_indices(
         # ``_SEL_PAD`` and fail the test; the incomplete trailing pool of a document is
         # never below the prefix either, so its out-of-document arithmetic slots are always
         # masked back to -1, matching ``pool_index``'s padding.
-        if pack:
-            # Span-dense packed rows (see :func:`pack_visible_tail_into`): dense with
-            # distinct visible tokens inside each row's causal read span, -1 only
-            # beyond it. The tail is packed inside the row, so no separate tail
-            # columns exist.
-            pack_visible_tail_into(
-                out,
-                sel_all,
-                row_prefix,
-                row_doc_start,
-                slot_offsets,
-                _visible_tail_tokens(seq_ctx, seq_len, index_kpool, device),
-                index_topk=index_topk,
-                index_kpool=index_kpool,
-            )
-            return out.unsqueeze(1)
+        # Span-dense packed rows (see :func:`pack_visible_tail_into`): dense with
+        # distinct visible tokens inside each row's causal read span, -1 only
+        # beyond it. The tail is packed inside the row, so no separate tail
+        # columns exist.
+        pack_visible_tail_into(
+            out,
+            sel_all,
+            row_prefix,
+            row_doc_start,
+            slot_offsets,
+            _visible_tail_tokens(seq_ctx, seq_len, index_kpool, device),
+            index_topk=index_topk,
+            index_kpool=index_kpool,
+        )
+        return out.unsqueeze(1)
 
-        valid = sel_all < row_prefix.unsqueeze(-1)
-        sel_all.mul_(index_kpool).add_(row_doc_start.unsqueeze(-1))
-        tok = sel_all.unsqueeze(-1) + slot_offsets
-        tok = tok.masked_fill_(~valid.unsqueeze(-1), -1)
-        out[:, :index_topk] = tok.view(seq_len, index_topk)
-
-    if always_select_tail:
-        out[:, index_topk : index_topk + index_kpool - 1] = _visible_tail_tokens(seq_ctx, seq_len, index_kpool, device)
-
+    # No shard rows to score (degenerate empty range set): the rows stay all -1,
+    # which under the packed contract sits beyond every row's causal read span.
     return out.unsqueeze(1)
 
 

@@ -57,9 +57,6 @@ import torch
 
 torch_npu = pytest.importorskip("torch_npu")
 
-# kpool_npu 在 import 时把打包门冻结为模块常量，默认值须设在任何 xtuner 导入之前；
-# 若本进程内该模块已被先行导入，由下方 autouse fixture 的 monkeypatch 兜底（调用期读取）。
-os.environ.setdefault("XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL", "1")
 os.environ.setdefault("XTUNER_SP_MLA_OFFLOAD", "1")
 
 from xtuner.v1.data_proto import SequenceContext  # noqa: E402
@@ -272,7 +269,6 @@ def _assert_gate_on_off_parity(monkeypatch: pytest.MonkeyPatch, block: _AttnBloc
 def _sfa_route(monkeypatch: pytest.MonkeyPatch):
     """钉住生产 offload Fn 路由与设备驻留默认（SP>1 + offload=1 + row-chunk 0），隔离 stash。"""
     monkeypatch.setenv("XTUNER_SP_MLA_OFFLOAD", "1")
-    monkeypatch.setattr(kpool_npu, "_PACK_VISIBLE_TAIL", True)
     monkeypatch.setitem(npu_sparse_mla.__globals__, "_SFA_GRAD_ROW_CHUNK", 0)
     # 测试默认设备驻留模式；卸载用例自行翻转（防环境变量泄漏进无关用例）。
     monkeypatch.setattr(activation_offload_npu, "_SFA_STASH_OFFLOAD", False)

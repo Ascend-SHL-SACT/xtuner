@@ -14,12 +14,11 @@ Three paths:
 
 Key implementation notes:
   - ``sparse_mode=3`` (RightDownCausal): kernel applies per-segment causal
-    mask internally. Requires valid (non -1) indices at training scale;
-    -1 is rewritten to query's own global position (self-attention) unless
-    the span-dense pack gate is on (see :func:`kpool_npu.pack_visible_tail_into`).
-  - ``self_pos`` must use GLOBAL position (``arange(S) + shard_start``)
-    for correct global→local conversion. Using local position causes
-    V1 kernel backward to produce NaN (sparse_mode=3 + multi-segment TND).
+    mask internally. The index rows are span-dense packed (see
+    :func:`kpool_npu.pack_visible_tail_into`): -1 appears only beyond each
+    row's causal read span, so the kernels skip those slots and no rewrite
+    pass exists (the legacy rewrite-to-self biased the softmax by duplicate
+    self slots and broke dkv -- xtuner#153).
   - indices passed to kernel are per-segment local (each segment from 0).
 
 This module is also what ``get_sparse_mla("torch_npu")`` hands out to both model families,
@@ -55,7 +54,6 @@ from xtuner.v1.utils.activation_offload_npu import (
     sfa_stash_push,
 )
 
-from .kpool_npu import pack_visible_tail_enabled
 from .npu_indexer import _compute_prefix_extended_kv_slice, get_sp_mode_and_slice
 from .protocol import SparseMLAOutputs
 
@@ -110,9 +108,9 @@ def npu_sfa_rope_padded(
             first.
         kv (Tensor): SP-gathered compressed KV, ``[S_g, 1, Rkv]`` (NoPE) or
             ``[S_g, 1, Rkv + Dr]`` (rope-tailed).
-        indices (Tensor): Top-k token ids ``[S, 1, K]`` int32, ``-1``-padded (rewritten to the
-            query's own position unless the pack gate is on; see
-            :func:`kpool_npu.pack_visible_tail_into`).
+        indices (Tensor): Top-k token ids ``[S, 1, K]`` int32, span-dense packed rows
+            (dense with distinct visible tokens inside the causal read span, -1 only
+            beyond it; see :func:`kpool_npu.pack_visible_tail_into`).
         scaling (float | None): Softmax scale; passed through to :func:`npu_sparse_mla`.
         value_dim (int | None): Value dimension (``Rkv``); passed through, and its equality
             with ``q.shape[-1]`` is the NoPE discriminator.
@@ -346,38 +344,6 @@ def _sparse_mla_split(
     )
 
 
-def _rewrite_invalid_indices(
-    indices: torch.Tensor,
-    shard_start: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Rewrite -1 (invalid) indices to query's own GLOBAL position.
-
-    ``sparse_mode=3`` kernel requires valid indices at training scale;
-    -1 causes aicore exception. The rewritten self-attention position
-    is always within causal range and segment boundaries.
-
-    ``self_pos`` must be GLOBAL (``arange(S) + shard_start``) for correct
-    global→local conversion downstream. Using local position causes V1
-    kernel backward NaN (sparse_mode=3 + multi-segment TND).
-
-    Under ``XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL=1`` the -1s sit beyond each
-    row's causal read span (see :func:`kpool_npu.pack_visible_tail_into`):
-    the kernel forward skips them and its backward never reads them, so they
-    pass through unchanged -- rewriting them to self would turn the packed
-    tail into duplicate slots (multiset accumulation).
-    """
-    if pack_visible_tail_enabled():
-        return indices.to(torch.int32)
-    S = indices.shape[0]
-    self_pos = torch.arange(S, device=device, dtype=indices.dtype) + shard_start
-    return torch.where(
-        indices == -1,
-        self_pos.unsqueeze(1).unsqueeze(2).expand_as(indices),
-        indices,
-    ).to(torch.int32)
-
-
 def _global_to_local_indices(
     sparse_indices: torch.Tensor,
     cu_seq_q_local: torch.Tensor,
@@ -389,8 +355,8 @@ def _global_to_local_indices(
     """Convert global indices to per-segment local indices for TND kernel.
 
     ``sparse_flash_attention`` expects per-segment local indices (each
-    segment from 0). The reverse of ``_local_to_global_indices`` in
-    the indexer::
+    segment from 0); this is the inverse of the indexer's pool-id → token-id
+    expand::
 
         local = global - kv_seg_start - kv_slice_offset
 
@@ -408,11 +374,11 @@ def _global_to_local_indices(
     # materializes a new [S, K] buffer, so the extra out-of-place clamp (and
     # the previous defensive clone) each doubled the transient footprint of
     # the global-width index conversion.
-    # Pack gate: -1 must pass through (it sits beyond the read span). -1 - offset
-    # is <= -1, so clamp(min=-1) maps every negative to exactly -1 while valid
-    # globals (>= 0) are untouched -- no extra mask tensor needed.
-    clamp_min = -1 if pack_visible_tail_enabled() else 0
-    local_indices = local_indices.clamp_(min=clamp_min)
+    # The packed rows hold -1 only beyond the row's causal read span; the kernel
+    # skips those slots. -1 - offset is <= -1, so clamp(min=-1) maps every negative
+    # to exactly -1 while valid globals (>= 0) are untouched -- no extra mask
+    # tensor needed.
+    local_indices = local_indices.clamp_(min=-1)
     return local_indices.unsqueeze(1).contiguous()
 
 
@@ -605,7 +571,7 @@ class _SpTndSparseMlaFn(torch.autograd.Function):
         key_tnd = kv.contiguous()  # [L, 1, Rkv]
         key_rope_tnd = k_rope.contiguous()  # [L, 1, Dr]
 
-        sparse_indices = _rewrite_invalid_indices(indices, shard_start, device)
+        sparse_indices = indices.to(torch.int32)
         sparse_indices_tnd = _global_to_local_indices(sparse_indices, cu_q, cu_k, kv_start, seq_len, device)
 
         # Checkpoint replay: reuse the original forward's kernel outputs
@@ -815,7 +781,7 @@ class _SpTndSparseMlaChunkedGradFn(torch.autograd.Function):
         query_tnd = q_nope.contiguous()  # [S, N, Rkv]
         query_rope_tnd = q_rope.contiguous()  # [S, N, Dr]
 
-        sparse_indices = _rewrite_invalid_indices(indices, shard_start, device)
+        sparse_indices = indices.to(torch.int32)
         sparse_indices_tnd = _global_to_local_indices(sparse_indices, cu_q, cu_k, kv_slice_offset, seq_len, device)
 
         attn_outs = torch_npu.npu_sparse_flash_attention(
@@ -1056,8 +1022,10 @@ def _sparse_mla_bsnd_single(
     """Single-sequence: BSND layout, sparse_mode=3."""
     device = q_nope.device
 
-    # Rewrite -1 to self-attention position
-    safe_indices = _rewrite_invalid_indices(indices, 0, device)
+    # Span-dense packed rows: -1 sits only beyond the causal read span, the kernels
+    # skip those slots (forward) and never read them (backward). Cast for the int32
+    # kernel contract.
+    safe_indices = indices.to(torch.int32)
 
     attn_outs = torch_npu.npu_sparse_flash_attention(
         q_nope.unsqueeze(0).contiguous(),  # [1, S, N, Rkv]
@@ -1181,8 +1149,9 @@ def _sparse_mla_tnd_packed(
     query_tnd = q_nope.contiguous()  # [S, N, Rkv]
     query_rope_tnd = q_rope.contiguous()  # [S, N, Dr]
 
-    # Rewrite -1 → global self position (sparse_mode=3 requires valid indices)
-    sparse_indices = _rewrite_invalid_indices(indices, shard_start, device)
+    # Cast for the int32 kernel contract; the packed rows hold -1 only beyond the
+    # causal read span (skipped by forward, unread by backward).
+    sparse_indices = indices.to(torch.int32)
 
     # Convert global indices → per-segment local for TND kernel
     sparse_indices_tnd = _global_to_local_indices(
