@@ -1,10 +1,11 @@
-"""GLM-5.3 kpool 行内可见 tail 打包（``XTUNER_GLM53_KPOOL_PACK_VISIBLE_TAIL``）回归测试。
+"""GLM-5.3 kpool 行内可见 tail 打包回归测试。
 
-打包门开启时 ``npu_kpool_topk_indices`` 输出行宽从 ``kpool_output_width`` 收缩到 ``index_topk``：行在
+``npu_kpool_topk_indices`` 的唯一输出布局是行宽 ``index_topk`` 的 span-dense packed 行：行在
 因果读窗 ``[0, min(qpos + 1, width))`` 内稠密无重复、``-1`` 只出现在读窗之外，尾 token 打包进行内
-（短行 ``[0..p]`` + ``-1``；长行 = 所选池展开截去 t 槽 + 恰好 t 个以 query 结尾的文档尾）。消费端
-``_rewrite_invalid_indices`` 门开时原样透传、``_global_to_local_indices`` 的 clamp 归一到 ``-1``。本文件
-锁定：打包数学（合成输入单元测试）、生产者接线（门开/门关同输入的组合等价）、以及门约束。
+（短行 ``[0..p]`` + ``-1``；长行 = 所选池展开截去 t 槽 + 恰好 t 个以 query 结尾的文档尾）。
+消费端无需改写（旧的 -1→自身位置改写已被删除——多重集 softmax 偏置 + dkv 失真，xtuner#153），
+``_global_to_local_indices`` 的 clamp 归一到 ``-1``。本文件锁定：打包数学（合成输入单元测试）、
+生产者行不变量、门约束（``always_select_tail``）与 GLM-5.2 生产者的拒绝契约。
 
 TestPackVisibleTailUnit（CPU 或 NPU）
     test_short_rows_dense_then_neg1: 严格短行（``p + 1 < width``）= ``[0..p]`` + ``-1`` 补齐；边界行
@@ -16,14 +17,11 @@ TestPackVisibleTailUnit（CPU 或 NPU）
     test_kpool_one_empty_tail_guard: ``index_kpool == 1`` 时尾张量为 ``[S, 0]``，短行走 arange、长行
         整行 = 所选池（单 token 池）展开，打包不触碰尾分支。
 TestPackVisibleTailProducer（NPU）
-    test_pack_rows_match_unpacked_layout_composition: 同一输入门开/门关各跑一次（同打分路径）。长行：
-        门开行逐元素等于门关布局的 ``out[:, :history_len]`` 拼 ``out[:, index_topk : index_topk + t]``
-        （同选择、同顺序）。短行：门开历史段 = 规范序 ``arange(doc_start, doc_start + history_len)`` 且
-        与门关历史段集合相等（topk 只保证集合），尾段逐元素相等。
-    test_gate_on_row_invariants: 门开输出形状/dtype 契约 + 逐行性质：读窗内稠密非负去重、``-1`` 只在
-        读窗外、长行精确占满。
-    test_gate_on_requires_always_select_tail: 门开 + ``always_select_tail=False`` 立即 ValueError。
-    test_gate_off_width_unchanged: 门关宽度契约不变（回归护栏）。
+    test_producer_row_invariants: 生产者输出形状/dtype 契约 + 逐行性质：读窗内稠密非负去重、
+        ``-1`` 只在读窗外、长行精确占满。
+    test_producer_requires_always_select_tail: ``always_select_tail=False`` 立即 ValueError。
+    test_glm52_dsa_producer_rejects_packed_contract: GLM-5.2 per-token 生产者无法产出 packed 行，
+        无条件 RuntimeError（在任何设备操作之前）。
 """
 
 import pytest
@@ -31,7 +29,7 @@ import torch
 from torch import Tensor
 
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.ops.sparse_mla import kpool, kpool_npu, npu_indexer
+from xtuner.v1.ops.sparse_mla import kpool_npu, npu_indexer
 from xtuner.v1.utils.device import get_device
 
 
@@ -293,21 +291,15 @@ class TestPackVisibleTailUnit:
 
 
 class TestPackVisibleTailProducer:
-    """真实生产者接线：门开/门关同输入的组合等价与契约。"""
+    """真实生产者接线：packed 行不变量与门约束。"""
 
     doc_lens = [40, 200, 3, 65, 1, 129]
     index_topk = 32
     index_kpool = 4
 
-    def _run(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        pack: bool,
-    ) -> tuple[Tensor, SequenceContext]:
+    def _run(self) -> tuple[Tensor, SequenceContext]:
         ctx = _make_ctx(self.doc_lens)
         inputs = _make_inputs(self.doc_lens, seed=7, index_kpool=self.index_kpool)
-        monkeypatch.setattr(kpool_npu, "_BATCHED_SCORE", False)
-        monkeypatch.setattr(kpool_npu, "_PACK_VISIBLE_TAIL", pack)
         q, k, gate, weights, ape = inputs
         out = kpool_npu.npu_kpool_topk_indices(
             q,
@@ -323,49 +315,8 @@ class TestPackVisibleTailProducer:
         return out, ctx
 
     @_requires_accelerator
-    def test_pack_rows_match_unpacked_layout_composition(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        packed, ctx = self._run(monkeypatch, pack=True)
-        unpacked, _ = self._run(monkeypatch, pack=False)
-        assert packed.shape == (sum(self.doc_lens), 1, self.index_topk)
-        assert unpacked.shape == (
-            sum(self.doc_lens),
-            1,
-            kpool.kpool_output_width(self.index_topk, self.index_kpool, 512),
-        )
-
-        flat_packed = packed.squeeze(1)
-        flat_unpacked = unpacked.squeeze(1)
-        select_k = self.index_topk // self.index_kpool
-        cu = ctx.cu_seq_lens_q.tolist()
-        for row in range(sum(self.doc_lens)):
-            d = max(i for i in range(len(cu) - 1) if cu[i] <= row)
-            p, doc_start = row - cu[d], cu[d]
-            t = (p + 1) % self.index_kpool
-            prefix = (p + 1) // self.index_kpool
-            history_len = min(prefix * self.index_kpool, self.index_topk - t)
-            tail_expect = flat_unpacked[row, self.index_topk : self.index_topk + t]
-            # 尾段: 门开行内尾 == 门关尾列, 逐元素（对长短行都成立）
-            assert torch.equal(flat_packed[row, history_len : history_len + t], tail_expect), (
-                f"tail row {row} (doc {d} local {p})"
-            )
-            if prefix >= select_k:
-                # 长行: 门开行 == 门关行的历史段前缀 + 尾段列（同选择、同顺序，逐元素）
-                expect = torch.cat([flat_unpacked[row, :history_len], tail_expect])
-                assert torch.equal(flat_packed[row], expect), f"long row {row} (doc {d} local {p})"
-            else:
-                # 短行: 门开历史段 = 规范序连续 arange; 与门关历史段集合相等（topk 只保证集合）
-                hist = flat_packed[row, :history_len]
-                expect = torch.arange(doc_start, doc_start + history_len, dtype=torch.int32, device=flat_packed.device)
-                assert torch.equal(hist, expect), f"short hist row {row} (doc {d} local {p})"
-                assert torch.equal(hist.sort().values, flat_unpacked[row, :history_len].sort().values), (
-                    f"short hist set row {row} (doc {d} local {p})"
-                )
-                if history_len + t < self.index_topk:
-                    assert (flat_packed[row, history_len + t :] == -1).all(), f"-1 inside span in short row {row}"
-
-    @_requires_accelerator
-    def test_gate_on_row_invariants(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        packed, _ = self._run(monkeypatch, pack=True)
+    def test_producer_row_invariants(self) -> None:
+        packed, _ = self._run()
         flat = packed.squeeze(1)
         assert packed.dtype == torch.int32
         cu = _make_ctx(self.doc_lens).cu_seq_lens_q.tolist()
@@ -380,8 +331,7 @@ class TestPackVisibleTailProducer:
                 assert (flat[row, span:] == -1).all(), f"-1 inside span in row {row}"
 
     @_requires_accelerator
-    def test_gate_on_requires_always_select_tail(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(kpool_npu, "_PACK_VISIBLE_TAIL", True)
+    def test_producer_requires_always_select_tail(self) -> None:
         ctx = _make_ctx([8])
         q, k, gate, weights, ape = _make_inputs([8], seed=11)
         with pytest.raises(ValueError, match="always_select_tail"):
@@ -398,21 +348,14 @@ class TestPackVisibleTailProducer:
                 always_select_tail=False,
             )
 
-    def test_glm52_dsa_producer_rejects_pack_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # GLM-5.2 生产者在读跨度内部任意位置填 -1, 门开直通会被 backward 读到; 守卫必须
-        # 在任何设备操作之前触发, 因此本测试无需加速器。
-        monkeypatch.setattr(kpool_npu, "_PACK_VISIBLE_TAIL", True)
+    def test_glm52_dsa_producer_rejects_packed_contract(self) -> None:
+        # GLM-5.2 生产者在读跨度内部任意位置填 -1, 无法产出 packed 行; 守卫必须在任何
+        # 设备操作之前触发, 因此本测试无需加速器。
         ctx = _make_ctx([4], device="cpu")
         q = torch.zeros(1, 4, 2, 128, dtype=torch.bfloat16)
         k = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
         weights = torch.zeros(1, 4, 2, dtype=torch.float32)
-        with pytest.raises(RuntimeError, match="PACK_VISIBLE_TAIL"):
+        with pytest.raises(RuntimeError, match="packed index rows"):
             npu_indexer.npu_dsa_topk_indices(
                 q, k, weights, ctx, index_head_dim=q.shape[-1], index_topk=2
             )
-
-    @_requires_accelerator
-    def test_gate_off_width_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        unpacked, _ = self._run(monkeypatch, pack=False)
-        assert unpacked.shape[-1] == kpool.kpool_output_width(self.index_topk, self.index_kpool, 512)
-        assert unpacked.dtype == torch.int32

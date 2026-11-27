@@ -78,7 +78,6 @@ from torch import Tensor
 
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.ops.sparse_mla import kpool_npu
-from xtuner.v1.ops.sparse_mla.kpool import kpool_output_width
 from xtuner.v1.utils.device import get_device
 
 
@@ -300,10 +299,8 @@ class TestAclnnV2DispatchChunkZero:
         weights = torch.randn(1, total, NUM_HEADS, dtype=torch.bfloat16, device=DEVICE)
         kpool_ape = torch.randn(INDEX_KPOOL, INDEX_HEAD_DIM, dtype=torch.bfloat16, device=DEVICE)
         ctx = _make_ctx(DOC_LENS)
-        width = kpool_output_width(SELECT_K * INDEX_KPOOL, INDEX_KPOOL, alignment=512)
+        topk_width = SELECT_K * INDEX_KPOOL  # packed 行宽（唯一布局，见 kpool_npu）
 
-        inputs = _build_aclnn_v2_inputs(DOC_LENS, seed=7)
-        row_prefix = inputs["row_prefix"]
         cu = [int(v) for v in ctx.cu_seq_lens_q_list]
         doc_start_of = {}
         for r, tok in enumerate(range(total)):
@@ -342,24 +339,22 @@ class TestAclnnV2DispatchChunkZero:
 
         for chunk, out in outputs.items():
             label = f"chunk={chunk}"
-            assert out.shape == (total, 1, width), (
-                f"{label}: out shape {tuple(out.shape)} != {(total, 1, width)}"
+            assert out.shape == (total, 1, topk_width), (
+                f"{label}: out shape {tuple(out.shape)} != {(total, 1, topk_width)}"
             )
             assert out.dtype == torch.int32, f"{label}: out dtype {out.dtype} != torch.int32"
             flat = out[:, 0, :]
             for r in range(total):
-                prefix = int(row_prefix[r])
-                expect_valid = min(prefix, SELECT_K) * INDEX_KPOOL
-                slots = flat[r][: SELECT_K * INDEX_KPOOL]
-                valid = slots[slots >= 0]
-                assert valid.numel() == expect_valid, (
-                    f"{label}: row {r} prefix={prefix} valid token slots {valid.numel()} "
-                    f"!= {expect_valid}"
-                )
+                # packed 行契约：读窗 [0, min(local_pos + 1, topk)) 稠密因果去重、窗外全 -1。
                 lo = doc_start_of[r]
-                hi = lo + prefix * INDEX_KPOOL
-                assert bool(((valid >= lo) & (valid < hi)).all()), (
-                    f"{label}: row {r} token ids outside doc span [{lo}, {hi}): "
+                gpos = r  # shard_start = 0，global token 即行号
+                span = min(gpos - lo + 1, topk_width)
+                valid = flat[r][flat[r] >= 0]
+                assert valid.numel() == span, (
+                    f"{label}: row {r} valid token slots {valid.numel()} != read span {span}"
+                )
+                assert bool(((valid >= lo) & (valid <= gpos)).all()), (
+                    f"{label}: row {r} token ids outside causal doc span [{lo}, {gpos}]: "
                     f"{valid.tolist()}"
                 )
                 assert torch.unique(valid).numel() == valid.numel(), (
